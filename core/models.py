@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any
 from datetime import datetime
-from .enums import TradeStatus, MarketRegime
+from .enums import TradeStatus, MarketRegime, OrderStatus
 from .config import IST, LOT_SIZE, BROKERAGE_PER_ORDER, STT_RATE, GST_RATE, EXCHANGE_CHARGES, STAMP_DUTY
 
 @dataclass
@@ -21,7 +21,7 @@ class Position:
     instrument_key: str
     strike: float
     option_type: str
-    quantity: int
+    quantity: int # Positive for long (BUY), Negative for short (SELL)
     entry_price: float
     entry_time: datetime
     current_price: float
@@ -34,7 +34,7 @@ class Position:
 class MultiLegTrade:
     legs: List[Position]
     strategy_type: str
-    net_premium_per_share: float
+    net_premium_per_share: float 
     entry_time: datetime
     lots: int
     status: TradeStatus
@@ -50,33 +50,34 @@ class MultiLegTrade:
         self.calculate_max_loss()
         self.calculate_trade_greeks()
         self.calculate_transaction_costs()
-    
+
     def calculate_max_loss(self):
-        """Calculate maximum loss per lot"""
+        """Calculate maximum loss per lot (simplified for standard spreads/condors)"""
         if "SPREAD" in self.strategy_type or "CONDOR" in self.strategy_type:
             strikes = sorted({leg.strike for leg in self.legs})
             if len(strikes) >= 2:
                 spread_width = strikes[-1] - strikes[0]
-                self.max_loss_per_lot = max(0.0, (spread_width - abs(self.net_premium_per_share)) * LOT_SIZE)
+                net_premium = self.net_premium_per_share * LOT_SIZE
+                self.max_loss_per_lot = max(0.0, (spread_width / LOT_SIZE) - net_premium if net_premium > 0 else spread_width / LOT_SIZE)
                 return
         self.max_loss_per_lot = float("inf")
-    
+        
     def calculate_trade_greeks(self):
         """Calculate trade-level Greeks"""
-        self.trade_vega = sum(leg.current_greeks.vega * leg.quantity / LOT_SIZE for leg in self.legs)
+        self.trade_vega = sum(leg.current_greeks.vega * (leg.quantity / LOT_SIZE) for leg in self.legs)
         self.trade_delta = sum(leg.current_greeks.delta * leg.quantity for leg in self.legs)
-    
-    def calculate_transaction_costs(self):
-        """Realistic transaction cost calculation"""
-        total_premium = abs(self.net_premium_per_share) * LOT_SIZE * self.lots
-        brokerage = BROKERAGE_PER_ORDER * len(self.legs) * 2  # Entry and exit
-        stt = total_premium * STT_RATE
-        exchange = total_premium * EXCHANGE_CHARGES
-        stamp = total_premium * STAMP_DUTY
-        gst = brokerage * GST_RATE
         
+    def calculate_transaction_costs(self):
+        """Realistic transaction cost calculation (for entry and estimated exit)"""
+        total_premium_value = sum(abs(leg.entry_price * leg.quantity) for leg in self.legs)
+        
+        brokerage = BROKERAGE_PER_ORDER * len(self.legs) * 2
+        stt = total_premium_value * STT_RATE
+        exchange = total_premium_value * EXCHANGE_CHARGES
+        stamp = total_premium_value * STAMP_DUTY
+        gst = brokerage * GST_RATE
         self.transaction_costs = brokerage + stt + exchange + stamp + gst
-    
+
     def total_unrealized_pnl(self) -> float:
         return sum(leg.unrealized_pnl() for leg in self.legs) - self.transaction_costs
     
@@ -120,7 +121,7 @@ class AdvancedMetrics:
     sabr_beta: float = 0.5
     sabr_rho: float = -0.2
     sabr_nu: float = 0.3
-
+    
 @dataclass
 class PortfolioMetrics:
     timestamp: datetime
@@ -133,7 +134,7 @@ class PortfolioMetrics:
     daily_pnl: float
     equity: float
     drawdown: float
-
+    
 @dataclass
 class EngineStatus:
     running: bool
