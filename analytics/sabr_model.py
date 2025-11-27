@@ -1,8 +1,7 @@
-import math
+import math 
 import numpy as np
 from scipy import optimize
-from scipy.stats import norm
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 import logging
 
@@ -10,7 +9,6 @@ logger = logging.getLogger("VolGuardHybrid")
 
 class EnhancedSABRModel:
     """Production-grade SABR model with robust calibration"""
-    
     def __init__(self):
         self.alpha = 0.2
         self.beta = 0.5
@@ -18,36 +16,32 @@ class EnhancedSABRModel:
         self.nu = 0.3
         self.calibrated = False
         self.calibration_error = float('inf')
-        self.last_calibration = None
-    
+        self.last_calibration = datetime.now() - timedelta(days=1) # Ensure calibration runs on startup
+
     def sabr_volatility(self, F: float, K: float, T: float) -> float:
         """Hagan's SABR formula with comprehensive error handling"""
-        if F <= 0 or K <= 0 or T <= 0:
-            return 0.2
-            
-        # ATM case
+        if F <= 0 or K <= 0 or T <= 0: return 0.2 
+        
         if abs(F - K) < F * 0.001:
             term1 = ((1 - self.beta) ** 2) / 24 * (self.alpha ** 2) / (F ** (2 - 2 * self.beta))
             term2 = 0.25 * self.rho * self.beta * self.nu * self.alpha / (F ** (1 - self.beta))
             term3 = (2 - 3 * self.rho ** 2) / 24 * self.nu ** 2
             expansion = 1 + (term1 + term2 + term3) * T
-            return (self.alpha / (F ** (1 - self.beta))) * expansion
+            result = (self.alpha / (F ** (1 - self.beta))) * expansion
+            return float(np.clip(result, 0.05, 1.5))
         
         try:
             z = (self.nu / self.alpha) * (F * K) ** ((1 - self.beta) / 2) * math.log(F / K)
             
-            # Handle large z values
             if abs(z) > 100:
-                return self.alpha / (F ** (1 - self.beta))
-            
+                 return self.alpha / (F ** (1 - self.beta))
+                 
             x = math.log((math.sqrt(1 - 2 * self.rho * z + z * z) + z - self.rho) / (1 - self.rho))
             
-            numerator = self.alpha * (1 + ((1 - self.beta) ** 2 / 24) * 
-                          (self.alpha ** 2 / (F * K) ** (1 - self.beta)) * T)
+            numerator = self.alpha * (1 + ((1 - self.beta) ** 2 / 24) * (self.alpha ** 2 / (F * K) ** (1 - self.beta)) * T)
             denominator = (F * K) ** ((1 - self.beta) / 2) * \
-                         (1 + (1 - self.beta) ** 2 / 24 * math.log(F / K) ** 2 + 
-                          (1 - self.beta) ** 4 / 1920 * math.log(F / K) ** 4)
-            
+                        (1 + (1 - self.beta) ** 2 / 24 * math.log(F / K) ** 2 + (1 - self.beta) ** 4 / 1920 * math.log(F / K) ** 4)
+                        
             if abs(denominator) < 1e-7:
                 return self.alpha / (F ** (1 - self.beta))
                 
@@ -60,49 +54,38 @@ class EnhancedSABRModel:
             
         except (ValueError, ZeroDivisionError):
             return self.alpha / (F ** (1 - self.beta))
-    
+
     def calibrate_to_chain(self, strikes: List[float], ivs: List[float], F: float, T: float) -> bool:
         """Robust calibration with validation"""
-        if len(strikes) < 5 or T <= 1/365:
-            return False
-            
-        # Filter valid data
-        valid_data = [(K, iv) for K, iv in zip(strikes, ivs) 
-                     if K > 0 and 0.05 < iv < 1.5 and 0.5 * F < K < 2.0 * F]
+        if len(strikes) < 5 or T <= 1/365: return False
         
-        if len(valid_data) < 5:
-            return False
-            
+        valid_data = [(K, iv) for K, iv in zip(strikes, ivs) if K > 0 and 0.05 < iv < 1.5 and 0.5 * F < K < 2.0 * F]
+        if len(valid_data) < 5: return False
         strikes_clean, ivs_clean = zip(*valid_data)
         
         def objective(params):
             alpha, beta, rho, nu = params
-            # Temporary assignment
             temp_params = (self.alpha, self.beta, self.rho, self.nu)
             self.alpha, self.beta, self.rho, self.nu = alpha, beta, rho, nu
-            
             errors = []
             for K, market_iv in zip(strikes_clean, ivs_clean):
                 model_iv = self.sabr_volatility(F, K, T)
                 errors.append((model_iv - market_iv) ** 2)
-            
-            # Restore original values
             self.alpha, self.beta, self.rho, self.nu = temp_params
             return math.sqrt(sum(errors) / len(errors)) if errors else 1.0
-        
+
         try:
-            bounds = [
+            bounds = [ 
                 (0.05, 0.8),    # alpha
-                (0.1, 0.9),     # beta  
+                (0.1, 0.9),     # beta
                 (-0.95, 0.95),  # rho
                 (0.1, 0.8)      # nu
             ]
-            
             result = optimize.minimize(
                 objective, 
-                [0.2, 0.5, -0.2, 0.3],
-                bounds=bounds,
-                method="L-BFGS-B",
+                [0.2, 0.5, -0.2, 0.3], 
+                bounds=bounds, 
+                method="L-BFGS-B", 
                 options={'maxiter': 50, 'ftol': 1e-4}
             )
             
@@ -112,11 +95,7 @@ class EnhancedSABRModel:
                 self.calibrated = True
                 self.last_calibration = datetime.now()
                 
-                # Validate parameters
-                if not (bounds[0][0] <= self.alpha <= bounds[0][1] and
-                       bounds[1][0] <= self.beta <= bounds[1][1] and
-                       bounds[2][0] <= self.rho <= bounds[2][1] and
-                       bounds[3][0] <= self.nu <= bounds[3][1]):
+                if not (bounds[0][0] <= self.alpha <= bounds[0][1] and bounds[1][0] <= self.beta <= bounds[1][1] and bounds[2][0] <= self.rho <= bounds[2][1] and bounds[3][0] <= self.nu <= bounds[3][1]):
                     self.calibrated = False
                     return False
                     
@@ -125,5 +104,5 @@ class EnhancedSABRModel:
                 
         except Exception as e:
             logger.error(f"SABR calibration failed: {e}")
-            
+            return False
         return False
