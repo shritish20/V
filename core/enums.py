@@ -1,10 +1,11 @@
-from enum import Enum
+from enum import Enum 
 
 class TradeStatus(Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
     PENDING = "PENDING"
-
+    EXTERNAL = "EXTERNAL" 
+    
 class ExitReason(Enum):
     PROFIT_TARGET = "PROFIT_TARGET"
     STOP_LOSS = "STOP_LOSS"
@@ -17,7 +18,7 @@ class ExitReason(Enum):
     DELTA_LIMIT = "DELTA_LIMIT"
     REGIME_CHANGE = "REGIME_CHANGE"
     HEALTH_CHECK = "HEALTH_CHECK"
-
+    
 class OrderStatus(Enum):
     PENDING = "PENDING"
     PLACED = "PLACED"
@@ -25,7 +26,7 @@ class OrderStatus(Enum):
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
-
+    
 class MarketRegime(Enum):
     PANIC = "PANIC"
     FEAR_BACKWARDATION = "FEAR_BACKWARDATION"
