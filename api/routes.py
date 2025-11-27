@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 import asyncio
 from core.engine import VolGuardHybridUltimate
 from core.models import EngineStatus, AdvancedMetrics, PortfolioMetrics
-from core.enums import ExitReason
+from core.enums import ExitReason, TradeStatus
 from .dependencies import get_engine, set_engine
 
 app = FastAPI(
@@ -12,6 +12,8 @@ app = FastAPI(
     description="Production-grade options trading engine with comprehensive risk management",
     version="1.0.0"
 )
+
+# --- Pydantic Models ---
 
 class EngineStartRequest(BaseModel):
     continuous: bool = True
@@ -34,12 +36,14 @@ class MetricsResponse(BaseModel):
     market_metrics: Optional[AdvancedMetrics] = None
     portfolio_metrics: Optional[PortfolioMetrics] = None
 
+# --- Application Lifecycle ---
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize engine on startup"""
     engine = VolGuardHybridUltimate()
     set_engine(engine)
-
+    
 @app.on_event("shutdown")
 async def shutdown_event():
     """Shutdown engine gracefully"""
@@ -47,10 +51,12 @@ async def shutdown_event():
     if engine:
         await engine.shutdown()
 
+# --- Routes ---
+
 @app.get("/")
 async def root():
     return {
-        "message": "VolGuard Hybrid Ultimate API", 
+        "message": "VolGuard Hybrid Ultimate API",
         "status": "running",
         "version": "1.0.0"
     }
@@ -62,14 +68,12 @@ async def start_engine(
     engine: VolGuardHybridUltimate = Depends(get_engine)
 ):
     """Start the trading engine"""
-    if engine.running:
+    if engine.running and engine.cycle_count > 0:
         raise HTTPException(status_code=400, detail="Engine is already running")
     
-    engine.running = True
     background_tasks.add_task(engine.run, request.continuous)
-    
     return StatusResponse(
-        status="success",
+        status="success", 
         message="Engine started successfully"
     )
 
@@ -78,7 +82,7 @@ async def stop_engine(engine: VolGuardHybridUltimate = Depends(get_engine)):
     """Stop the trading engine"""
     engine.running = False
     return StatusResponse(
-        status="success",
+        status="success", 
         message="Engine stop signal sent"
     )
 
@@ -86,7 +90,7 @@ async def stop_engine(engine: VolGuardHybridUltimate = Depends(get_engine)):
 async def get_engine_status(engine: VolGuardHybridUltimate = Depends(get_engine)):
     """Get current engine status"""
     return StatusResponse(
-        status="success",
+        status="success", 
         engine_status=engine.get_status()
     )
 
@@ -111,14 +115,13 @@ async def get_trades(engine: VolGuardHybridUltimate = Depends(get_engine)):
                 "lots": trade.lots,
                 "pnl": trade.total_unrealized_pnl(),
                 "entry_time": trade.entry_time
-            }
-            for trade in engine.trades
+            } for trade in engine.trades
         ]
     }
 
 @app.post("/trades/close")
 async def close_trade(
-    request: TradeCloseRequest,
+    request: TradeCloseRequest, 
     engine: VolGuardHybridUltimate = Depends(get_engine)
 ):
     """Close a specific trade"""
@@ -131,16 +134,19 @@ async def close_trade(
 
 @app.post("/trades/execute")
 async def execute_strategy(
-    request: StrategyExecuteRequest,
+    request: StrategyExecuteRequest, 
     engine: VolGuardHybridUltimate = Depends(get_engine)
 ):
-    """Execute a specific strategy"""
+    """Execute a specific strategy (manual override)"""
+    # NOTE: Spot price lookup for manual execution
+    current_spot = engine.rt_quotes.get(engine.MARKET_KEY_INDEX, engine.last_metrics.spot_price if engine.last_metrics else 0.0)
+    
     trade = await engine.trade_mgr.execute_strategy(
         request.strategy_name,
         request.legs_spec,
-        request.lots
+        request.lots,
+        current_spot
     )
-    
     if trade:
         engine.trades.append(trade)
         return {"status": "success", "trade_id": trade.id}
@@ -161,5 +167,5 @@ async def health_check(engine: VolGuardHybridUltimate = Depends(get_engine)):
         "engine_running": engine.running,
         "market_open": engine._is_market_open(),
         "cycle_count": engine.cycle_count,
-        "active_trades": len([t for t in engine.trades if t.status == TradeStatus.OPEN])
-  }
+        "active_trades": len([t for t in engine.trades if t.status in [TradeStatus.OPEN, TradeStatus.EXTERNAL]])
+    }
