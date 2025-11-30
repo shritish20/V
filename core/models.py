@@ -1,8 +1,10 @@
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any
 from datetime import datetime
-from .enums import TradeStatus, MarketRegime, OrderStatus
+from pydantic import BaseModel, Field, validator
+from enum import Enum
 from .config import IST, LOT_SIZE, BROKERAGE_PER_ORDER, STT_RATE, GST_RATE, EXCHANGE_CHARGES, STAMP_DUTY
+from .enums import TradeStatus, ExitReason, OrderStatus, OrderType, MarketRegime
 
 @dataclass
 class GreeksSnapshot:
@@ -12,40 +14,51 @@ class GreeksSnapshot:
     theta: float = 0.0
     vega: float = 0.0
     
-    def is_stale(self, max_age: float = 60.0) -> bool:
+    def is_stale(self, max_age: float = 30.0) -> bool:
         return (datetime.now(IST) - self.timestamp).total_seconds() > max_age
 
-@dataclass
-class Position:
+class Position(BaseModel):
+    """Enhanced position with transaction cost tracking"""
     symbol: str
     instrument_key: str
     strike: float
     option_type: str
-    quantity: int # Positive for long (BUY), Negative for short (SELL)
-    entry_price: float
+    quantity: int
+    entry_price: float = Field(gt=0.0)
     entry_time: datetime
-    current_price: float
+    current_price: float = Field(gt=0.0)
     current_greeks: GreeksSnapshot
+    transaction_costs: float = Field(ge=0.0, default=0.0)
+    
+    class Config:
+        arbitrary_types_allowed = True
     
     def unrealized_pnl(self) -> float:
-        return (self.current_price - self.entry_price) * self.quantity
+        """PnL including transaction costs"""
+        price_change = self.current_price - self.entry_price
+        return (price_change * self.quantity) - self.transaction_costs
 
-@dataclass
-class MultiLegTrade:
+class MultiLegTrade(BaseModel):
+    """Enhanced trade model with state machine"""
     legs: List[Position]
     strategy_type: str
-    net_premium_per_share: float 
+    net_premium_per_share: float
     entry_time: datetime
-    lots: int
+    lots: int = Field(gt=0)
     status: TradeStatus
     expiry_date: str
-    max_loss_per_lot: float = 0.0
-    transaction_costs: float = 0.0
+    max_loss_per_lot: float = Field(ge=0.0)
+    transaction_costs: float = Field(ge=0.0, default=0.0)
     basket_order_id: Optional[str] = None
     trade_vega: float = 0.0
     trade_delta: float = 0.0
     id: Optional[int] = None
+    exit_reason: Optional[ExitReason] = None
+    exit_time: Optional[datetime] = None
     
+    class Config:
+        arbitrary_types_allowed = True
+
     def __post_init__(self):
         self.calculate_max_loss()
         self.calculate_trade_greeks()
@@ -84,23 +97,53 @@ class MultiLegTrade:
     def total_credit(self) -> float:
         return max(self.net_premium_per_share, 0) * LOT_SIZE * self.lots
 
-@dataclass
-class Order:
+    def update_greeks(self):
+        """Recalculate trade-level Greeks"""
+        self.trade_vega = sum(leg.current_greeks.vega * (leg.quantity / LOT_SIZE) for leg in self.legs)
+        self.trade_delta = sum(leg.current_greeks.delta * leg.quantity for leg in self.legs)
+
+class Order(BaseModel):
+    """Complete order lifecycle management"""
     order_id: str
     instrument_key: str
     quantity: int
     price: float
-    side: str
+    order_type: OrderType
+    transaction_type: str  # BUY/SELL
     status: OrderStatus
+    product: str = "I"
+    validity: str = "DAY"
+    disclosed_quantity: int = 0
+    trigger_price: float = 0
     placed_time: datetime
+    last_updated: datetime
     filled_quantity: int = 0
     average_price: float = 0.0
+    remaining_quantity: int = 0
+    retry_count: int = 0
+    parent_trade_id: Optional[int] = None
+    error_message: Optional[str] = None
+    
+    class Config:
+        arbitrary_types_allowed = True
     
     def is_complete(self) -> bool:
         return self.status in [OrderStatus.FILLED, OrderStatus.REJECTED, OrderStatus.CANCELLED]
     
-    def is_filled(self) -> bool:
-        return self.status == OrderStatus.FILLED
+    def is_active(self) -> bool:
+        return self.status in [OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIAL_FILLED]
+    
+    def update_fill(self, filled_qty: int, avg_price: float):
+        """Update order with fill information"""
+        self.filled_quantity = filled_qty
+        self.average_price = avg_price
+        self.remaining_quantity = self.quantity - filled_qty
+        self.last_updated = datetime.now()
+        
+        if self.remaining_quantity == 0:
+            self.status = OrderStatus.FILLED
+        elif filled_qty > 0:
+            self.status = OrderStatus.PARTIAL_FILLED
 
 @dataclass
 class AdvancedMetrics:
