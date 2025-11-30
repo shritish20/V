@@ -11,3 +11,4 @@ python-multipart
 websockets
 httpx
 prometheus-client
+uvloop; sys_platform != 'win32'
