@@ -6,6 +6,7 @@ from core.models import EngineStatus
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
 import logging
+import asyncio  # ADD THIS
 
 logger = logging.getLogger("VolGuard14")
 
@@ -27,11 +28,16 @@ class TradeRequest(BaseModel):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize engine on startup"""
+    """Initialize AND START engine on startup"""
     global ENGINE
     try:
         ENGINE = VolGuard14Engine()
         logger.info("VolGuard 14.00 Engine initialized successfully")
+        
+        # 🚀 CRITICAL FIX: Start the engine automatically
+        asyncio.create_task(ENGINE.run(continuous=True))
+        logger.info("✅ Trading engine started automatically in background")
+        
     except Exception as e:
         logger.error(f"Failed to initialize engine: {e}")
         raise
@@ -44,13 +50,33 @@ async def shutdown_event():
         await ENGINE.shutdown()
         logger.info("VolGuard 14.00 Engine shutdown complete")
 
+# ADD DEBUG ENDPOINT
+@app.get("/debug/state")
+async def debug_state():
+    """Debug endpoint to check engine state"""
+    if not ENGINE:
+        return {"error": "Engine not initialized"}
+    
+    return {
+        "engine_exists": ENGINE is not None,
+        "engine_running": ENGINE.running,
+        "circuit_breaker": ENGINE.circuit_breaker,
+        "cycle_count": ENGINE.cycle_count,
+        "trades_count": len(ENGINE.trades),
+        "rt_quotes_count": len(ENGINE.rt_quotes),
+        "market_open": ENGINE._is_market_open() if hasattr(ENGINE, '_is_market_open') else "unknown",
+        "ws_connected": ENGINE.api.ws_connected if hasattr(ENGINE, 'api') and hasattr(ENGINE.api, 'ws_connected') else False
+    }
+
+# KEEP ALL YOUR EXISTING ENDPOINTS BELOW...
 @app.get("/")
 async def root():
     """Root endpoint with system info"""
     return {
         "message": "VolGuard 14.00 - Ironclad Trading System",
         "status": "operational",
-        "version": "14.0.0"
+        "version": "14.0.0",
+        "engine_running": ENGINE.running if ENGINE else False
     }
 
 @app.get("/health")
@@ -71,6 +97,7 @@ async def health_check():
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
+# ... KEEP ALL YOUR OTHER EXISTING ENDPOINTS EXACTLY AS THEY ARE
 @app.get("/status")
 async def get_status():
     """Get detailed engine status"""
