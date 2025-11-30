@@ -2,16 +2,11 @@ import uvicorn
 import os
 import sys
 from pathlib import Path
-import asyncio
-import logging
-from utils.logger import setup_logger
 
 # Add the current directory to Python path
 sys.path.append(str(Path(__file__).parent))
 
 if __name__ == "__main__":
-    logger = setup_logger()
-    
     print("🚀 VOLGUARD 14.00 - IRONCLAD ARCHITECTURE")
     print("✅ PRODUCTION-GRADE TRADING ENGINE")
     print("✅ ADVANCED VOLATILITY ANALYTICS")
@@ -42,13 +37,11 @@ if __name__ == "__main__":
     ENV = os.getenv("ENV", "production")
     PORT = int(os.getenv("PORT", 8000))
 
-    # Run the FastAPI server
+    # Run the FastAPI server - SIMPLE VERSION (NO UVLOOP)
     print(f"🚀 Starting VolGuard 14.00 on port {PORT}...")
     uvicorn.run(
         "api.routes:app",
         host="0.0.0.0",
         port=PORT,
-        log_level="info",
-        reload=(ENV == "development"),
-        loop="uvloop" if sys.platform != "win32" else "asyncio"
+        log_level="info"
     )
