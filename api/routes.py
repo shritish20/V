@@ -1,171 +1,202 @@
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from pydantic import BaseModel
-from typing import Dict, List, Optional
-import asyncio
-from core.engine import VolGuardHybridUltimate
-from core.models import EngineStatus, AdvancedMetrics, PortfolioMetrics
-from core.enums import ExitReason, TradeStatus
-from .dependencies import get_engine, set_engine
+from typing import Dict, Any, Optional
+from core.engine import VolGuard14Engine
+from core.models import EngineStatus
+from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+import logging
+
+logger = logging.getLogger("VolGuard14")
 
 app = FastAPI(
-    title="VolGuard Hybrid Ultimate API",
-    description="Production-grade options trading engine with comprehensive risk management",
-    version="1.0.0"
+    title="VolGuard 14.00 API",
+    description="Ironclad Trading System - Production Grade",
+    version="14.0.0"
 )
 
-# --- Pydantic Models ---
+# Global engine instance
+ENGINE: Optional[VolGuard14Engine] = None
 
 class EngineStartRequest(BaseModel):
     continuous: bool = True
 
-class TradeCloseRequest(BaseModel):
-    trade_id: int
-    reason: ExitReason
-
-class StrategyExecuteRequest(BaseModel):
-    strategy_name: str
-    legs_spec: List[Dict]
+class TradeRequest(BaseModel):
+    strategy: str
     lots: int
-
-class StatusResponse(BaseModel):
-    status: str
-    engine_status: Optional[EngineStatus] = None
-    message: Optional[str] = None
-
-class MetricsResponse(BaseModel):
-    market_metrics: Optional[AdvancedMetrics] = None
-    portfolio_metrics: Optional[PortfolioMetrics] = None
-
-# --- Application Lifecycle ---
 
 @app.on_event("startup")
 async def startup_event():
     """Initialize engine on startup"""
-    engine = VolGuardHybridUltimate()
-    set_engine(engine)
-    
+    global ENGINE
+    try:
+        ENGINE = VolGuard14Engine()
+        logger.info("VolGuard 14.00 Engine initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize engine: {e}")
+        raise
+
 @app.on_event("shutdown")
 async def shutdown_event():
     """Shutdown engine gracefully"""
-    engine = get_engine()
-    if engine:
-        await engine.shutdown()
-
-# --- Routes ---
+    global ENGINE
+    if ENGINE:
+        await ENGINE.shutdown()
+        logger.info("VolGuard 14.00 Engine shutdown complete")
 
 @app.get("/")
 async def root():
+    """Root endpoint with system info"""
     return {
-        "message": "VolGuard Hybrid Ultimate API",
-        "status": "running",
-        "version": "1.0.0"
+        "message": "VolGuard 14.00 - Ironclad Trading System",
+        "status": "operational",
+        "version": "14.0.0"
     }
-
-@app.post("/engine/start", response_model=StatusResponse)
-async def start_engine(
-    request: EngineStartRequest,
-    background_tasks: BackgroundTasks,
-    engine: VolGuardHybridUltimate = Depends(get_engine)
-):
-    """Start the trading engine"""
-    if engine.running and engine.cycle_count > 0:
-        raise HTTPException(status_code=400, detail="Engine is already running")
-    
-    background_tasks.add_task(engine.run, request.continuous)
-    return StatusResponse(
-        status="success", 
-        message="Engine started successfully"
-    )
-
-@app.post("/engine/stop", response_model=StatusResponse)
-async def stop_engine(engine: VolGuardHybridUltimate = Depends(get_engine)):
-    """Stop the trading engine"""
-    engine.running = False
-    return StatusResponse(
-        status="success", 
-        message="Engine stop signal sent"
-    )
-
-@app.get("/engine/status", response_model=StatusResponse)
-async def get_engine_status(engine: VolGuardHybridUltimate = Depends(get_engine)):
-    """Get current engine status"""
-    return StatusResponse(
-        status="success", 
-        engine_status=engine.get_status()
-    )
-
-@app.get("/metrics", response_model=MetricsResponse)
-async def get_metrics(engine: VolGuardHybridUltimate = Depends(get_engine)):
-    """Get current market and portfolio metrics"""
-    return MetricsResponse(
-        market_metrics=engine.last_metrics,
-        portfolio_metrics=engine.risk_mgr.portfolio_metrics
-    )
-
-@app.get("/trades")
-async def get_trades(engine: VolGuardHybridUltimate = Depends(get_engine)):
-    """Get all trades"""
-    return {
-        "status": "success",
-        "trades": [
-            {
-                "id": trade.id,
-                "strategy_type": trade.strategy_type,
-                "status": trade.status.value,
-                "lots": trade.lots,
-                "pnl": trade.total_unrealized_pnl(),
-                "entry_time": trade.entry_time
-            } for trade in engine.trades
-        ]
-    }
-
-@app.post("/trades/close")
-async def close_trade(
-    request: TradeCloseRequest, 
-    engine: VolGuardHybridUltimate = Depends(get_engine)
-):
-    """Close a specific trade"""
-    trade = next((t for t in engine.trades if t.id == request.trade_id), None)
-    if not trade:
-        raise HTTPException(status_code=404, detail="Trade not found")
-    
-    await engine.trade_mgr.close_trade(trade, request.reason)
-    return {"status": "success", "message": f"Trade {request.trade_id} closed"}
-
-@app.post("/trades/execute")
-async def execute_strategy(
-    request: StrategyExecuteRequest, 
-    engine: VolGuardHybridUltimate = Depends(get_engine)
-):
-    """Execute a specific strategy (manual override)"""
-    # NOTE: Spot price lookup for manual execution
-    current_spot = engine.rt_quotes.get(engine.MARKET_KEY_INDEX, engine.last_metrics.spot_price if engine.last_metrics else 0.0)
-    
-    trade = await engine.trade_mgr.execute_strategy(
-        request.strategy_name,
-        request.legs_spec,
-        request.lots,
-        current_spot
-    )
-    if trade:
-        engine.trades.append(trade)
-        return {"status": "success", "trade_id": trade.id}
-    else:
-        raise HTTPException(status_code=400, detail="Strategy execution failed")
-
-@app.post("/emergency/flatten")
-async def emergency_flatten(engine: VolGuardHybridUltimate = Depends(get_engine)):
-    """Emergency flatten all positions"""
-    await engine._emergency_flatten()
-    return {"status": "success", "message": "Emergency flatten executed"}
 
 @app.get("/health")
-async def health_check(engine: VolGuardHybridUltimate = Depends(get_engine)):
-    """Health check endpoint"""
+async def health_check():
+    """Comprehensive health check endpoint"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    try:
+        health_data = ENGINE.get_system_health()
+        return {
+            "status": "healthy",
+            "engine_running": health_data["engine"]["running"],
+            "circuit_breaker": health_data["engine"]["circuit_breaker"],
+            "active_trades": health_data["engine"]["active_trades"],
+            "analytics_healthy": health_data["analytics"]["sabr_calibrated"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
+
+@app.get("/status")
+async def get_status():
+    """Get detailed engine status"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    status = ENGINE.get_status()
     return {
-        "status": "healthy",
-        "engine_running": engine.running,
-        "market_open": engine._is_market_open(),
-        "cycle_count": engine.cycle_count,
-        "active_trades": len([t for t in engine.trades if t.status in [TradeStatus.OPEN, TradeStatus.EXTERNAL]])
+        "running": status.running,
+        "circuit_breaker": status.circuit_breaker,
+        "cycle_count": status.cycle_count,
+        "total_trades": status.total_trades,
+        "daily_pnl": status.daily_pnl,
+        "max_equity": status.max_equity,
+        "last_metrics_timestamp": status.last_metrics.timestamp.isoformat() if status.last_metrics else None
     }
+
+@app.post("/start")
+async def start_engine(background_tasks: BackgroundTasks, request: EngineStartRequest = EngineStartRequest()):
+    """Start the trading engine"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    if ENGINE.running:
+        raise HTTPException(status_code=400, detail="Engine already running")
+    
+    try:
+        background_tasks.add_task(ENGINE.run, request.continuous)
+        return {"status": "starting", "continuous": request.continuous}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to start engine: {str(e)}")
+
+@app.post("/stop")
+async def stop_engine():
+    """Stop the trading engine"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    if not ENGINE.running:
+        raise HTTPException(status_code=400, detail="Engine not running")
+    
+    try:
+        await ENGINE.shutdown()
+        return {"status": "stopping"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to stop engine: {str(e)}")
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/risk")
+async def get_risk_report():
+    """Get comprehensive risk report"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    try:
+        risk_report = ENGINE.risk_mgr.get_risk_report()
+        return risk_report
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get risk report: {str(e)}")
+
+@app.get("/analytics/volatility")
+async def get_volatility_metrics():
+    """Get current volatility analytics"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    if not ENGINE.last_metrics:
+        raise HTTPException(status_code=404, detail="No analytics data available")
+    
+    return {
+        "spot_price": ENGINE.last_metrics.spot_price,
+        "vix": ENGINE.last_metrics.vix,
+        "ivp": ENGINE.last_metrics.ivp,
+        "realized_vol": ENGINE.last_metrics.realized_vol_7d,
+        "garch_vol": ENGINE.last_metrics.garch_vol_7d,
+        "regime": ENGINE.last_metrics.regime.value,
+        "event_risk": ENGINE.last_metrics.event_risk_score
+    }
+
+@app.get("/trades/active")
+async def get_active_trades():
+    """Get all active trades"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    try:
+        active_trades = []
+        for trade in ENGINE.trades:
+            if trade.status.value in ["OPEN", "EXTERNAL"]:
+                active_trades.append({
+                    "id": trade.id,
+                    "strategy": trade.strategy_type,
+                    "lots": trade.lots,
+                    "pnl": trade.total_unrealized_pnl(),
+                    "vega": trade.trade_vega,
+                    "delta": trade.trade_delta,
+                    "entry_time": trade.entry_time.isoformat()
+                })
+        return {"active_trades": active_trades}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get active trades: {str(e)}")
+
+@app.post("/emergency/flatten")
+async def emergency_flatten():
+    """Emergency flatten all positions"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    try:
+        await ENGINE._emergency_flatten()
+        return {"status": "emergency_flatten_initiated"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Emergency flatten failed: {str(e)}")
+
+@app.get("/system/health/detailed")
+async def get_detailed_health():
+    """Get detailed system health information"""
+    if not ENGINE:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+    
+    try:
+        health_data = ENGINE.get_system_health()
+        return health_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get detailed health: {str(e)}")
