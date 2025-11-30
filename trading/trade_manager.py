@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import List, Dict, Optional, Tuple
-from core.models import MultiLegTrade, Position, GreeksSnapshot, TradeStatus, ExitReason, OrderStatus
+from core.models import MultiLegTrade, Position, GreeksSnapshot, TradeStatus, ExitReason, OrderStatus, AdvancedMetrics  # ADDED: AdvancedMetrics
 from core.config import IST, LOT_SIZE, MARKET_KEY_INDEX
 from trading.api_client import HybridUpstoxAPI
 from trading.order_manager import EnhancedOrderManager
