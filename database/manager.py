@@ -1,5 +1,6 @@
 import sqlite3
 import asyncio
+import os
 from datetime import datetime
 from typing import Tuple, Optional, List, Dict
 from core.models import MultiLegTrade, PortfolioMetrics, AdvancedMetrics, TradeStatus, ExitReason, Order
@@ -9,12 +10,20 @@ import logging
 logger = logging.getLogger("VolGuard14")
 
 class HybridDatabaseManager:
-    """ACID-compliant storage with state management and audit trail - Enhanced Fusion - FIXED"""
+    """ACID-compliant storage with state management and audit trail - RENDER COMPATIBLE"""
     
-    def __init__(self, db_path: str = DB_FILE):
+    def __init__(self, db_path: str = None):
+        # Use environment variable or default to /tmp/ directory
+        if db_path is None:
+            db_path = DB_FILE
+            
         self.db_path = db_path
         self.conn = None
-        self._db_lock = asyncio.Lock()  # FIXED: Add async lock for thread safety
+        self._db_lock = asyncio.Lock()
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        
         self._init_db()
 
     def _init_db(self):
@@ -154,14 +163,14 @@ class HybridDatabaseManager:
             cursor.execute('''CREATE INDEX IF NOT EXISTS idx_trade_legs_trade_id ON trade_legs(trade_id)''')
             
             self.conn.commit()
-            logger.info("Enhanced database initialized successfully")
+            logger.info(f"Enhanced database initialized successfully at: {self.db_path}")
             
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
             raise
 
     async def save_trade(self, trade: MultiLegTrade) -> int:
-        """FIXED: Save trade with full audit trail and thread safety"""
+        """Save trade with full audit trail and thread safety"""
         async with self._db_lock:
             try:
                 cursor = self.conn.cursor()
@@ -199,7 +208,7 @@ class HybridDatabaseManager:
 
     async def update_trade_status(self, trade_id: int, status: TradeStatus, 
                               pnl: float = None, exit_reason: ExitReason = None):
-        """FIXED: Update trade status with comprehensive tracking and thread safety"""
+        """Update trade status with comprehensive tracking and thread safety"""
         async with self._db_lock:
             try:
                 cursor = self.conn.cursor()
@@ -244,7 +253,7 @@ class HybridDatabaseManager:
             return []
 
     async def save_order(self, order: Order):
-        """FIXED: Save order to database with thread safety"""
+        """Save order to database with thread safety"""
         async with self._db_lock:
             try:
                 cursor = self.conn.cursor()
@@ -267,7 +276,7 @@ class HybridDatabaseManager:
                 raise
 
     async def save_portfolio_snapshot(self, metrics: PortfolioMetrics):
-        """FIXED: Save portfolio snapshot for time series analysis with thread safety"""
+        """Save portfolio snapshot for time series analysis with thread safety"""
         async with self._db_lock:
             try:
                 self.conn.execute('''INSERT INTO portfolio_snapshots 
@@ -281,7 +290,7 @@ class HybridDatabaseManager:
                 logger.error(f"Failed to save portfolio snapshot: {e}")
 
     async def save_market_analytics(self, metrics: AdvancedMetrics):
-        """FIXED: Save comprehensive market analytics with thread safety"""
+        """Save comprehensive market analytics with thread safety"""
         async with self._db_lock:
             try:
                 self.conn.execute('''INSERT INTO market_analytics 
@@ -316,7 +325,7 @@ class HybridDatabaseManager:
             return 0.0, ACCOUNT_SIZE, 0, 0
 
     async def save_daily_state(self, daily_pnl: float, max_equity: float, cycle_count: int, total_trades: int):
-        """FIXED: Save daily state with thread safety"""
+        """Save daily state with thread safety"""
         async with self._db_lock:
             today = datetime.now(IST).strftime("%Y-%m-%d")
             try:
