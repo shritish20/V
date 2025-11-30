@@ -4,11 +4,13 @@ from scipy import optimize
 from datetime import datetime, timedelta
 from typing import List
 import logging
+from core.config import SABR_BOUNDS
 
-logger = logging.getLogger("VolGuardHybrid")
+logger = logging.getLogger("VolGuard14")
 
 class EnhancedSABRModel:
     """Production-grade SABR model with robust calibration"""
+    
     def __init__(self):
         self.alpha = 0.2
         self.beta = 0.5
@@ -16,7 +18,8 @@ class EnhancedSABRModel:
         self.nu = 0.3
         self.calibrated = False
         self.calibration_error = float('inf')
-        self.last_calibration = datetime.now() - timedelta(days=1) # Ensure calibration runs on startup
+        self.last_calibration = datetime.now() - timedelta(days=1)
+        self.fallback_mode = False
 
     def sabr_volatility(self, F: float, K: float, T: float) -> float:
         """Hagan's SABR formula with comprehensive error handling"""
@@ -75,12 +78,7 @@ class EnhancedSABRModel:
             return math.sqrt(sum(errors) / len(errors)) if errors else 1.0
 
         try:
-            bounds = [ 
-                (0.05, 0.8),    # alpha
-                (0.1, 0.9),     # beta
-                (-0.95, 0.95),  # rho
-                (0.1, 0.8)      # nu
-            ]
+            bounds = list(SABR_BOUNDS.values())
             result = optimize.minimize(
                 objective, 
                 [0.2, 0.5, -0.2, 0.3], 
@@ -93,6 +91,7 @@ class EnhancedSABRModel:
                 self.alpha, self.beta, self.rho, self.nu = result.x
                 self.calibration_error = result.fun
                 self.calibrated = True
+                self.fallback_mode = False
                 self.last_calibration = datetime.now()
                 
                 if not (bounds[0][0] <= self.alpha <= bounds[0][1] and bounds[1][0] <= self.beta <= bounds[1][1] and bounds[2][0] <= self.rho <= bounds[2][1] and bounds[3][0] <= self.nu <= bounds[3][1]):
@@ -106,3 +105,10 @@ class EnhancedSABRModel:
             logger.error(f"SABR calibration failed: {e}")
             return False
         return False
+
+    def _validate_parameters(self) -> bool:
+        """Validate SABR parameters are within reasonable bounds"""
+        return (SABR_BOUNDS['alpha'][0] <= self.alpha <= SABR_BOUNDS['alpha'][1] and
+                SABR_BOUNDS['beta'][0] <= self.beta <= SABR_BOUNDS['beta'][1] and
+                SABR_BOUNDS['rho'][0] <= self.rho <= SABR_BOUNDS['rho'][1] and
+                SABR_BOUNDS['nu'][0] <= self.nu <= SABR_BOUNDS['nu'][1])
