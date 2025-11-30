@@ -3,63 +3,98 @@ import threading
 import smtplib
 import os 
 import logging
+import asyncio
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import Dict, List
+from typing import Dict, List, Set
 from threading import Lock
 from datetime import datetime
-from core.config import IST
+from collections import deque
+from core.config import ALERT_EMAIL, EMAIL_PASSWORD
 
-logger = logging.getLogger("VolGuardHybrid")
+logger = logging.getLogger("VolGuard14")
 
 class CriticalAlertSystem:
-    """Production-grade alert system"""
+    """Production-grade alert system with multiple channels - Enhanced"""
+    
     def __init__(self):
+        self.alert_queue = deque(maxlen=1000)
+        self._alert_lock = Lock()
+        self.sent_alerts: Set[str] = set()  # Prevent duplicate alerts
+        self.alert_cooldown = 300  # 5 minutes
         self.last_alert_time: Dict[str, float] = {}
-        self.alert_cooldown = 300 # 5 minutes
-        self._lock = Lock()
-        self.alert_email = os.getenv("ALERT_EMAIL")
-        self.email_password = os.getenv("EMAIL_PASSWORD")
-
+        
     async def send_alert(self, alert_type: str, message: str, urgent: bool = False):
-        """Send alert with cooldown management"""
-        with self._lock:
+        """Send alert through multiple channels with cooldown management"""
+        alert_id = f"{alert_type}_{hash(message)}"
+        
+        # Cooldown check
+        with self._alert_lock:
             now = time.time()
             last_time = self.last_alert_time.get(alert_type, 0)
             if now - last_time < self.alert_cooldown and not urgent:
                 return
             self.last_alert_time[alert_type] = now
             
-            print(f"🚨 VOLGUARD ALERT [{alert_type}]: {message}")
-            logger.critical(f"ALERT_{alert_type}: {message}")
-            
-            if urgent and self.alert_email and self.email_password:
-                threading.Thread(target=self._send_email_alert, args=(alert_type, message), daemon=True).start()
-
-    def _send_email_alert(self, subject: str, body: str):
+            if alert_id in self.sent_alerts:
+                return  # Prevent duplicates
+            self.sent_alerts.add(alert_id)
+            self.alert_queue.append({
+                'type': alert_type,
+                'message': message,
+                'timestamp': datetime.now(),
+                'urgent': urgent
+            })
+        
+        # Send via available channels
+        tasks = []
+        if ALERT_EMAIL and EMAIL_PASSWORD:
+            tasks.append(self._send_email_alert(alert_type, message, urgent))
+        
+        # Console logging (always)
+        log_level = logging.CRITICAL if urgent else logging.WARNING
+        logger.log(log_level, f"ALERT [{alert_type}]: {message}")
+        
+        # Run all alert methods concurrently
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+    
+    async def _send_email_alert(self, alert_type: str, message: str, urgent: bool):
         """Send email alert"""
         try:
+            if not ALERT_EMAIL or not EMAIL_PASSWORD:
+                return
+                
             msg = MIMEMultipart()
-            msg['From'] = self.alert_email
-            msg['To'] = self.alert_email
-            msg['Subject'] = f"VOLGUARD HYBRID: {subject}"
+            msg['From'] = ALERT_EMAIL
+            msg['To'] = ALERT_EMAIL
+            msg['Subject'] = f"{'🚨 URGENT: ' if urgent else '⚠️ '}VolGuard 14.00 Alert: {alert_type}"
             
-            email_body = f"""
-VolGuard Hybrid Critical Alert
-Time: {datetime.now(IST).strftime('%Y-%m-%d %H:%M:%S')}
-
-{body}
-
----
-Automated alert from VolGuard Hybrid Ultimate
-"""
-            msg.attach(MIMEText(email_body, 'plain'))
+            body = f"""
+            VolGuard 14.00 System Alert
             
-            server = smtplib.SMTP("smtp.gmail.com", 587)
+            Type: {alert_type}
+            Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+            Urgent: {urgent}
+            
+            Message:
+            {message}
+            
+            ---
+            VolGuard 14.00 - Ironclad Trading System
+            Automated Alert - Do not reply
+            """
+            
+            msg.attach(MIMEText(body, 'plain'))
+            
+            server = smtplib.SMTP('smtp.gmail.com', 587)
             server.starttls()
-            server.login(self.alert_email, self.email_password)
+            server.login(ALERT_EMAIL, EMAIL_PASSWORD)
             server.send_message(msg)
             server.quit()
+            
+            logger.info(f"Email alert sent for {alert_type}")
+            
         except Exception as e:
             logger.error(f"Email alert failed: {e}")
 
@@ -77,9 +112,18 @@ Automated alert from VolGuard Hybrid Ultimate
             urgent=urgent
         )
 
-    async def risk_limit_alert(self, metric: str, value: float, limit: float, urgent: bool = False):
+    async def data_feed_alert(self, feed_type: str, error: str, urgent: bool = False):
         await self.send_alert(
-            "RISK_LIMIT",
-            f"Risk limit breached! {metric}: {value:.1f}, Limit: {limit:.1f}",
+            "DATA_FEED_ERROR",
+            f"{feed_type} data feed error: {error}",
             urgent=urgent
         )
+
+    def get_alert_stats(self) -> Dict[str, any]:
+        """Get alert system statistics"""
+        with self._alert_lock:
+            return {
+                "queue_size": len(self.alert_queue),
+                "sent_alerts": len(self.sent_alerts),
+                "recent_alerts": list(self.alert_queue)[-10:] if self.alert_queue else []
+            }
