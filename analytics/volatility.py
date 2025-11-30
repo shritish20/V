@@ -5,12 +5,13 @@ import logging
 from typing import Tuple
 from datetime import datetime
 from .sabr_model import EnhancedSABRModel
-from core.config import VIX_HISTORY_URL, NIFTY_HISTORY_URL
+from core.config import VIX_HISTORY_URL, NIFTY_HIST_URL
 
-logger = logging.getLogger("VolGuardHybrid")
+logger = logging.getLogger("VolGuard14")
 
 class HybridVolatilityAnalytics:
-    """Combines speed of Race Edition with depth of Luxury Edition"""
+    """Combines speed with depth - Ultimate volatility analytics"""
+    
     def __init__(self):
         self.vix_data = pd.DataFrame()
         self.nifty_data = pd.DataFrame()
@@ -39,7 +40,7 @@ class HybridVolatilityAnalytics:
             vix_df['Close'] = pd.to_numeric(vix_df['Close'], errors='coerce')
             self.vix_data = vix_df.dropna(subset=['Close'])
 
-            nifty_df = pd.read_csv(NIFTY_HISTORY_URL)
+            nifty_df = pd.read_csv(NIFTY_HIST_URL)
             nifty_df = parse_date(nifty_df)
             nifty_df = nifty_df.sort_values('Date').dropna(subset=['Date'])
             nifty_df['Close'] = pd.to_numeric(nifty_df['Close'], errors='coerce')
@@ -54,8 +55,7 @@ class HybridVolatilityAnalytics:
     def _create_synthetic_data(self):
         """Create realistic synthetic data"""
         dates = pd.date_range(start='2020-01-01', end=datetime.now().strftime('%Y-%m-%d'), freq='D')
-        vix_values = 15 + 5 * np.sin(np.arange(len(dates)) * 2 * np.pi / 252) + np.random.normal(0, 2, 
-        len(dates))
+        vix_values = 15 + 5 * np.sin(np.arange(len(dates)) * 2 * np.pi / 252) + np.random.normal(0, 2, len(dates))
         returns = np.random.normal(0.0005, 0.015, len(dates))
         nifty_values = 10000 * np.exp(np.cumsum(returns))
         self.vix_data = pd.DataFrame({'Date': dates, 'Close': np.clip(vix_values, 10, 40)})
