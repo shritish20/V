@@ -3,26 +3,32 @@ import os
 import sys
 from pathlib import Path
 import asyncio
+import logging
+from utils.logger import setup_logger
 
 # Add the current directory to Python path
 sys.path.append(str(Path(__file__).parent))
 
 if __name__ == "__main__":
-    print("🚀 VOLGUARD HYBRID ULTIMATE - FASTAPI EDITION")
-    print("✅ MODULAR ARCHITECTURE")
-    print("✅ PRODUCTION-GRADE API")
+    logger = setup_logger()
+    
+    print("🚀 VOLGUARD 14.00 - IRONCLAD ARCHITECTURE")
+    print("✅ PRODUCTION-GRADE TRADING ENGINE")
+    print("✅ ADVANCED VOLATILITY ANALYTICS")
     print("✅ COMPREHENSIVE RISK MANAGEMENT")
-    print("🎯 READY FOR LIVE TRADING")
+    print("✅ REAL-TIME ANALYTICS & ALERTS")
+    print("✅ PRODUCTION MONITORING & METRICS")
+    print("🎯 READY FOR LIVE DEPLOYMENT")
 
-    # CRITICAL FIX 1: Use persistent storage path
+    # Create persistent storage directory
     PERSISTENT_DIR = os.getenv("PERSISTENT_DATA_DIR", "./data")
     Path(PERSISTENT_DIR).mkdir(parents=True, exist_ok=True)
     
-    # Create required files in the persistent directory
+    # Create required files
     for file in [
-        os.path.join(PERSISTENT_DIR, "volguard_hybrid.db"), 
-        os.path.join(PERSISTENT_DIR, "volguard_hybrid_log.txt"), 
-        os.path.join(PERSISTENT_DIR, "volguard_hybrid_journal.csv")
+        os.path.join(PERSISTENT_DIR, "volguard_14.db"), 
+        os.path.join(PERSISTENT_DIR, "volguard_14_log.txt"), 
+        os.path.join(PERSISTENT_DIR, "volguard_14_journal.csv")
     ]:
         if not os.path.exists(file):
             try:
@@ -30,10 +36,16 @@ if __name__ == "__main__":
             except IOError as e:
                 print(f"WARNING: Could not create file {file}. Error: {e}")
 
-    # Run the FastAPI server using the PORT environment variable
+    # Configuration
+    ENV = os.getenv("ENV", "production")
+    PORT = int(os.getenv("PORT", 8000))
+
+    # Run the FastAPI server
     uvicorn.run(
         "api.routes:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", 8000)),
+        port=PORT,
         log_level="info",
+        reload=(ENV == "development"),
+        loop="uvloop" if sys.platform != "win32" else "asyncio"
     )
