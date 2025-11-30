@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
+    from datetime import datetime, timedelta
+from typing import List, Dict, Tuple, Optional, Any  # ADDED: Any import
 from core.models import AdvancedMetrics, MultiLegTrade, Position, GreeksSnapshot
 from core.enums import MarketRegime
 from core.config import IST, LOT_SIZE
@@ -125,4 +125,4 @@ class AdvancedStrategyEngine:
             "probability_of_profit": 0.65,  # Placeholder
             "risk_reward_ratio": 2.5,  # Placeholder
             "margin_required": 50000  # Placeholder
-                             }
+        }
