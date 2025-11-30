@@ -18,18 +18,29 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 def setup_logger():
-    """Setup enhanced logging"""
-    logger = logging.getLogger("VolGuardHybrid")
+    """Setup enhanced logging for VolGuard 14.00"""
+    logger = logging.getLogger("VolGuard14")
+    
+    if logger.handlers:
+        return logger
+        
     logger.setLevel(logging.INFO)
     
+    # File handler
     fh = logging.FileHandler(TRADE_LOG_FILE)
-    fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    fh.setLevel(logging.INFO)
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    fh.setFormatter(file_formatter)
     
+    # Console handler with colors
     sh = logging.StreamHandler()
-    sh.setFormatter(ColoredFormatter('%(asctime)s - %(levelname)s - %(message)s'))
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(ColoredFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
     
-    if not logger.handlers:
-        logger.addHandler(fh)
-        logger.addHandler(sh)
-        
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    
+    # Prevent propagation to root logger
+    logger.propagate = False
+    
     return logger
