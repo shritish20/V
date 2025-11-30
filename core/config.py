@@ -54,8 +54,8 @@ GST_RATE = 0.18
 EXCHANGE_CHARGES = 0.00005
 STAMP_DUTY = 0.00003
 
-# 📁 Files & Database
-PERSISTENT_DATA_DIR = os.getenv("PERSISTENT_DATA_DIR", "./data")
+# 📁 Files & Database - RENDER COMPATIBLE
+PERSISTENT_DATA_DIR = os.getenv("PERSISTENT_DATA_DIR", "/tmp/data")
 
 DB_FILE = os.path.join(PERSISTENT_DATA_DIR, "volguard_14.db")
 TRADE_LOG_FILE = os.path.join(PERSISTENT_DATA_DIR, "volguard_14_log.txt")
