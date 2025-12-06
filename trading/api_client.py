@@ -1,141 +1,141 @@
 import aiohttp
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any
-from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
 from core.config import settings, get_full_url
-from core.models import GreeksSnapshot
+from core.models import Order
 
-logger = logging.getLogger("VolGuard18")
+logger = logging.getLogger("UpstoxAPI")
 
 class EnhancedUpstoxAPI:
-    def __init__(self, access_token: str):
-        self.access_token = access_token
-        self.headers = {"Authorization": f"Bearer {access_token}"}
-        self.ws: Optional[aiohttp.ClientWebSocketResponse] = None
-        self.session: Optional aiohttp.ClientSession = None
-        self.pricing_engine = None
-        self.subscribed_instruments: set = set()
+    def __init__(self, token: str):
+        self.token = token
+        self.headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Api-Version": "2.0",
+        }
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    def set_pricing_engine(self, pricing_engine):
-        self.pricing_engine = pricing_engine
+    async def _session(self) -> aiohttp.ClientSession:
+        if self.session is None or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=30)
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
+        return self.session
 
-    async def connect_ws(self, quote_callback):
-        self.session = aiohttp.ClientSession()
-        ws_url = f"{settings.WS_BASE_URL}?apiKey={settings.UPSTOX_ACCESS_TOKEN}"
-        self.ws = await self.session.ws_connect(ws_url)
-        logger.info("WebSocket connected")
-        async for msg in self.ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                data = json.loads(msg.data)
-                if data.get("type") == "quote":
-                    instrument_key = data.get("instrument_key")
-                    last_price = data.get("last_price")
-                    if instrument_key and last_price:
-                        await quote_callback(instrument_key, last_price)
-            elif msg.type == aiohttp.WSMsgType.ERROR:
-                logger.error("WebSocket error")
-                break
+    async def _request_with_retry(self, method: str, url: str, **kwargs) -> Dict:
+        retries = 3
+        for i in range(retries):
+            try:
+                session = await self._session()
+                async with session.request(method, url, **kwargs) as response:
+                    if 400 <= response.status < 500:
+                        logger.error(
+                            f"Client error {response.status} on {url}: {await response.text()}"
+                        )
+                        return {}
+                    if response.status >= 500:
+                        logger.warning(
+                            f"Server error {response.status} on {url}, retry {i+1}/{retries}"
+                        )
+                        await asyncio.sleep(1)
+                        continue
+                    return await response.json()
+            except Exception as e:
+                logger.error(f"Request exception on {url}: {e}")
+                await asyncio.sleep(1)
+        return {}
 
-    async def subscribe_instruments(self, instrument_keys: List[str]):
-        if not self.ws:
-            logger.warning("WebSocket not connected")
-            return
-        new_keys = set(instrument_keys) - self.subscribed_instruments
-        if new_keys:
-            await self.ws.send_json({
-                "action": "subscribe",
-                "instrument_keys": list(new_keys)
-            })
-            self.subscribed_instruments.update(new_keys)
-            logger.debug(f"Subscribed to {len(new_keys)} new instruments")
-
-    async def get_quotes(self, instrument_keys: List[str]) -> Dict[str, Any]:
+    async def get_quotes(self, instrument_keys: List[str]) -> Dict:
+        if not instrument_keys:
+            return {}
         url = get_full_url("market_quote")
-        params = {"instrument_key": ",".join(instrument_keys)}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.headers, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("data", {})
-                else:
-                    logger.warning(f"Failed to fetch quotes: {resp.status}")
-                    return {}
+        return await self._request_with_retry(
+            "GET", url, params={"instrument_key": ",".join(instrument_keys)}
+        )
 
-    async def fetch_option_chain(self, index_key: str, expiry: str) -> List[Dict[str, Any]]:
-        url = get_full_url("option_chain")
-        params = {"instrument_key": index_key, "expiry_date": expiry}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.headers, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("data", [])
-                else:
-                    logger.warning(f"Failed to fetch option chain: {resp.status}")
-                    return []
+    async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
+        if settings.SAFETY_MODE != "live":
+            await asyncio.sleep(0.1)
+            logger.info(
+                f"[{settings.SAFETY_MODE}] Order Sim: {order.transaction_type} "
+                f"{order.quantity} of {order.instrument_key}"
+            )
+            return True, f"SIM-{int(asyncio.get_event_loop().time())}"
 
-    async def get_available_expiries(self, index_key: str = settings.MARKET_KEY_INDEX) -> List[str]:
-        chain = await self.fetch_option_chain(index_key, "")
-        expiries = set()
-        for item in chain:
-            expiries.add(item.get("expiry_date", ""))
-        return sorted(list(expiries))
-
-    async def get_short_term_positions(self) -> List[Dict[str, Any]]:
-        url = get_full_url("order_book")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return [p for p in data.get("data", []) if p.get("product") == "I" and p.get("net_quantity", 0) != 0]
-                else:
-                    logger.warning(f"Failed to fetch positions: {resp.status}")
-                    return []
-
-    async def place_order(self, order: Dict[str, Any]) -> Optional[str]:
         url = get_full_url("place_order")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=self.headers, json=order) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("data", {}).get("order_id")
-                else:
-                    logger.error(f"Order placement failed: {resp.status}")
-                    return None
-
-    async def place_gtt_order(self, gtt_order: Dict[str, Any]) -> Optional[str]:
-        url = get_full_url("gtt_place")
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, headers=self.headers, json=gtt_order) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("data", {}).get("order_id")
-                else:
-                    logger.error(f"GTT order placement failed: {resp.status}")
-                    return None
+        payload = {
+            "instrument_token": order.instrument_key,
+            "transaction_type": order.transaction_type,
+            "quantity": abs(order.quantity),
+            "order_type": order.order_type.value,
+            "price": round(order.price, 2),
+            "product": order.product,
+            "validity": order.validity,
+            "disclosed_quantity": order.disclosed_quantity,
+            "trigger_price": round(order.trigger_price, 2),
+            "is_amo": False,
+            "tag": "VG19",
+        }
+        res = await self._request_with_retry("POST", url, json=payload)
+        if res.get("status") == "success":
+            return True, res["data"]["order_id"]
+        logger.error(f"Order Failed: {res}")
+        return False, None
 
     async def cancel_order(self, order_id: str) -> bool:
+        if order_id.startswith("SIM"):
+            return True
         url = get_full_url("cancel_order")
-        async with aiohttp.ClientSession() as session:
-            async with session.delete(url, headers=self.headers, params={"order_id": order_id}) as resp:
-                if resp.status == 200:
-                    logger.info(f"Order {order_id} cancelled")
-                    return True
-                else:
-                    logger.warning(f"Failed to cancel order {order_id}: {resp.status}")
-                    return False
+        res = await self._request_with_retry(
+            "DELETE", url, params={"order_id": order_id}
+        )
+        return res.get("status") == "success"
 
-    async def get_order_status(self, order_id: str) -> Optional[Dict[str, Any]]:
+    async def get_order_details(self, order_id: str) -> Dict:
+        if order_id.startswith("SIM"):
+            return {
+                "status": "complete",
+                "filled_quantity": 100,
+                "average_price": 100.0,
+            }
         url = get_full_url("order_details")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=self.headers, params={"order_id": order_id}) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("data", {})
-                else:
-                    logger.warning(f"Failed to fetch order status: {resp.status}")
-                    return None
+        return await self._request_with_retry(
+            "GET", url, params={"order_id": order_id}
+        )
+
+    async def get_short_term_positions(self) -> List[Dict]:
+        if settings.SAFETY_MODE != "live":
+            return []
+        url = f"{settings.API_BASE_V2}/portfolio/short-term-positions"
+        res = await self._request_with_retry("GET", url)
+        return res.get("data", [])
+
+    async def get_option_greeks(self, instrument_keys: List[str]) -> Dict[str, Any]:
+        if not instrument_keys:
+            return {}
+        url = get_full_url("option_greek")
+        params = {"instrument_key": ",".join(instrument_keys)}
+        try:
+            response = await self._request_with_retry("GET", url, params=params)
+            if response.get("status") == "success":
+                return response.get("data", {})
+        except Exception as e:
+            logger.error(f"Failed to fetch Upstox Greeks: {e}")
+        return {}
+
+    async def get_current_future_symbol(self, index_key: str) -> str:
+        # NOTE: Implement proper resolution via instruments dump in future
+        return "NSE_FO|NIFTY24DECFUT"
+
+    async def resolve_instrument_key(self, strike: float, type: str, expiry: str) -> str:
+        # Placeholder: In production this should query a local instrument master DB
+        # Format: NSE_FO|NIFTY23DEC21000CE
+        from datetime import datetime
+        formatted_date = datetime.strptime(expiry, "%Y-%m-%d").strftime("%y%b").upper()
+        return f"NSE_FO|NIFTY{formatted_date}{int(strike)}{type}"
 
     async def close(self):
-        if self.session:
+        if self.session and not self.session.closed:
             await self.session.close()
