@@ -1,229 +1,323 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
-from pydantic import BaseModel
-from typing import Dict, Any, Optional
-from core.engine import VolGuard14Engine
-from core.models import EngineStatus
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends, status
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, validator
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+from pathlib import Path
+import json
+import logging
+from core.engine import VolGuard17Engine
+from core.models import EngineStatus, DashboardData
+from core.config import settings, DASHBOARD_DATA_DIR
+from core.enums import CapitalBucket, StrategyType
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
-import logging
-import asyncio  # ADD THIS
 
-logger = logging.getLogger("VolGuard14")
+logger = logging.getLogger("VolGuard18")
 
 app = FastAPI(
-    title="VolGuard 14.00 API",
-    description="Ironclad Trading System - Production Grade",
-    version="14.0.0"
+    title="VolGuard 18.0 API",
+    description="Intelligent Trading System with Capital Allocation",
+    version="18.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json"
 )
 
-# Global engine instance
-ENGINE: Optional[VolGuard14Engine] = None
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+dashboard_path = Path(DASHBOARD_DATA_DIR)
+dashboard_path.mkdir(exist_ok=True)
+app.mount("/dashboard/static", StaticFiles(directory=dashboard_path), name="dashboard_static")
+
+ENGINE: Optional[VolGuard17Engine] = None
+
+# ==================== PYDANTIC MODELS ====================
 
 class EngineStartRequest(BaseModel):
-    continuous: bool = True
+    continuous: bool = Field(default=True, description="Run continuously")
+    initialize_dashboard: bool = Field(default=True, description="Initialize dashboard on start")
 
 class TradeRequest(BaseModel):
-    strategy: str
-    lots: int
+    strategy: str = Field(..., description="Strategy type")
+    lots: int = Field(1, ge=1, le=10, description="Number of lots")
+    capital_bucket: str = Field(..., description="Capital bucket")
+
+    @validator('capital_bucket')
+    def validate_bucket(cls, v):
+        if v not in [b.value for b in CapitalBucket]:
+            raise ValueError(f"Invalid bucket. Must be one of: {[b.value for b in CapitalBucket]}")
+        return v
+
+class CapitalAdjustmentRequest(BaseModel):
+    weekly_pct: float = Field(0.4, ge=0.0, le=1.0, description="Weekly allocation %")
+    monthly_pct: float = Field(0.5, ge=0.0, le=1.0, description="Monthly allocation %")
+    intraday_pct: float = Field(0.1, ge=0.0, le=1.0, description="Intraday allocation %")
+
+    @validator('weekly_pct', 'monthly_pct', 'intraday_pct')
+    def validate_percentages(cls, v, values):
+        total = values.get('weekly_pct', 0) + values.get('monthly_pct', 0) + values.get('intraday_pct', 0)
+        if abs(total - 1.0) > 0.01:
+            raise ValueError(f"Percentages must sum to 100%, got {total * 100:.1f}%")
+        return v
+
+class StrategyRecommendationRequest(BaseModel):
+    regime: Optional[str] = Field(None, description="Market regime")
+    ivp: Optional[float] = Field(None, ge=0.0, le=100.0, description="IV percentile")
+    event_risk: Optional[float] = Field(None, ge=0.0, le=5.0, description="Event risk score")
+    spot_price: Optional[float] = Field(None, gt=0.0, description="Spot price")
+
+# ==================== DEPENDENCIES ====================
+
+def get_engine():
+    if not ENGINE:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Engine not initialized")
+    return ENGINE
+
+# ==================== STARTUP/SHUTDOWN ====================
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize AND START engine on startup"""
     global ENGINE
     try:
-        ENGINE = VolGuard14Engine()
-        logger.info("VolGuard 14.00 Engine initialized successfully")
-        
-        # 🚀 CRITICAL FIX: Start the engine automatically
-        asyncio.create_task(ENGINE.run(continuous=True))
-        logger.info("✅ Trading engine started automatically in background")
-        
+        ENGINE = VolGuard17Engine()
+        logger.info("✅ VolGuard 18.0 Engine initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize engine: {e}")
+        logger.error(f"❌ Failed to initialize engine: {e}")
         raise
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Shutdown engine gracefully"""
     global ENGINE
     if ENGINE:
         await ENGINE.shutdown()
-        logger.info("VolGuard 14.00 Engine shutdown complete")
+        logger.info("✅ VolGuard 18.0 Engine shutdown complete")
 
-# ADD DEBUG ENDPOINT
-@app.get("/debug/state")
-async def debug_state():
-    """Debug endpoint to check engine state"""
-    if not ENGINE:
-        return {"error": "Engine not initialized"}
-    
-    return {
-        "engine_exists": ENGINE is not None,
-        "engine_running": ENGINE.running,
-        "circuit_breaker": ENGINE.circuit_breaker,
-        "cycle_count": ENGINE.cycle_count,
-        "trades_count": len(ENGINE.trades),
-        "rt_quotes_count": len(ENGINE.rt_quotes),
-        "market_open": ENGINE._is_market_open() if hasattr(ENGINE, '_is_market_open') else "unknown",
-        "ws_connected": ENGINE.api.ws_connected if hasattr(ENGINE, 'api') and hasattr(ENGINE.api, 'ws_connected') else False
-    }
+# ==================== ROOT & HEALTH ====================
 
-# KEEP ALL YOUR EXISTING ENDPOINTS BELOW...
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """Root endpoint with system info"""
-    return {
-        "message": "VolGuard 14.00 - Ironclad Trading System",
-        "status": "operational",
-        "version": "14.0.0",
-        "engine_running": ENGINE.running if ENGINE else False
-    }
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><title>VolGuard 18.0</title></head>
+    <body>
+    <h1>🚀 VolGuard 18.0 – Intelligent Volatility Trading System</h1>
+    <p>✅ System is online. Visit <a href="/dashboard">/dashboard</a> for live dashboard.</p>
+    </body>
+    </html>
+    """
 
 @app.get("/health")
-async def health_check():
-    """Comprehensive health check endpoint"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
+async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        health_data = ENGINE.get_system_health()
+        health_data = engine.get_system_health()
+        is_healthy = (
+            health_data["engine"]["running"] is not False and
+            health_data["analytics"]["dashboard_ready"] and
+            health_data["capital_allocation"] is not None
+        )
         return {
-            "status": "healthy",
+            "status": "healthy" if is_healthy else "degraded",
+            "timestamp": datetime.now().isoformat(),
             "engine_running": health_data["engine"]["running"],
             "circuit_breaker": health_data["engine"]["circuit_breaker"],
             "active_trades": health_data["engine"]["active_trades"],
-            "analytics_healthy": health_data["analytics"]["sabr_calibrated"]
+            "dashboard_ready": health_data["analytics"]["dashboard_ready"]
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
-# ... KEEP ALL YOUR OTHER EXISTING ENDPOINTS EXACTLY AS THEY ARE
-@app.get("/status")
-async def get_status():
-    """Get detailed engine status"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    status = ENGINE.get_status()
+# ==================== DASHBOARD ENDPOINTS ====================
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard_home():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head><title>VolGuard 18.0 Dashboard</title></head>
+    <body>
+    <h1>📊 VolGuard 18.0 Dashboard</h1>
+    <p>Real-time trading analytics with smart capital allocation.</p>
+    <ul>
+    <li><a href="/api/dashboard/data">📈 Dashboard Data (JSON)</a></li>
+    <li><a href="/api/health">🩺 Health Check</a></li>
+    <li><a href="/api/status">⚙️ Engine Status</a></li>
+    </ul>
+    </body>
+    </html>
+    """
+
+@app.get("/api/dashboard/data")
+async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
+    try:
+        data = engine.get_dashboard_data()
+        if not data:
+            raise HTTPException(status_code=404, detail="Dashboard data not available")
+        return {**data, "timestamp": datetime.now().isoformat()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get dashboard data: {str(e)}")
+
+# ==================== ENGINE CONTROL ====================
+
+@app.get("/api/status")
+async def get_status(engine: VolGuard17Engine = Depends(get_engine)):
+    status = engine.get_status()
     return {
         "running": status.running,
         "circuit_breaker": status.circuit_breaker,
         "cycle_count": status.cycle_count,
         "total_trades": status.total_trades,
         "daily_pnl": status.daily_pnl,
-        "max_equity": status.max_equity,
-        "last_metrics_timestamp": status.last_metrics.timestamp.isoformat() if status.last_metrics else None
+        "dashboard_ready": status.dashboard_ready,
+        "timestamp": datetime.now().isoformat()
     }
 
-@app.post("/start")
-async def start_engine(background_tasks: BackgroundTasks, request: EngineStartRequest = EngineStartRequest()):
-    """Start the trading engine"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    if ENGINE.running:
+@app.post("/api/start")
+async def start_engine(background_tasks: BackgroundTasks,
+                       request: EngineStartRequest = EngineStartRequest(),
+                       engine: VolGuard17Engine = Depends(get_engine)):
+    if engine.running:
         raise HTTPException(status_code=400, detail="Engine already running")
-    
     try:
-        background_tasks.add_task(ENGINE.run, request.continuous)
-        return {"status": "starting", "continuous": request.continuous}
+        background_tasks.add_task(engine.run)
+        return {
+            "status": "starting",
+            "continuous": request.continuous,
+            "initialize_dashboard": request.initialize_dashboard,
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start engine: {str(e)}")
 
-@app.post("/stop")
-async def stop_engine():
-    """Stop the trading engine"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    if not ENGINE.running:
+@app.post("/api/stop")
+async def stop_engine(engine: VolGuard17Engine = Depends(get_engine)):
+    if not engine.running:
         raise HTTPException(status_code=400, detail="Engine not running")
-    
     try:
-        await ENGINE.shutdown()
-        return {"status": "stopping"}
+        await engine.shutdown()
+        return {"status": "stopping", "timestamp": datetime.now().isoformat()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to stop engine: {str(e)}")
 
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint"""
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+# ==================== CAPITAL ALLOCATION ====================
 
-@app.get("/risk")
-async def get_risk_report():
-    """Get comprehensive risk report"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
+@app.get("/api/capital/allocation")
+async def get_capital_allocation(engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        risk_report = ENGINE.risk_mgr.get_risk_report()
-        return risk_report
+        capital_status = engine.capital_allocator.get_allocation_status()
+        return {
+            "allocation": capital_status,
+            "total_capital": engine.capital_allocator.total_capital,
+            "total_used": engine.capital_allocator.get_total_used_capital(),
+            "total_available": engine.capital_allocator.get_total_available_capital(),
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get risk report: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get capital allocation: {str(e)}")
 
-@app.get("/analytics/volatility")
-async def get_volatility_metrics():
-    """Get current volatility analytics"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    if not ENGINE.last_metrics:
-        raise HTTPException(status_code=404, detail="No analytics data available")
-    
-    return {
-        "spot_price": ENGINE.last_metrics.spot_price,
-        "vix": ENGINE.last_metrics.vix,
-        "ivp": ENGINE.last_metrics.ivp,
-        "realized_vol": ENGINE.last_metrics.realized_vol_7d,
-        "garch_vol": ENGINE.last_metrics.garch_vol_7d,
-        "regime": ENGINE.last_metrics.regime.value,
-        "event_risk": ENGINE.last_metrics.event_risk_score
-    }
-
-@app.get("/trades/active")
-async def get_active_trades():
-    """Get all active trades"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
+@app.post("/api/capital/adjust")
+async def adjust_capital_allocation(request: CapitalAdjustmentRequest,
+                                    engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        active_trades = []
-        for trade in ENGINE.trades:
-            if trade.status.value in ["OPEN", "EXTERNAL"]:
-                active_trades.append({
-                    "id": trade.id,
-                    "strategy": trade.strategy_type,
-                    "lots": trade.lots,
-                    "pnl": trade.total_unrealized_pnl(),
-                    "vega": trade.trade_vega,
-                    "delta": trade.trade_delta,
-                    "entry_time": trade.entry_time.isoformat()
-                })
-        return {"active_trades": active_trades}
+        new_allocation = {
+            "weekly_expiries": request.weekly_pct,
+            "monthly_expiries": request.monthly_pct,
+            "intraday_adjustments": request.intraday_pct
+        }
+        success = engine.capital_allocator.adjust_allocation(new_allocation)
+        if success:
+            return {"status": "success", "new_allocation": new_allocation, "timestamp": datetime.now().isoformat()}
+        else:
+            raise HTTPException(status_code=400, detail="Cannot adjust allocation - too much capital in use")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to adjust capital allocation: {str(e)}")
+
+# ==================== TRADES & PORTFOLIO ====================
+
+@app.get("/api/trades/active")
+async def get_active_trades(engine: VolGuard17Engine = Depends(get_engine)):
+    try:
+        active_trades = [
+            {
+                "id": trade.id,
+                "strategy": trade.strategy_type.value,
+                "lots": trade.lots,
+                "pnl": trade.total_unrealized_pnl(),
+                "vega": trade.trade_vega,
+                "delta": trade.trade_delta,
+                "theta": trade.trade_theta,
+                "entry_time": trade.entry_time.isoformat() if trade.entry_time else None,
+                "expiry_type": trade.expiry_type.value,
+                "capital_bucket": trade.capital_bucket.value,
+                "status": trade.status.value
+            }
+            for trade in engine.trades if trade.status.value in ["OPEN", "EXTERNAL"]
+        ]
+        return {
+            "active_trades": active_trades,
+            "count": len(active_trades),
+            "timestamp": datetime.now().isoformat()
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get active trades: {str(e)}")
 
-@app.post("/emergency/flatten")
-async def emergency_flatten():
-    """Emergency flatten all positions"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
+# ==================== ANALYTICS ====================
+
+@app.get("/api/analytics/volatility")
+async def get_volatility_analytics(engine: VolGuard17Engine = Depends(get_engine)):
+    if not engine.last_metrics:
+        raise HTTPException(status_code=404, detail="No analytics data available")
+    m = engine.last_metrics
+    return {
+        "spot_price": m.spot_price,
+        "vix": m.vix,
+        "ivp": m.ivp,
+        "realized_vol": m.realized_vol_7d,
+        "garch_vol": m.garch_vol_7d,
+        "iv_rv_spread": m.iv_rv_spread,
+        "regime": m.regime.value,
+        "event_risk": m.event_risk_score,
+        "sabr_parameters": {
+            "alpha": m.sabr_alpha,
+            "beta": m.sabr_beta,
+            "rho": m.sabr_rho,
+            "nu": m.sabr_nu
+        },
+        "timestamp": m.timestamp.isoformat()
+    }
+
+# ==================== EMERGENCY CONTROLS ====================
+
+@app.post("/api/emergency/flatten")
+async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        await ENGINE._emergency_flatten()
-        return {"status": "emergency_flatten_initiated"}
+        await engine._emergency_flatten()
+        return {"status": "emergency_flatten_initiated", "timestamp": datetime.now().isoformat()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Emergency flatten failed: {str(e)}")
 
-@app.get("/system/health/detailed")
-async def get_detailed_health():
-    """Get detailed system health information"""
-    if not ENGINE:
-        raise HTTPException(status_code=503, detail="Engine not initialized")
-    
-    try:
-        health_data = ENGINE.get_system_health()
-        return health_data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to get detailed health: {str(e)}")
+# ==================== METRICS ====================
+
+@app.get("/api/metrics")
+async def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+# ==================== UTILITIES ====================
+
+@app.get("/api/version")
+async def get_version():
+    return {
+        "version": "18.0.0",
+        "name": "VolGuard 18.0",
+        "description": "Intelligent Trading System with Capital Allocation",
+        "timestamp": datetime.now().isoformat()
+    }
