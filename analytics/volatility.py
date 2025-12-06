@@ -1,109 +1,167 @@
-import pandas as pd
 import numpy as np
-from arch import arch_model
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Tuple, Dict, List
 import logging
-from typing import Tuple
-from datetime import datetime
-from .sabr_model import EnhancedSABRModel
-from core.config import VIX_HISTORY_URL, NIFTY_HIST_URL
+from arch import arch_model
+from core.config import settings, IST
+from utils.data_fetcher import DashboardDataFetcher
 
-logger = logging.getLogger("VolGuard14")
+logger = logging.getLogger("VolGuard18")
 
 class HybridVolatilityAnalytics:
-    """Combines speed with depth - Ultimate volatility analytics"""
-    
     def __init__(self):
-        self.vix_data = pd.DataFrame()
-        self.nifty_data = pd.DataFrame()
-        self.sabr_model = EnhancedSABRModel()
-        self._load_historical_data()
+        self.data_fetcher = DashboardDataFetcher()
+        self.vol_cache: Dict[str, Tuple[float, datetime]] = {}
+        self.cache_ttl = 300  # 5 minutes
 
-    def _load_historical_data(self):
-        """Load or create realistic historical data, with robust date parsing."""
-        date_formats = ['%d-%b-%Y', '%Y-%m-%d', '%m/%d/%Y']
-        
-        def parse_date(df, col_name='Date'):
-            for fmt in date_formats:
-                try:
-                    df[col_name] = pd.to_datetime(df[col_name], format=fmt, errors='coerce')
-                    df = df.dropna(subset=[col_name])
-                    if not df.empty:
-                        return df
-                except ValueError:
-                    continue
-            return df
-
+    def get_volatility_metrics(self, current_vix: float) -> Tuple[float, float, float]:
         try:
-            vix_df = pd.read_csv(VIX_HISTORY_URL)
-            vix_df = parse_date(vix_df)
-            vix_df = vix_df.sort_values('Date').dropna(subset=['Date'])
-            vix_df['Close'] = pd.to_numeric(vix_df['Close'], errors='coerce')
-            self.vix_data = vix_df.dropna(subset=['Close'])
-
-            nifty_df = pd.read_csv(NIFTY_HIST_URL)
-            nifty_df = parse_date(nifty_df)
-            nifty_df = nifty_df.sort_values('Date').dropna(subset=['Date'])
-            nifty_df['Close'] = pd.to_numeric(nifty_df['Close'], errors='coerce')
-            self.nifty_data = nifty_df.dropna(subset=['Close'])
-
-            logger.info(f"Loaded {len(self.vix_data)} VIX and {len(self.nifty_data)} Nifty records")
-
+            realized_vol = self._calculate_realized_volatility()
+            garch_vol = self._calculate_garch_forecast()
+            iv_percentile = self._calculate_iv_percentile(current_vix)
+            logger.debug(f"Vol Metrics - Realized: {realized_vol:.2f}%, GARCH: {garch_vol:.2f}%, IVP: {iv_percentile:.2f}%")
+            return realized_vol, garch_vol, iv_percentile
         except Exception as e:
-            logger.warning(f"Historical data load failed, using synthetic data: {e}")
-            self._create_synthetic_data()
+            logger.error(f"Volatility metrics calculation failed: {e}")
+            return 15.0, 15.0, 50.0
 
-    def _create_synthetic_data(self):
-        """Create realistic synthetic data"""
-        dates = pd.date_range(start='2020-01-01', end=datetime.now().strftime('%Y-%m-%d'), freq='D')
-        vix_values = 15 + 5 * np.sin(np.arange(len(dates)) * 2 * np.pi / 252) + np.random.normal(0, 2, len(dates))
-        returns = np.random.normal(0.0005, 0.015, len(dates))
-        nifty_values = 10000 * np.exp(np.cumsum(returns))
-        self.vix_data = pd.DataFrame({'Date': dates, 'Close': np.clip(vix_values, 10, 40)})
-        self.nifty_data = pd.DataFrame({'Date': dates, 'Close': nifty_values})
-
-    def calculate_realized_volatility(self, window: int = 7) -> float:
-        """Calculate realized volatility from Nifty returns"""
+    def _calculate_realized_volatility(self, window: int = 7) -> float:
+        cache_key = f"realized_vol_{window}"
+        if cache_key in self.vol_cache:
+            value, timestamp = self.vol_cache[cache_key]
+            if (datetime.now(IST) - timestamp).total_seconds() < self.cache_ttl:
+                return value
         try:
-            if self.nifty_data.empty: return 15.0
-            returns = np.log(self.nifty_data['Close'] / self.nifty_data['Close'].shift(1))
-            recent_returns = returns.tail(window).dropna()
-            if len(recent_returns) < 5: return 15.0
-            realized_vol = np.std(recent_returns) * np.sqrt(252) * 100
-            return float(np.clip(realized_vol, 5, 60))
+            returns = self.data_fetcher.nifty_data['Log_Returns'].dropna().tail(window)
+            realized_vol = returns.std() * np.sqrt(252) * 100
+            self.vol_cache[cache_key] = (realized_vol, datetime.now(IST))
+            return realized_vol
         except Exception as e:
             logger.error(f"Realized vol calculation failed: {e}")
             return 15.0
 
-    def calculate_garch_volatility(self, horizon: int = 7) -> float:
-        """GARCH volatility forecasting"""
+    def _calculate_garch_forecast(self, horizon: int = 1) -> float:
+        cache_key = f"garch_forecast_{horizon}"
+        if cache_key in self.vol_cache:
+            value, timestamp = self.vol_cache[cache_key]
+            if (datetime.now(IST) - timestamp).total_seconds() < self.cache_ttl:
+                return value
         try:
-            if self.nifty_data.empty or len(self.nifty_data) < 100: return 15.0
-            returns = np.log(self.nifty_data['Close'] / self.nifty_data['Close'].shift(1))
-            returns = returns.dropna()
-            if len(returns) < 100: return 15.0
-            model = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='normal')
-            fitted_model = model.fit(disp='off', show_warning=False)
-            forecast = fitted_model.forecast(horizon=horizon, reindex=False)
-            garch_vol = np.sqrt(forecast.variance.iloc[-1].mean()) / 100
-            annualized_vol = garch_vol * np.sqrt(252) * 100
-            return float(np.clip(annualized_vol, 5, 60))
+            returns = self.data_fetcher.nifty_data['Log_Returns'].dropna().tail(252)
+            if len(returns) < 100:
+                return 15.0
+            model = arch_model(returns * 100, vol='Garch', p=1, q=1)
+            fitted_model = model.fit(disp='off')
+            forecast = fitted_model.forecast(horizon=horizon)
+            garch_vol = np.sqrt(forecast.variance.values[-1, -1]) / 100
+            garch_vol_annual = garch_vol * np.sqrt(252) * 100
+            self.vol_cache[cache_key] = (garch_vol_annual, datetime.now(IST))
+            return garch_vol_annual
         except Exception as e:
-            logger.error(f"GARCH calculation failed: {e}")
+            logger.error(f"GARCH forecast failed: {e}")
             return 15.0
 
-    def calculate_iv_percentile(self, current_vix: float, lookback_days: int = 252) -> float:
-        """Calculate IV Percentile"""
+    def _calculate_iv_percentile(self, current_vix: float, lookback_days: int = 252) -> float:
+        cache_key = f"iv_percentile_{current_vix:.2f}"
+        if cache_key in self.vol_cache:
+            value, timestamp = self.vol_cache[cache_key]
+            if (datetime.now(IST) - timestamp).total_seconds() < self.cache_ttl:
+                return value
         try:
-            if self.vix_data.empty: return 50.0
-            recent_vix = self.vix_data.tail(lookback_days)["Close"]
-            ivp = (recent_vix < current_vix).mean() * 100.0
-            return float(max(0.0, min(100.0, ivp)))
-        except Exception:
-            return 50.0
+            iv_percentile = self.data_fetcher.calculate_iv_percentile(current_vix, lookback_days)
+            self.vol_cache[cache_key] = (iv_percentile, datetime.now(IST))
+            return iv_percentile
+        except Exception as e:
+            logger.error(f"IV percentile calculation failed: {e}")
+            if current_vix < 12:
+                return 20.0
+            elif current_vix < 18:
+                return 50.0
+            elif current_vix < 25:
+                return 70.0
+            else:
+                return 90.0
 
-    def get_volatility_metrics(self, current_vix: float) -> Tuple[float, float, float]:
-        """Get comprehensive volatility metrics"""
-        realized_vol = self.calculate_realized_volatility()
-        garch_vol = self.calculate_garch_volatility()
-        ivp = self.calculate_iv_percentile(current_vix)
-        return realized_vol, garch_vol, ivp
+    def calculate_volatility_regime(self, vix: float, ivp: float, realized_vol: float) -> str:
+        iv_rv_spread = vix - realized_vol
+        if vix > 25 and iv_rv_spread > 5.0:
+            return "PANIC"
+        elif vix > 20 and ivp > 70:
+            return "FEAR_BACKWARDATION"
+        elif ivp < 30:
+            return "LOW_VOL_COMPRESSION"
+        elif 15 <= vix <= 22 and ivp < 70:
+            return "CALM_COMPRESSION"
+        else:
+            return "TRANSITION"
+
+    def calculate_expected_move(self, spot: float, straddle_price: float) -> Tuple[float, float, float]:
+        expected_move_pct = (straddle_price / spot) * 100
+        lower_band = spot - straddle_price
+        upper_band = spot + straddle_price
+        return expected_move_pct, lower_band, upper_band
+
+    def calculate_volatility_surface(self, chain_data: List[Dict], spot: float) -> List[Dict]:
+        surface_points = []
+        try:
+            for item in chain_data:
+                strike = item.get('strike_price', 0)
+                ce_data = item.get('call_options', {})
+                pe_data = item.get('put_options', {})
+                if not ce_data or not pe_data:
+                    continue
+                ce_iv = ce_data.get('option_greeks', {}).get('iv', 0)
+                pe_iv = pe_data.get('option_greeks', {}).get('iv', 0)
+                if ce_iv == 0 or pe_iv == 0:
+                    continue
+                moneyness = ((strike - spot) / spot) * 100
+                surface_points.append({
+                    'strike': strike,
+                    'moneyness': moneyness,
+                    'call_iv': ce_iv,
+                    'put_iv': pe_iv,
+                    'avg_iv': (ce_iv + pe_iv) / 2,
+                    'iv_skew': ce_iv - pe_iv,
+                    'call_oi': ce_data.get('market_data', {}).get('oi', 0),
+                    'put_oi': pe_data.get('market_data', {}).get('oi', 0)
+                })
+            return surface_points
+        except Exception as e:
+            logger.error(f"Volatility surface calculation failed: {e}")
+            return surface_points
+
+    def calculate_term_structure(self, chains_by_expiry: Dict[str, List[Dict]], spot: float) -> List[Dict]:
+        term_structure = []
+        try:
+            for expiry, chain in chains_by_expiry.items():
+                if not chain:
+                    continue
+                atm_item = min(chain, key=lambda x: abs(x.get('strike_price', 0) - spot))
+                ce = atm_item.get('call_options', {})
+                pe = atm_item.get('put_options', {})
+                if ce and pe:
+                    ce_iv = ce.get('option_greeks', {}).get('iv', 0)
+                    pe_iv = pe.get('option_greeks', {}).get('iv', 0)
+                    if ce_iv > 0 and pe_iv > 0:
+                        avg_iv = (ce_iv + pe_iv) / 2
+                        try:
+                            expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+                            days_to_expiry = max(1, (expiry_dt - datetime.now(IST)).days)
+                        except:
+                            days_to_expiry = 7
+                        term_structure.append({
+                            'expiry': expiry,
+                            'days_to_expiry': days_to_expiry,
+                            'atm_iv': avg_iv,
+                            'strike': atm_item.get('strike_price', spot)
+                        })
+            term_structure.sort(key=lambda x: x['days_to_expiry'])
+            return term_structure
+        except Exception as e:
+            logger.error(f"Term structure calculation failed: {e}")
+            return []
+
+    def clear_cache(self):
+        self.vol_cache.clear()
+        logger.debug("Volatility cache cleared")
