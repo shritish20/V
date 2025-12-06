@@ -1,47 +1,48 @@
+#!/usr/bin/env python3
+import asyncio
+import signal
 import uvicorn
-import os
-import sys
-from pathlib import Path
+from core.config import settings
+from core.engine import VolGuard17Engine
+from database.manager import HybridDatabaseManager
+from utils.logger import setup_logger
+from api.routes import app
 
-# Add the current directory to Python path
-sys.path.append(str(Path(__file__).parent))
+logger = setup_logger("Main")
+engine_instance = None
+
+async def startup_sequence():
+    global engine_instance
+    logger.info("🚀 VOLGUARD 19.0 - ENDGAME MASTER")
+    
+    db_manager = HybridDatabaseManager()
+    await db_manager.init_db()
+    
+    engine_instance = VolGuard17Engine()
+    app.state.engine = engine_instance
+    return engine_instance
+
+async def shutdown_sequence(sig=None):
+    if engine_instance:
+        await engine_instance.shutdown()
+
+async def main():
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(
+            s, lambda sig=s: asyncio.create_task(shutdown_sequence(sig))
+        )
+
+    try:
+        active_engine = await startup_sequence()
+        await asyncio.gather(
+            active_engine.run(),
+            uvicorn.Server(
+                uvicorn.Config(app, host="0.0.0.0", port=settings.PORT)
+            ).serve(),
+        )
+    finally:
+        await shutdown_sequence()
 
 if __name__ == "__main__":
-    print("🚀 VOLGUARD 14.00 - IRONCLAD ARCHITECTURE")
-    print("✅ PRODUCTION-GRADE TRADING ENGINE")
-    print("✅ ADVANCED VOLATILITY ANALYTICS")
-    print("✅ COMPREHENSIVE RISK MANAGEMENT")
-    print("✅ REAL-TIME ANALYTICS & ALERTS")
-    print("✅ PRODUCTION MONITORING & METRICS")
-    print("🎯 READY FOR LIVE DEPLOYMENT")
-
-    # Create persistent storage directory - RENDER COMPATIBLE
-    PERSISTENT_DIR = os.getenv("PERSISTENT_DATA_DIR", "/tmp/data")
-    Path(PERSISTENT_DIR).mkdir(parents=True, exist_ok=True)
-    
-    # Create required files with better error handling
-    for file in [
-        os.path.join(PERSISTENT_DIR, "volguard_14.db"), 
-        os.path.join(PERSISTENT_DIR, "volguard_14_log.txt"), 
-        os.path.join(PERSISTENT_DIR, "volguard_14_journal.csv")
-    ]:
-        try:
-            # Use pathlib for better file creation
-            Path(file).touch(exist_ok=True)
-            print(f"✅ Created file: {file}")
-        except Exception as e:
-            print(f"⚠️ WARNING: Could not create file {file}. Error: {e}")
-            # Continue anyway - some files might not be critical
-
-    # Configuration
-    ENV = os.getenv("ENV", "production")
-    PORT = int(os.getenv("PORT", 8000))
-
-    # Run the FastAPI server - SIMPLE VERSION (NO UVLOOP)
-    print(f"🚀 Starting VolGuard 14.00 on port {PORT}...")
-    uvicorn.run(
-        "api.routes:app",
-        host="0.0.0.0",
-        port=PORT,
-        log_level="info"
-    )
+    asyncio.run(main())
