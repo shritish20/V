@@ -1,128 +1,95 @@
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional, Any  # ADDED: Any import
-from core.models import AdvancedMetrics, MultiLegTrade, Position, GreeksSnapshot
-from core.enums import MarketRegime
-from core.config import IST, LOT_SIZE
-from analytics.volatility import HybridVolatilityAnalytics
-from analytics.events import AdvancedEventIntelligence
-from datetime import time as dtime
 import logging
+from typing import List, Tuple, Dict, Any
+from datetime import datetime
+from core.config import settings
+from core.models import AdvancedMetrics
+from core.enums import StrategyType, CapitalBucket, MarketRegime
 
-logger = logging.getLogger("VolGuard14")
+logger = logging.getLogger("VolGuard18")
 
-class AdvancedStrategyEngine:
-    """Advanced strategy selection with regime awareness and analytics fusion - FIXED"""
-    
-    def __init__(self, volatility_analytics: HybridVolatilityAnalytics, event_intel: AdvancedEventIntelligence):
-        self.vol_analytics = volatility_analytics
+class IntelligentStrategyEngine:
+    def __init__(self, vol_analytics, event_intel, sabr_model):
+        self.vol_analytics = vol_analytics
         self.event_intel = event_intel
-        self.last_trade_time = None
+        self.sabr = sabr_model
 
-    def select_strategy(self, metrics: AdvancedMetrics, spot: float) -> Tuple[str, List[Dict]]:
-        """Select optimal strategy based on comprehensive market regime analysis"""
-        now = datetime.now(IST)
-        
-        # Trade cooldown period
-        if self.last_trade_time and (now - self.last_trade_time).total_seconds() < 300:
-            return "WAIT", []
-        
-        self.last_trade_time = now
-        expiry = self._get_weekly_expiry()
-        atm_strike = round(spot / 50) * 50 
+    def select_strategy(self, metrics: AdvancedMetrics, spot: float,
+                        capital_status: Dict[str, Dict[str, float]]) -> Tuple[str, List[Dict], str, CapitalBucket]:
+        event_score = metrics.event_risk_score
+        regime = metrics.regime
+        ivp = metrics.ivp
+        vix = metrics.vix
+        straddle_price = self._estimate_straddle_price(spot, metrics.atm_iv)
 
-        # Enhanced regime-based strategy selection
-        if metrics.regime in [MarketRegime.PANIC, MarketRegime.FEAR_BACKWARDATION, MarketRegime.DEFENSIVE_EVENT]:
-            return self._defensive_strategies(atm_strike, expiry, metrics)
-        elif metrics.regime in [MarketRegime.CALM_COMPRESSION, MarketRegime.LOW_VOL_COMPRESSION]:
-            return self._premium_selling_strategies(atm_strike, expiry, metrics)
-        elif metrics.regime == MarketRegime.BULL_EXPANSION:
-            return self._bullish_strategies(atm_strike, expiry, metrics)
+        if event_score > 3.0:
+            logger.info("High event risk - waiting")
+            return StrategyType.WAIT.value, [], "WAIT", CapitalBucket.WEEKLY
+
+        if regime == MarketRegime.PANIC:
+            return self._panic_strategy(spot, straddle_price, capital_status)
+        elif regime == MarketRegime.LOW_VOL_COMPRESSION:
+            return self._low_vol_strategy(spot, straddle_price, capital_status)
+        elif regime == MarketRegime.FEAR_BACKWARDATION:
+            return self._fear_strategy(spot, straddle_price, capital_status)
         else:
-            return self._neutral_strategies(atm_strike, expiry, metrics)
+            return self._neutral_strategy(spot, straddle_price, capital_status)
 
-    def _defensive_strategies(self, atm: float, expiry: str, metrics: AdvancedMetrics) -> Tuple[str, List[Dict]]:
-        """Defensive strategies for high volatility regimes"""
-        if metrics.event_risk_score > 2.0:
-            return (
-                "DEFENSIVE_IRON_CONDOR",
-                [
-                    {"strike": atm + 600, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm + 800, "type": "CE", "side": "BUY", "expiry": expiry},
-                    {"strike": atm - 600, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm - 800, "type": "PE", "side": "BUY", "expiry": expiry},
-                ]
-            )
-        else:
-            return (
-                "DEFENSIVE_PUT_SPREAD",
-                [
-                    {"strike": atm - 200, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm - 400, "type": "PE", "side": "BUY", "expiry": expiry},
-                ]
-            )
+    def _estimate_straddle_price(self, spot: float, atm_iv: float) -> float:
+        return spot * atm_iv * 0.4
 
-    def _premium_selling_strategies(self, atm: float, expiry: str, metrics: AdvancedMetrics) -> Tuple[str, List[Dict]]:
-        """Premium selling strategies for low volatility regimes"""
-        if metrics.ivp < 30:
-            # More aggressive in very low IV
-            return (
-                "SHORT_STRANGLE",
-                [
-                    {"strike": atm + 200, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm - 200, "type": "PE", "side": "SELL", "expiry": expiry},
-                ]
-            )
-        else:
-            # Conservative in moderate IV
-            return (
-                "IRON_CONDOR",
-                [
-                    {"strike": atm + 300, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm + 500, "type": "CE", "side": "BUY", "expiry": expiry},
-                    {"strike": atm - 300, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm - 500, "type": "PE", "side": "BUY", "expiry": expiry},
-                ]
-            )
+    def _panic_strategy(self, spot: float, straddle_price: float, capital_status: Dict) -> Tuple[str, List[Dict], str, CapitalBucket]:
+        if not self._can_allocate(CapitalBucket.WEEKLY, straddle_price * settings.LOT_SIZE, capital_status):
+            return StrategyType.WAIT.value, [], "WAIT", CapitalBucket.WEEKLY
 
-    def _bullish_strategies(self, atm: float, expiry: str, metrics: AdvancedMetrics) -> Tuple[str, List[Dict]]:
-        """Bullish strategies (Bull Put Spread)"""
-        return (
-            "BULL_PUT_SPREAD",
-            [
-                {"strike": atm - 100, "type": "PE", "side": "SELL", "expiry": expiry},
-                {"strike": atm - 300, "type": "PE", "side": "BUY", "expiry": expiry},
-            ]
-        )
+        atm_strike = round(spot / 50) * 50
+        legs = [
+            {"symbol": f"NIFTY{atm_strike}CE", "quantity": -1, "strike": atm_strike, "option_type": "CE"},
+            {"symbol": f"NIFTY{atm_strike}PE", "quantity": -1, "strike": atm_strike, "option_type": "PE"}
+        ]
+        logger.info("Panic regime - selling ATM straddle")
+        return StrategyType.ATM_STRADDLE.value, legs, "WEEKLY", CapitalBucket.WEEKLY
 
-    def _neutral_strategies(self, atm: float, expiry: str, metrics: AdvancedMetrics) -> Tuple[str, List[Dict]]:
-        """Neutral strategies for transition regimes"""
-        return (
-            "NEUTRAL_IRON_CONDOR",
-            [
-                {"strike": atm + 400, "type": "CE", "side": "SELL", "expiry": expiry},
-                {"strike": atm + 600, "type": "CE", "side": "BUY", "expiry": expiry},
-                {"strike": atm - 400, "type": "PE", "side": "SELL", "expiry": expiry},
-                {"strike": atm - 600, "type": "PE", "side": "BUY", "expiry": expiry},
-            ]
-        )
+    def _low_vol_strategy(self, spot: float, straddle_price: float, capital_status: Dict) -> Tuple[str, List[Dict], str, CapitalBucket]:
+        if not self._can_allocate(CapitalBucket.MONTHLY, straddle_price * settings.LOT_SIZE, capital_status):
+            return StrategyType.WAIT.value, [], "WAIT", CapitalBucket.MONTHLY
 
-    def _get_weekly_expiry(self) -> str:
-        """Get next weekly expiry (Thursday)"""
-        today = datetime.now(IST)
-        days_ahead = (3 - today.weekday()) % 7 
-        if days_ahead == 0 and today.time() >= dtime(15, 30):
-            days_ahead = 7
-        expiry = today + timedelta(days=days_ahead)
-        return expiry.strftime("%Y-%m-%d")
+        atm_strike = round(spot / 50) * 50
+        legs = [
+            {"symbol": f"NIFTY{atm_strike}CE", "quantity": 1, "strike": atm_strike, "option_type": "CE"},
+            {"symbol": f"NIFTY{atm_strike}PE", "quantity": 1, "strike": atm_strike, "option_type": "PE"}
+        ]
+        logger.info("Low vol regime - buying ATM straddle")
+        return StrategyType.ATM_STRADDLE.value, legs, "MONTHLY", CapitalBucket.MONTHLY
 
-    def get_strategy_metrics(self, strategy: str, legs_spec: List[Dict], spot: float) -> Dict[str, Any]:
-        """Calculate comprehensive metrics for a strategy"""
-        # This would calculate expected max loss, probability of profit, etc.
-        # Simplified for now
-        return {
-            "strategy": strategy,
-            "expected_max_loss": 1000,  # Placeholder
-            "probability_of_profit": 0.65,  # Placeholder
-            "risk_reward_ratio": 2.5,  # Placeholder
-            "margin_required": 50000  # Placeholder
-        }
+    def _fear_strategy(self, spot: float, straddle_price: float, capital_status: Dict) -> Tuple[str, List[Dict], str, CapitalBucket]:
+        if not self._can_allocate(CapitalBucket.WEEKLY, straddle_price * settings.LOT_SIZE, capital_status):
+            return StrategyType.WAIT.value, [], "WAIT", CapitalBucket.WEEKLY
+
+        atm_strike = round(spot / 50) * 50
+        otm_call_strike = atm_strike + 200
+        otm_put_strike = atm_strike - 200
+        legs = [
+            {"symbol": f"NIFTY{atm_strike}CE", "quantity": -1, "strike": atm_strike, "option_type": "CE"},
+            {"symbol": f"NIFTY{atm_strike}PE", "quantity": -1, "strike": atm_strike, "option_type": "PE"},
+            {"symbol": f"NIFTY{otm_call_strike}CE", "quantity": 1, "strike": otm_call_strike, "option_type": "CE"},
+            {"symbol": f"NIFTY{otm_put_strike}PE", "quantity": 1, "strike": otm_put_strike, "option_type": "PE"}
+        ]
+        logger.info("Fear regime - iron condor")
+        return StrategyType.IRON_CONDOR.value, legs, "WEEKLY", CapitalBucket.WEEKLY
+
+    def _neutral_strategy(self, spot: float, straddle_price: float, capital_status: Dict) -> Tuple[str, List[Dict], str, CapitalBucket]:
+        bucket = CapitalBucket.WEEKLY if straddle_price < spot * 0.02 else CapitalBucket.MONTHLY
+        if not self._can_allocate(bucket, straddle_price * settings.LOT_SIZE, capital_status):
+            return StrategyType.WAIT.value, [], "WAIT", bucket
+
+        atm_strike = round(spot / 50) * 50
+        legs = [
+            {"symbol": f"NIFTY{atm_strike}CE", "quantity": -1, "strike": atm_strike, "option_type": "CE"},
+            {"symbol": f"NIFTY{atm_strike}PE", "quantity": -1, "strike": atm_strike, "option_type": "PE"}
+        ]
+        logger.info("Neutral regime - selling ATM straddle")
+        return StrategyType.ATM_STRADDLE.value, legs, bucket.value.upper(), bucket
+
+    def _can_allocate(self, bucket: CapitalBucket, required: float, capital_status: Dict) -> bool:
+        available = capital_status.get("available", {}).get(bucket.value, 0)
+        return available >= required
