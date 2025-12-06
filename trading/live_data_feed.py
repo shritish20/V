@@ -28,8 +28,7 @@ class LiveDataFeed:
             if "feeds" in message:
                 for key, feed in message["feeds"].items():
                     if "ltpc" in feed:
-                        ltp = feed["ltpc"]["ltp"]
-                        self.rt_quotes[key] = ltp
+                        self.rt_quotes[key] = feed["ltpc"]["ltp"]
         except Exception as e:
             logger.error(f"Feed Parse Error: {e}")
 
@@ -50,7 +49,6 @@ class LiveDataFeed:
             while thread.is_alive() and self.running:
                 await asyncio.sleep(1)
             
-            if not self.running:
-                break
-            logger.warning("⚠️ Feed Thread Died. Restarting in 2s...")
+            if not self.running: break
+            logger.warning("⚠️ Feed Thread Died. Restarting...")
             await asyncio.sleep(2)
