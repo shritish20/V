@@ -1,114 +1,115 @@
-import math 
-import numpy as np
-from scipy import optimize
-from datetime import datetime, timedelta
-from typing import List
-import logging
-from core.config import SABR_BOUNDS
 
-logger = logging.getLogger("VolGuard14")
+import numpy as np
+from scipy.optimize import minimize
+from typing import List, Optional, Dict
+from datetime import datetime
+from core.config import settings
+
+logger = logging.getLogger("VolGuard18")
 
 class EnhancedSABRModel:
-    """Production-grade SABR model with robust calibration"""
-    
     def __init__(self):
         self.alpha = 0.2
         self.beta = 0.5
         self.rho = -0.2
         self.nu = 0.3
         self.calibrated = False
-        self.calibration_error = float('inf')
-        self.last_calibration = datetime.now() - timedelta(days=1)
-        self.fallback_mode = False
+        self.last_calibration = None
 
-    def sabr_volatility(self, F: float, K: float, T: float) -> float:
-        """Hagan's SABR formula with comprehensive error handling"""
-        if F <= 0 or K <= 0 or T <= 0: return 0.2 
-        
-        if abs(F - K) < F * 0.001:
-            term1 = ((1 - self.beta) ** 2) / 24 * (self.alpha ** 2) / (F ** (2 - 2 * self.beta))
-            term2 = 0.25 * self.rho * self.beta * self.nu * self.alpha / (F ** (1 - self.beta))
-            term3 = (2 - 3 * self.rho ** 2) / 24 * self.nu ** 2
-            expansion = 1 + (term1 + term2 + term3) * T
-            result = (self.alpha / (F ** (1 - self.beta))) * expansion
-            return float(np.clip(result, 0.05, 1.5))
-        
+    def calibrate_to_chain(self, strikes: List[float], market_vols: List[float],
+                           forward: float, time_to_expiry: float) -> bool:
         try:
-            z = (self.nu / self.alpha) * (F * K) ** ((1 - self.beta) / 2) * math.log(F / K)
-            
-            if abs(z) > 100:
-                 return self.alpha / (F ** (1 - self.beta))
-                 
-            x = math.log((math.sqrt(1 - 2 * self.rho * z + z * z) + z - self.rho) / (1 - self.rho))
-            
-            numerator = self.alpha * (1 + ((1 - self.beta) ** 2 / 24) * (self.alpha ** 2 / (F * K) ** (1 - self.beta)) * T)
-            denominator = (F * K) ** ((1 - self.beta) / 2) * \
-                        (1 + (1 - self.beta) ** 2 / 24 * math.log(F / K) ** 2 + (1 - self.beta) ** 4 / 1920 * math.log(F / K) ** 4)
-                        
-            if abs(denominator) < 1e-7:
-                return self.alpha / (F ** (1 - self.beta))
-                
-            if abs(x) < 1e-6:
-                result = numerator / denominator
-            else:
-                result = numerator / denominator * z / x
-                
-            return float(np.clip(result, 0.05, 1.5))
-            
-        except (ValueError, ZeroDivisionError):
-            return self.alpha / (F ** (1 - self.beta))
+            if len(strikes) != len(market_vols) or len(strikes) < 3:
+                logger.warning("Insufficient data for SABR calibration")
+                return False
 
-    def calibrate_to_chain(self, strikes: List[float], ivs: List[float], F: float, T: float) -> bool:
-        """Robust calibration with validation"""
-        if len(strikes) < 5 or T <= 1/365: return False
-        
-        valid_data = [(K, iv) for K, iv in zip(strikes, ivs) if K > 0 and 0.05 < iv < 1.5 and 0.5 * F < K < 2.0 * F]
-        if len(valid_data) < 5: return False
-        strikes_clean, ivs_clean = zip(*valid_data)
-        
-        def objective(params):
-            alpha, beta, rho, nu = params
-            temp_params = (self.alpha, self.beta, self.rho, self.nu)
-            self.alpha, self.beta, self.rho, self.nu = alpha, beta, rho, nu
-            errors = []
-            for K, market_iv in zip(strikes_clean, ivs_clean):
-                model_iv = self.sabr_volatility(F, K, T)
-                errors.append((model_iv - market_iv) ** 2)
-            self.alpha, self.beta, self.rho, self.nu = temp_params
-            return math.sqrt(sum(errors) / len(errors)) if errors else 1.0
+            initial_guess = [self.alpha, self.beta, self.rho, self.nu]
+            bounds = [
+                settings.SABR_BOUNDS['alpha'],
+                settings.SABR_BOUNDS['beta'],
+                settings.SABR_BOUNDS['rho'],
+                settings.SABR_BOUNDS['nu']
+            ]
 
-        try:
-            bounds = list(SABR_BOUNDS.values())
-            result = optimize.minimize(
-                objective, 
-                [0.2, 0.5, -0.2, 0.3], 
-                bounds=bounds, 
-                method="L-BFGS-B", 
-                options={'maxiter': 50, 'ftol': 1e-4}
+            result = minimize(
+                fun=self._calibration_error,
+                x0=initial_guess,
+                args=(strikes, market_vols, forward, time_to_expiry),
+                bounds=bounds,
+                method='L-BFGS-B',
+                options={'maxiter': 1000, 'ftol': 1e-8}
             )
-            
+
             if result.success:
                 self.alpha, self.beta, self.rho, self.nu = result.x
-                self.calibration_error = result.fun
                 self.calibrated = True
-                self.fallback_mode = False
                 self.last_calibration = datetime.now()
-                
-                if not (bounds[0][0] <= self.alpha <= bounds[0][1] and bounds[1][0] <= self.beta <= bounds[1][1] and bounds[2][0] <= self.rho <= bounds[2][1] and bounds[3][0] <= self.nu <= bounds[3][1]):
-                    self.calibrated = False
-                    return False
-                    
-                logger.info(f"SABR calibrated: α={self.alpha:.3f} β={self.beta:.3f} ρ={self.rho:.3f} ν={self.nu:.3f}")
+                logger.info(f"SABR calibrated: α={self.alpha:.3f}, β={self.beta:.3f}, ρ={self.rho:.3f}, ν={self.nu:.3f}")
                 return True
-                
+            else:
+                logger.warning(f"SABR calibration failed: {result.message}")
+                return False
         except Exception as e:
-            logger.error(f"SABR calibration failed: {e}")
+            logger.error(f"SABR calibration error: {e}")
             return False
-        return False
 
-    def _validate_parameters(self) -> bool:
-        """Validate SABR parameters are within reasonable bounds"""
-        return (SABR_BOUNDS['alpha'][0] <= self.alpha <= SABR_BOUNDS['alpha'][1] and
-                SABR_BOUNDS['beta'][0] <= self.beta <= SABR_BOUNDS['beta'][1] and
-                SABR_BOUNDS['rho'][0] <= self.rho <= SABR_BOUNDS['rho'][1] and
-                SABR_BOUNDS['nu'][0] <= self.nu <= SABR_BOUNDS['nu'][1])
+    def _calibration_error(self, params: List[float], strikes: List[float],
+                           market_vols: List[float], forward: float, time_to_expiry: float) -> float:
+        alpha, beta, rho, nu = params
+        try:
+            total_error = 0.0
+            for strike, market_vol in zip(strikes, market_vols):
+                sabr_vol = self.sabr_volatility(strike, forward, time_to_expiry, alpha, beta, rho, nu)
+                error = (sabr_vol - market_vol) ** 2
+                total_error += error
+            return total_error / len(strikes)
+        except:
+            return 1e6
+
+    def sabr_volatility(self, strike: float, forward: float, time_to_expiry: float,
+                        alpha: Optional[float] = None, beta: Optional[float] = None,
+                        rho: Optional[float] = None, nu: Optional[float] = None) -> float:
+        alpha = alpha or self.alpha
+        beta = beta or self.beta
+        rho = rho or self.rho
+        nu = nu or self.nu
+
+        if strike == forward:
+            strike = forward * 1.0001
+        fk = forward * strike
+        fk_beta = fk ** ((1 - beta) / 2)
+        z = (nu / alpha) * fk_beta * np.log(forward / strike)
+        xz = np.log((np.sqrt(1 - 2 * rho * z + z ** 2) + z - rho) / (1 - rho))
+
+        if abs(z) < 1e-8:
+            term1 = 1 + (((1 - beta) ** 2 / 24) * (alpha ** 2) / (fk ** (1 - beta)) +
+                         (1 / 4) * (rho * beta * nu * alpha) / (fk ** ((1 - beta) / 2)) +
+                         ((2 - 3 * rho ** 2) / 24) * nu ** 2) * time_to_expiry
+            vol = (alpha / (forward ** (1 - beta))) * term1
+        else:
+            term1 = z / xz
+            term2 = 1 + (((1 - beta) ** 2 / 24) * (alpha ** 2) / (fk ** (1 - beta)) +
+                         (1 / 4) * (rho * beta * nu * alpha) / (fk ** ((1 - beta) / 2)) +
+                         ((2 - 3 * rho ** 2) / 24) * nu ** 2) * time_to_expiry
+            vol = (alpha / fk_beta) * term1 * term2
+
+        return max(0.05, min(0.80, vol))
+
+    def get_parameters(self) -> Dict[str, float]:
+        return {
+            'alpha': self.alpha,
+            'beta': self.beta,
+            'rho': self.rho,
+            'nu': self.nu,
+            'calibrated': self.calibrated,
+            'last_calibration': self.last_calibration.isoformat() if self.last_calibration else None
+        }
+
+    def reset(self):
+        self.alpha = 0.2
+        self.beta = 0.5
+        self.rho = -0.2
+        self.nu = 0.3
+        self.calibrated = False
+        self.last_calibration = None
+        logger.debug("SABR model reset to defaults")
