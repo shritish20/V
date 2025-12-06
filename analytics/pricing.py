@@ -1,131 +1,101 @@
-import math 
 import numpy as np
 from scipy.stats import norm
-from datetime import datetime
 from typing import Dict, Optional
-from threading import Lock
+from datetime import datetime
+from core.config import settings, IST
 from core.models import GreeksSnapshot
-from core.config import IST, RISK_FREE_RATE, TRADING_DAYS
 from .sabr_model import EnhancedSABRModel
-import logging
 
-logger = logging.getLogger("VolGuard14")
+logger = logging.getLogger("VolGuard18")
 
 class HybridPricingEngine:
-    """Advanced pricing with SABR and market data"""
-    
     def __init__(self, sabr_model: EnhancedSABRModel):
         self.sabr = sabr_model
-        self._cache: Dict[tuple, GreeksSnapshot] = {}
-        self._cache_lock = Lock()
-        self._cache_ttl = 300 # 5 minutes
-        self._cache_hits = 0
-        self._cache_misses = 0
+        self.cache: Dict[str, tuple] = {}
+        self.cache_ttl = 30  # seconds
 
-    def calculate_greeks(self, spot: float, strike: float, opt_type: str, expiry: str, market_price: float = None) -> GreeksSnapshot:
-        """Calculate Greeks using SABR volatility with bounds checking"""
-        # Add bounds checking for extreme scenarios
-        if spot <= 0 or strike <= 0:
+    def calculate_greeks(self, spot: float, strike: float, option_type: str, expiry: str,
+                         risk_free_rate: Optional[float] = None) -> GreeksSnapshot:
+        cache_key = f"{spot}_{strike}_{option_type}_{expiry}"
+        if cache_key in self.cache:
+            greeks, timestamp = self.cache[cache_key]
+            if (datetime.now(IST) - timestamp).total_seconds() < self.cache_ttl:
+                return greeks
+
+        try:
+            expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
+            time_to_expiry = max(0.001, (expiry_dt - datetime.now(IST)).days / 365.0)
+            rfr = risk_free_rate or settings.RISK_FREE_RATE
+            iv = self._get_implied_volatility(spot, strike, time_to_expiry)
+            greeks = self._calculate_black_scholes_greeks(spot, strike, time_to_expiry, iv, rfr, option_type)
+            self.cache[cache_key] = (greeks, datetime.now(IST))
+            return greeks
+        except Exception as e:
+            logger.error(f"Greeks calculation failed: {e}")
             return GreeksSnapshot(timestamp=datetime.now(IST))
-            
-        moneyness = spot / strike
-        if moneyness < 0.5 or moneyness > 2.0:  # Extreme OTM/ITM
-            logger.warning(f"Extreme moneyness detected: {moneyness:.2f}")
-            return self._calculate_extreme_greeks(spot, strike, opt_type, expiry)
-        
-        cache_key = (spot, strike, opt_type, expiry)
-        with self._cache_lock:
-            if cache_key in self._cache:
-                cached = self._cache[cache_key]
-                if not cached.is_stale(self._cache_ttl):
-                    self._cache_hits += 1
-                    return cached
-            self._cache_misses += 1
 
-        T = self._get_dte(expiry)
-        iv = self.sabr.sabr_volatility(spot, strike, T)
-        
-        if T <= 0.001 or iv <= 0.001:
-            return GreeksSnapshot(timestamp=datetime.now(IST)) 
+    def _get_implied_volatility(self, spot: float, strike: float, time_to_expiry: float) -> float:
+        if self.sabr.calibrated:
+            return self.sabr.sabr_volatility(strike, spot, time_to_expiry)
+        else:
+            moneyness = abs(strike - spot) / spot
+            base_iv = 0.15
+            skew_adjustment = 0.02 * moneyness * 100
+            return min(0.80, max(0.05, base_iv + skew_adjustment))
 
-        d1 = (math.log(spot/strike) + (RISK_FREE_RATE + 0.5*iv**2)*T) / (iv*math.sqrt(T))
-        d2 = d1 - iv*math.sqrt(T)
+    def _calculate_black_scholes_greeks(self, spot: float, strike: float, time_to_expiry: float,
+                                        iv: float, risk_free_rate: float, option_type: str) -> GreeksSnapshot:
+        time_to_expiry = max(0.001, time_to_expiry)
+        iv = max(0.001, iv)
 
-        if opt_type == "CE":
+        d1 = (np.log(spot / strike) + (risk_free_rate + 0.5 * iv ** 2) * time_to_expiry) / (iv * np.sqrt(time_to_expiry))
+        d2 = d1 - iv * np.sqrt(time_to_expiry)
+
+        if option_type == 'CE':
             delta = norm.cdf(d1)
-            theta = (-spot * norm.pdf(d1) * iv / (2*math.sqrt(T)) - RISK_FREE_RATE * strike * math.exp(-RISK_FREE_RATE*T) * norm.cdf(d2)) / TRADING_DAYS
-        else: # PE
+            gamma = norm.pdf(d1) / (spot * iv * np.sqrt(time_to_expiry))
+            theta = (-spot * norm.pdf(d1) * iv / (2 * np.sqrt(time_to_expiry)) -
+                     risk_free_rate * strike * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(d2))
+            vega = spot * norm.pdf(d1) * np.sqrt(time_to_expiry)
+        else:
             delta = norm.cdf(d1) - 1
-            theta = (-spot * norm.pdf(d1) * iv / (2*math.sqrt(T)) + RISK_FREE_RATE * strike * math.exp(-RISK_FREE_RATE*T) * norm.cdf(-d2)) / TRADING_DAYS
-            
-        gamma = norm.pdf(d1) / (spot * iv * math.sqrt(T))
-        vega = spot * norm.pdf(d1) * math.sqrt(T) / 100 
+            gamma = norm.pdf(d1) / (spot * iv * np.sqrt(time_to_expiry))
+            theta = (-spot * norm.pdf(d1) * iv / (2 * np.sqrt(time_to_expiry)) +
+                     risk_free_rate * strike * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(-d2))
+            vega = spot * norm.pdf(d1) * np.sqrt(time_to_expiry)
 
-        greeks = GreeksSnapshot(
-            timestamp=datetime.now(IST),
-            delta=delta,
-            gamma=gamma,
-            theta=theta,
-            vega=vega
-        )
-        with self._cache_lock:
-            self._cache[cache_key] = greeks
-        
-        self._clean_cache()
-        return greeks
+        pop = norm.cdf(d2 if option_type == 'CE' else -d2)
+        charm = -norm.pdf(d1) * (2 * risk_free_rate * time_to_expiry - d2 * iv * np.sqrt(time_to_expiry)) / (2 * time_to_expiry * iv * np.sqrt(time_to_expiry))
+        vanna = -norm.pdf(d1) * d2 / iv
 
-    def _calculate_extreme_greeks(self, spot: float, strike: float, opt_type: str, expiry: str) -> GreeksSnapshot:
-        """Simplified Greeks for extreme OTM/ITM options"""
-        T = self._get_dte(expiry)
-        if T <= 0.001:
-            return GreeksSnapshot(timestamp=datetime.now(IST))
-            
-        if opt_type == "CE":
-            if spot > strike * 1.5:  # Deep ITM call
-                delta = 0.99
-                theta = -0.1
-            else:  # Deep OTM call
-                delta = 0.01
-                theta = -0.01
-        else:  # PE
-            if spot < strike * 0.7:  # Deep ITM put
-                delta = -0.99
-                theta = -0.1
-            else:  # Deep OTM put
-                delta = -0.01
-                theta = -0.01
-                
         return GreeksSnapshot(
             timestamp=datetime.now(IST),
             delta=delta,
-            gamma=0.001,
-            theta=theta,
-            vega=0.1
+            gamma=gamma,
+            theta=theta / 100,
+            vega=vega / 100,
+            iv=iv,
+            pop=pop,
+            charm=charm,
+            vanna=vanna
         )
 
-    def _get_dte(self, expiry_str: str) -> float:
-        """Get days to expiry as year fraction"""
+    def calculate_option_price(self, spot: float, strike: float, option_type: str, expiry: str,
+                               risk_free_rate: Optional[float] = None) -> float:
         try:
-            exp_dt = datetime.strptime(expiry_str, "%Y-%m-%d").replace(hour=15, minute=30, tzinfo=IST)
-            now = datetime.now(IST)
-            seconds = max(0, (exp_dt - now).total_seconds())
-            return seconds / (365 * 24 * 3600)
-        except:
-            return 7/365
+            greeks = self.calculate_greeks(spot, strike, option_type, expiry, risk_free_rate)
+            moneyness = abs(strike - spot) / spot
+            time_to_expiry = max(0.001, (datetime.strptime(expiry, "%Y-%m-%d") - datetime.now(IST)).days / 365.0)
+            intrinsic = max(0, spot - strike if option_type == 'CE' else strike - spot)
+            time_value = spot * greeks.iv * np.sqrt(time_to_expiry) * 0.4
+            return max(intrinsic, time_value * (1 - moneyness))
+        except Exception as e:
+            logger.error(f"Option price calculation failed: {e}")
+            return 0.0
 
-    def _clean_cache(self):
-        """Clean stale cache entries"""
-        self._cache = {
-            k: v for k, v in self._cache.items() if not v.is_stale(self._cache_ttl)
-        }
+    def clear_cache(self):
+        self.cache.clear()
+        logger.debug("Pricing cache cleared")
 
-    def get_cache_stats(self) -> Dict[str, float]:
-        """Get cache performance statistics"""
-        total = self._cache_hits + self._cache_misses
-        hit_ratio = self._cache_hits / total if total > 0 else 0
-        return {
-            "hit_ratio": hit_ratio,
-            "cache_size": len(self._cache),
-            "hits": self._cache_hits,
-            "misses": self._cache_misses
-        }
+    def get_cache_stats(self):
+        return {'cache_size': len(self.cache), 'cache_ttl': self.cache_ttl}
