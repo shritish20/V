@@ -1,46 +1,39 @@
-from enum import Enum 
+from enum import Enum
 
-class TradeStatus(str, Enum):
+class StrategyType(Enum):
+    WAIT = "WAIT"
+    ATM_STRADDLE = "ATM_STRADDLE"
+    ATM_STRANGLE = "ATM_STRANGLE"
+    IRON_CONDOR = "IRON_CONDOR"
+    CALENDAR_SPREAD = "CALENDAR_SPREAD"
+    RATIO_SPREAD = "RATIO_SPREAD"
+
+class TradeStatus(Enum):
     OPEN = "OPEN"
     CLOSED = "CLOSED"
-    PENDING = "PENDING"
     EXTERNAL = "EXTERNAL"
-    CANCELLED = "CANCELLED"
-    
-class ExitReason(str, Enum):
+
+class ExitReason(Enum):
     PROFIT_TARGET = "PROFIT_TARGET"
     STOP_LOSS = "STOP_LOSS"
-    DAILY_LOSS_LIMIT = "DAILY_LOSS_LIMIT"
-    EOD_FLATTEN = "EOD_FLATTEN"
-    EXPIRY_FLATTEN = "EXPIRY_FLATTEN"
+    EXPIRY = "EXPIRY"
     CIRCUIT_BREAKER = "CIRCUIT_BREAKER"
     MANUAL = "MANUAL"
-    VEGA_LIMIT = "VEGA_LIMIT"
-    DELTA_LIMIT = "DELTA_LIMIT"
-    REGIME_CHANGE = "REGIME_CHANGE"
-    HEALTH_CHECK = "HEALTH_CHECK"
-    
-class OrderStatus(str, Enum):
-    PENDING = "PENDING"
-    SUBMITTED = "SUBMITTED"
-    FILLED = "FILLED"
-    PARTIAL_FILLED = "PARTIAL_FILLED"
-    REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
-    EXPIRED = "EXPIRED"
 
-class OrderType(str, Enum):
-    LIMIT = "LIMIT"
-    MARKET = "MARKET"
-    SL = "SL"
-    SL_M = "SL-M"
+class CapitalBucket(Enum):
+    WEEKLY = "weekly_expiries"
+    MONTHLY = "monthly_expiries"
+    INTRADAY = "intraday_adjustments"
 
-class MarketRegime(str, Enum):
+class ExpiryType(Enum):
+    WEEKLY = "WEEKLY"
+    MONTHLY = "MONTHLY"
+    INTRADAY = "INTRADAY"
+
+class MarketRegime(Enum):
     PANIC = "PANIC"
     FEAR_BACKWARDATION = "FEAR_BACKWARDATION"
-    DEFENSIVE_EVENT = "DEFENSIVE_EVENT"
-    BULL_EXPANSION = "BULL_EXPANSION"
-    CALM_COMPRESSION = "CALM_COMPRESSION"
     LOW_VOL_COMPRESSION = "LOW_VOL_COMPRESSION"
+    CALM_COMPRESSION = "CALM_COMPRESSION"
+    DEFENSIVE_EVENT = "DEFENSIVE_EVENT"
     TRANSITION = "TRANSITION"
-    UNSTABLE_HIGH_VOL = "UNSTABLE_HIGH_VOL"
