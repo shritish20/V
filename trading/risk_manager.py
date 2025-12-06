@@ -1,4 +1,5 @@
 from core.config import settings
+from core.enums import TradeStatus
 from utils.logger import setup_logger
 
 logger = setup_logger("RiskMgr")
@@ -45,23 +46,28 @@ class AdvancedRiskManager:
         return True
 
     def update_portfolio_state(self, trades, pnl):
+        """Correct ENUM comparison — prevents portfolio vega/delta from becoming zero."""
         self.daily_pnl = pnl
+
         self.portfolio_vega = sum(
             getattr(t, "trade_vega", 0.0)
             for t in trades
-            if t.status in ["OPEN", "EXTERNAL"]
+            if t.status in {TradeStatus.OPEN, TradeStatus.EXTERNAL}
         )
+
         self.portfolio_delta = sum(
             getattr(t, "trade_delta", 0.0)
             for t in trades
-            if t.status in ["OPEN", "EXTERNAL"]
+            if t.status in {TradeStatus.OPEN, TradeStatus.EXTERNAL}
         )
 
     def check_portfolio_limits(self) -> bool:
         if self.daily_pnl < -(settings.ACCOUNT_SIZE * settings.DAILY_LOSS_LIMIT_PCT):
             logger.critical(f"Daily Loss Breach: {self.daily_pnl:.0f}")
             return True
+
         if abs(self.portfolio_vega) > settings.MAX_PORTFOLIO_VEGA:
             logger.critical(f"Vega Limit Breach: {self.portfolio_vega:.0f}")
             return True
+
         return False
