@@ -19,7 +19,10 @@ class GreekValidator:
         self.token = settings.UPSTOX_ACCESS_TOKEN
         self.url = "https://api-v2.upstox.com/v3/market-quote/option-greek"
         self.subscribed = set()
-        self.instrument_master = None # Injected by engine
+        self.instrument_master = None
+        
+        # FIX: Async Lock for Cache Safety
+        self._update_lock = asyncio.Lock()
 
     def set_instrument_master(self, master):
         self.instrument_master = master
@@ -37,38 +40,36 @@ class GreekValidator:
             await asyncio.sleep(self.refresh_sec)
 
     async def _validate_once(self):
-        if not self.subscribed:
-            return
+        if not self.subscribed: return
 
         broker_data = await self._fetch_broker_greeks()
         sabr_data = self._compute_sabr_greeks(broker_data.keys())
 
-        for key, broker in broker_data.items():
-            sabr = sabr_data.get(key)
-            if not sabr:
-                self.cache[key] = broker # Fallback to broker
-                continue
+        # FIX: Locked Update
+        async with self._update_lock:
+            for key, broker in broker_data.items():
+                sabr = sabr_data.get(key)
+                if not sabr:
+                    self.cache[key] = broker 
+                    continue
 
-            trusted = {}
-            for g in ("delta", "theta", "gamma", "vega", "iv"):
-                b = broker.get(g, 0)
-                s = sabr.get(g, 0)
+                trusted = {}
+                for g in ("delta", "theta", "gamma", "vega", "iv"):
+                    b = broker.get(g, 0)
+                    s = sabr.get(g, 0)
+                    
+                    denom = max(abs(s), 1e-6)
+                    disc = abs(b - s) * 100 / denom
+
+                    if disc > self.tolerance_pct:
+                        trusted[g] = b
+                    else:
+                        trusted[g] = s
                 
-                # Avoid division by zero
-                denominator = max(abs(s), 1e-6)
-                disc = abs(b - s) * 100 / denominator
-
-                if disc > self.tolerance_pct:
-                    # logger.warning(f"{key} {g} Diff: {disc:.1f}% (Using Broker)")
-                    trusted[g] = b
-                else:
-                    trusted[g] = s
-            
-            trusted["timestamp"] = datetime.now(IST)
-            self.cache[key] = trusted
+                trusted["timestamp"] = datetime.now(IST)
+                self.cache[key] = trusted
 
     async def _fetch_broker_greeks(self) -> Dict[str, dict]:
-        # Chunking for API limits
         chunk_size = 500
         keys_list = list(self.subscribed)
         chunks = [keys_list[i:i + chunk_size] for i in range(0, len(keys_list), chunk_size)]
@@ -89,17 +90,13 @@ class GreekValidator:
         return results
 
     def _compute_sabr_greeks(self, keys) -> Dict[str, dict]:
-        if not self.sabr.calibrated:
-            return {}
-            
+        if not self.sabr.calibrated: return {}
         engine = HybridPricingEngine(self.sabr)
         out = {}
-        # Fetch spot from cache or settings (Assuming engine updates this)
-        spot = 25000.0 # Placeholder, ideally inject RT quotes
+        spot = 25000.0 # Should ideally use RT quotes
         
         for key in keys:
             try:
-                # FIX: Use InstrumentMaster for safe lookup
                 if self.instrument_master and self.instrument_master.df is not None:
                     row = self.instrument_master.df[self.instrument_master.df['instrument_key'] == key]
                     if row.empty: continue
@@ -111,13 +108,11 @@ class GreekValidator:
                     gsnap = engine.calculate_greeks(spot, strike, opt_type, expiry)
                     
                     out[key] = {
-                        "delta": gsnap.delta,
-                        "theta": gsnap.theta,
-                        "gamma": gsnap.gamma,
-                        "vega": gsnap.vega,
-                        "iv": gsnap.iv
+                        "delta": gsnap.delta, "theta": gsnap.theta,
+                        "gamma": gsnap.gamma, "vega": gsnap.vega, "iv": gsnap.iv
                     }
             except Exception:
                 continue
         return out
+
 
