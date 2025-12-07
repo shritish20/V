@@ -31,23 +31,24 @@ class HybridPricingEngine:
             now = datetime.now(IST)
             
             # CRITICAL FIX: Precise Expiry Math
-            # Prevents division-by-zero or infinite Gamma on expiry days
             if expiry_dt.date() == now.date():
                 market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
                 
                 # Check if already expired
                 if now >= market_close:
-                    return GreeksSnapshot(timestamp=datetime.now(IST))
+                    # Return Zero Greeks for Expired Option
+                    return GreeksSnapshot(
+                        timestamp=datetime.now(IST),
+                        delta=0.0, gamma=0.0, theta=0.0, vega=0.0, iv=0.0, pop=0.0
+                    )
                 
                 seconds_remaining = (market_close - now).total_seconds()
                 # Use tiny floor (1e-6) to prevent blowups
-                # 31536000.0 is seconds in a year (365 * 24 * 60 * 60)
+                # 31536000.0 is seconds in a year
                 time_to_expiry = max(1e-6, seconds_remaining / 31536000.0)
             else:
                 # Use 15:30 on expiry day as the target
                 expiry_target = datetime.combine(expiry_dt.date(), dtime(15, 30))
-                # Localize naive datetime if necessary, but assuming naive comparison works here
-                # if both are in same timezone context. 
                 # Calculating diff in seconds for better precision than .days
                 delta_seconds = (expiry_target - now.replace(tzinfo=None)).total_seconds()
                 time_to_expiry = max(0.001, delta_seconds / 31536000.0)
@@ -66,7 +67,7 @@ class HybridPricingEngine:
             return GreeksSnapshot(timestamp=datetime.now(IST))
 
     def _get_implied_volatility(self, spot: float, strike: float, time_to_expiry: float) -> float:
-        # Fallback Logic if SABR fails
+        # Fallback Logic if SABR fails or not calibrated
         if self.sabr.calibrated:
             return self.sabr.sabr_volatility(strike, spot, time_to_expiry)
         else:
@@ -79,7 +80,7 @@ class HybridPricingEngine:
     def _calculate_black_scholes_greeks(self, spot: float, strike: float, time_to_expiry: float, 
                                         iv: float, risk_free_rate: float, option_type: str) -> GreeksSnapshot:
         
-        iv = max(0.01, iv) # Safety floor to prevent div/0
+        iv = max(0.01, iv) # Safety floor
         
         d1 = (np.log(spot / strike) + (risk_free_rate + 0.5 * iv ** 2) * time_to_expiry) / (iv * np.sqrt(time_to_expiry))
         d2 = d1 - iv * np.sqrt(time_to_expiry)
@@ -116,10 +117,8 @@ class HybridPricingEngine:
                                risk_free_rate: Optional[float] = None) -> float:
         """
         Calculates theoretical option price using Black-Scholes.
-        Useful for PnL projections or "fair value" checks.
         """
         try:
-            # Re-use logic to get inputs
             expiry_dt = datetime.strptime(expiry, "%Y-%m-%d")
             now = datetime.now(IST)
             
