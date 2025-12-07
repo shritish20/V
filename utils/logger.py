@@ -1,4 +1,3 @@
-
 import logging
 import sys
 import re
@@ -6,15 +5,14 @@ from pathlib import Path
 from core.config import settings
 
 class SanitizingFormatter(logging.Formatter):
-    """
-    Security Formatter: Redacts sensitive API tokens from logs.
-    """
-    # Patterns to catch Bearer tokens and Access tokens
+    """Redacts sensitive API tokens from logs."""
     SENSITIVE_PATTERNS = [
-        (r'Bearer\s+[\w\-]+', 'Bearer [REDACTED]'),
+        (r'Bearer\s+[\w\-\.]+', 'Bearer [REDACTED]'),
         (r'"access_token":\s*"[^"]+"', '"access_token": "[REDACTED]"'),
         (r'Authorization:\s*[^\s]+', 'Authorization: [REDACTED]'),
-        (r'token=[^&\s]+', 'token=[REDACTED]')
+        (r'token=[^&\s]+', 'token=[REDACTED]'),
+        (r'"token":\s*"[^"]+"', '"token": "[REDACTED]"'), # FIX: JSON format
+        (r'eyJ[\w\-\.]+', '[JWT_REDACTED]') # FIX: Catch raw JWTs
     ]
     
     def format(self, record):
@@ -30,18 +28,15 @@ def setup_logger(name: str = "VolGuard18") -> logging.Logger:
         
     logger.setLevel(logging.DEBUG)
     
-    # Use Sanitizing Formatter
     formatter = SanitizingFormatter(
         fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
     
-    # Console
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     
-    # File
     logs_dir = Path(settings.PERSISTENT_DATA_DIR) / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     
@@ -54,6 +49,5 @@ def setup_logger(name: str = "VolGuard18") -> logging.Logger:
     
     return logger
 
-# FIX: Added alias for compatibility with margin_guard.py
 def get_logger(name: str = "VolGuard18") -> logging.Logger:
     return setup_logger(name)
