@@ -1,18 +1,16 @@
 from fastapi import FastAPI, BackgroundTasks, HTTPException, Query, Depends, status, Request
-from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from typing import Dict, Any, Optional, List
+from typing import Optional
 from datetime import datetime
 from pathlib import Path
-import json
 import logging
 
 from core.engine import VolGuard17Engine
-from core.models import EngineStatus, DashboardData
-from core.config import settings, DASHBOARD_DATA_DIR
-from core.enums import CapitalBucket, StrategyType
+from core.config import DASHBOARD_DATA_DIR
+from core.enums import CapitalBucket
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
 
@@ -31,7 +29,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict this
+    allow_origins=["*"],  # In production, you should restrict this
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -95,10 +93,6 @@ def get_engine(request: Request) -> VolGuard17Engine:
         )
     return engine
 
-# ==================== REMOVED STARTUP/SHUTDOWN EVENTS ====================
-# Why? Because main.py now controls the lifecycle. 
-# FastAPI is just the interface, not the controller.
-
 # ==================== ROOT & HEALTH ====================
 @app.get("/", response_class=HTMLResponse)
 async def root():
@@ -146,7 +140,6 @@ async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_home():
     """Interactive dashboard placeholder"""
-    # (Same HTML content as before, kept brief for this file)
     return HTMLResponse(content="<h1>VolGuard Dashboard Loading...</h1><script>window.location='/api/dashboard/data'</script>")
 
 @app.get("/api/dashboard/data")
@@ -209,3 +202,4 @@ async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
 @app.get("/api/metrics")
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
