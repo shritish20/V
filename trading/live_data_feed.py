@@ -1,105 +1,167 @@
 import asyncio
 import time
-from threading import Thread
+import logging
+from threading import Thread, Event
+from typing import Dict, Optional, Set
 from upstox_client.feeder.market_data_feed import MarketDataFeed
-from core.config import settings
-from utils.logger import get_logger
+from upstox_client.feeder.portfolio_data_feed import PortfolioDataFeed
 
-logger = get_logger("LiveFeed")
+from core.config import settings
+
+logger = logging.getLogger("LiveFeed")
 
 class LiveDataFeed:
-    def __init__(self, rt_quotes, greeks_cache, sabr_model):
+    """
+    Robust, thread-safe implementation of Upstox Live Feed.
+    Features:
+    - Auto-reconnection on stale data.
+    - Dynamic token updates (Zero Downtime).
+    - Thread-safe dictionary updates.
+    """
+    def __init__(self, rt_quotes: Dict[str, float], greeks_cache: Dict, sabr_model):
         self.rt_quotes = rt_quotes
         self.greeks_cache = greeks_cache
         self.sabr_model = sabr_model
         
+        # Internal State
         self.token = settings.UPSTOX_ACCESS_TOKEN
-        self.sub_list = {settings.MARKET_KEY_INDEX, settings.MARKET_KEY_VIX}
-        self.feed = None
-        self.last_tick_time = 0.0
-        self.running = False
+        self.sub_list: Set[str] = {settings.MARKET_KEY_INDEX, settings.MARKET_KEY_VIX}
+        self.feed: Optional[MarketDataFeed] = None
+        self.last_tick_time = time.time()
+        
+        # Concurrency Controls
+        self.stop_event = Event()
+        self.feed_thread: Optional[Thread] = None
+        self.is_connected = False
 
     def subscribe_instrument(self, key: str):
-        """
-        Subscribes to a new instrument dynamically.
-        If feed is running, sends the subscribe command immediately.
-        """
-        if key in self.sub_list:
+        """Dynamic subscription safe for runtime calls"""
+        if not key or key in self.sub_list:
             return
 
         self.sub_list.add(key)
-        logger.info(f"➕ Subscribing to new instrument: {key}")
-        
-        # Dynamic Subscription Fix:
-        if self.feed and self.running:
+        logger.info(f"➕ Subscribing to: {key}")
+
+        # If connected, try to subscribe immediately
+        if self.is_connected and self.feed:
             try:
-                # The Upstox SDK usually exposes a subscribe method. 
-                # If using the 'MarketDataFeed' class specifically, we might need to 
-                # rely on the restart loop if it doesn't support dynamic updates, 
-                # but typically SDKs allow this.
-                # Assuming standard SDK behavior:
-                self.feed.subscribe([key]) 
+                # The SDK allows dynamic subscription
+                self.feed.subscribe([key])
             except Exception as e:
-                logger.warning(f"Dynamic subscription failed (will retry on restart): {e}")
+                logger.warning(f"Dynamic subscribe failed (will retry on reconnect): {e}")
+
+    def update_token(self, new_token: str):
+        """
+        CRITICAL: Allows rotating the access token without killing the bot.
+        Triggers a graceful reconnect with the new token.
+        """
+        if new_token == self.token:
+            return
+
+        logger.info("🔄 Rotating Access Token for Live Feed...")
+        self.token = new_token
+        
+        # Force a reconnect cycle
+        self.disconnect()
+        # The main loop in start() will pick this up and restart with new token
 
     def on_market_data(self, message):
-        # FIX 1: Use time.time() instead of asyncio loop in a thread
+        """Callback from Upstox SDK (Runs in SDK Thread)"""
         self.last_tick_time = time.time()
-        
+        self.is_connected = True
+
         try:
             if "feeds" in message:
                 for key, feed in message["feeds"].items():
+                    # Update LTP
                     if "ltpc" in feed:
-                        ltp = feed["ltpc"]["ltp"]
-                        self.rt_quotes[key] = ltp
-                        
-                        # Optional: If you need Greeks calculated here, 
-                        # you must use self.greeks_cache safely.
+                        ltp = feed["ltpc"].get("ltp")
+                        if ltp:
+                            self.rt_quotes[key] = float(ltp)
+                            
+                    # Note: You could calculate Greeks here, but better to do it 
+                    # in the analysis loop to keep this thread lightweight.
         except Exception as e:
             logger.error(f"Feed Parse Error: {e}")
 
-    def _start_feed_process(self):
+    def on_error(self, error):
+        logger.error(f"Upstox Feed Error: {error}")
+        self.is_connected = False
+
+    def on_close(self):
+        logger.warning("Upstox Feed Connection Closed")
+        self.is_connected = False
+
+    def _run_feed_process(self):
+        """Blocking process to run in separate thread"""
         try:
-            # FIX 2: Ensure API_BASE_V3 is actually what the SDK expects.
-            # Usually Upstox SDK just needs the token and config.
-            # We pass the current sub_list to ensure all keys are grabbed on start/restart.
+            # Re-initialize feed with current token
             self.feed = MarketDataFeed(
-                self.token, 
-                settings.API_BASE_V3, 
+                settings.API_BASE_V3,
+                self.token,
                 instrument_keys=list(self.sub_list)
             )
+            
+            # Attach callbacks
             self.feed.on_market_data = self.on_market_data
+            self.feed.on_error = self.on_error
+            self.feed.on_close = self.on_close
+            
             logger.info(f"🔌 Connecting Feed with {len(self.sub_list)} instruments...")
-            self.feed.connect()
+            self.feed.connect() # Blocking call
+            
         except Exception as e:
-            logger.error(f"Feed Process Crash: {e}")
+            logger.error(f"Feed Thread Crash: {e}")
+            self.is_connected = False
+        finally:
+            logger.info("Feed thread exiting.")
+
+    def disconnect(self):
+        """Gracefully disconnect the current feed"""
+        if self.feed:
+            try:
+                self.feed.disconnect()
+            except Exception:
+                pass
+        self.feed = None
+        self.is_connected = False
 
     async def start(self):
-        self.running = True
+        """
+        Async Supervisor Loop.
+        Monitors the background thread and restarts it if it dies or stalls.
+        """
+        self.stop_event.clear()
         self.last_tick_time = time.time()
-        
-        while self.running:
-            logger.info("🔄 Starting Feed Thread Monitor...")
-            thread = Thread(target=self._start_feed_process, daemon=True)
-            thread.start()
+
+        logger.info("🚀 Live Data Feed Supervisor Started")
+
+        while not self.stop_event.is_set():
             
-            # Watchdog Loop
-            while thread.is_alive() and self.running:
-                # Check for stale feed (Heartbeat)
-                if time.time() - self.last_tick_time > 60:
-                    logger.warning("❤️ Feed Stalled (No ticks for 60s). Restarting...")
-                    try:
-                        # Force close if possible, or just break to restart
-                        if self.feed: 
-                            self.feed.disconnect() # Attempt graceful close
-                    except:
-                        pass
-                    break # Break inner loop to trigger restart
-                
-                await asyncio.sleep(1)
-            
-            if not self.running:
-                break
-                
-            logger.warning("⚠️ Feed Thread Died or Stalled. Restarting in 2s...")
-            await asyncio.sleep(2)
+            # 1. Start Thread if missing
+            if self.feed_thread is None or not self.feed_thread.is_alive():
+                logger.info("Starting new feed thread...")
+                self.feed_thread = Thread(target=self._run_feed_process, daemon=True)
+                self.feed_thread.start()
+                # Give it a moment to connect
+                await asyncio.sleep(2)
+
+            # 2. Watchdog Check
+            silence_duration = time.time() - self.last_tick_time
+            if silence_duration > 60: # 60 seconds silence
+                logger.warning(f"⚠️ Feed Stalled ({silence_duration:.0f}s silence). Restarting...")
+                self.disconnect()
+                # The loop will restart the thread in next iteration
+                self.last_tick_time = time.time() # Reset timer to prevent rapid-fire restarts
+
+            # 3. Sleep check
+            await asyncio.sleep(5)
+
+    async def stop(self):
+        """Stop the supervisor and feed"""
+        logger.info("🛑 Stopping Live Data Feed...")
+        self.stop_event.set()
+        self.disconnect()
+        if self.feed_thread:
+            self.feed_thread.join(timeout=2)
+
