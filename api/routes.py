@@ -16,57 +16,29 @@ from starlette.responses import Response
 
 logger = logging.getLogger("VolGuardAPI")
 
-# ==================== FASTAPI APP ====================
-app = FastAPI(
-    title="VolGuard 19.0 API",
-    description="Intelligent Trading System with Capital Allocation (Endgame Architecture)",
-    version="19.0.0",
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json"
-)
+app = FastAPI(title="VolGuard 19.0 API", version="19.0.0")
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Mount static files for dashboard
 dashboard_path = Path(DASHBOARD_DATA_DIR)
 dashboard_path.mkdir(exist_ok=True)
 app.mount("/dashboard/static", StaticFiles(directory=dashboard_path), name="dashboard_static")
 
-
-# ==================== PYDANTIC MODELS ====================
-
+# --- MODELS ---
 class EngineStartRequest(BaseModel):
-    """Engine start request model"""
-    continuous: bool = Field(default=True, description="Run continuously")
-    initialize_dashboard: bool = Field(default=True, description="Initialize dashboard on start")
+    continuous: bool = Field(default=True)
+    initialize_dashboard: bool = Field(default=True)
 
 class TokenUpdateRequest(BaseModel):
-    """Token update request model"""
-    access_token: str = Field(..., min_length=10, description="New Upstox Access Token")
-
-class TradeRequest(BaseModel):
-    """Trade request model"""
-    strategy: str = Field(..., description="Strategy type")
-    lots: int = Field(1, ge=1, le=10, description="Number of lots")
-    capital_bucket: str = Field(..., description="Capital bucket")
-
-    @validator('capital_bucket')
-    def validate_bucket(cls, v):
-        valid_buckets = [b.value for b in CapitalBucket]
-        if v not in valid_buckets:
-            raise ValueError(f"Invalid bucket. Must be one of: {valid_buckets}")
-        return v
+    access_token: str = Field(..., min_length=10)
 
 class CapitalAdjustmentRequest(BaseModel):
-    """Capital adjustment request model"""
     weekly_pct: float = Field(0.40, ge=0.0, le=1.0)
     monthly_pct: float = Field(0.50, ge=0.0, le=1.0)
     intraday_pct: float = Field(0.10, ge=0.0, le=1.0)
@@ -79,182 +51,65 @@ class CapitalAdjustmentRequest(BaseModel):
                 raise ValueError(f"Percentages must sum to 100%, got {total*100:.1f}%")
         return v
 
-class StrategyRecommendationRequest(BaseModel):
-    regime: Optional[str] = None
-    ivp: Optional[float] = Field(None, ge=0.0, le=100.0)
-    event_risk: Optional[float] = Field(None, ge=0.0, le=5.0)
-    spot_price: Optional[float] = Field(None, gt=0.0)
-
-
-# ==================== DEPENDENCIES ====================
-
+# --- DEPENDENCIES ---
 def get_engine(request: Request) -> VolGuard17Engine:
-    """
-    Retrieves the single engine instance initialized in main.py.
-    """
     engine = getattr(request.app.state, "engine", None)
     if not engine:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Engine is still initializing. Please wait."
-        )
+        raise HTTPException(status_code=503, detail="Engine initializing...")
     return engine
 
-
-# ==================== ROOT & HEALTH ====================
-
+# --- ROUTES ---
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head><title>VolGuard 19.0</title></head>
-    <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-        <h1>🛡 VolGuard 19.0 Active</h1>
-        <p>Endgame Production Architecture</p>
-        <p><a href="/dashboard">Go to Dashboard</a> | <a href="/api/docs">API Docs</a></p>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
+    return HTMLResponse("<h1>VolGuard 19.0 Active</h1>")
 
 @app.get("/health")
 async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
-    try:
-        health_data = engine.get_system_health()
-        
-        # Check critical components
-        is_healthy = (
-            health_data["engine"]["running"] is not False and
-            health_data["capital_allocation"] is not None
-        )
-        
-        status_code = status.HTTP_200_OK if is_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
-        
-        return JSONResponse(
-            status_code=status_code,
-            content={
-                "status": "healthy" if is_healthy else "degraded",
-                "timestamp": datetime.now().isoformat(),
-                "version": "19.0.0",
-                "engine_running": health_data["engine"]["running"],
-                "active_trades": health_data["engine"]["active_trades"],
-                "analytics_healthy": health_data["analytics"].get("sabr_calibrated", False),
-            }
-        )
-    except Exception as e:
-        raise HTTPException(500, f"Health check failed: {str(e)}")
-
-
-# ==================== DASHBOARD ENDPOINTS ====================
-
-@app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_home():
-    """Interactive dashboard placeholder"""
-    return HTMLResponse(content="<h1>VolGuard Dashboard Loading...</h1><script>window.location='/api/dashboard/data'</script>")
+    return JSONResponse(content=engine.get_system_health())
 
 @app.get("/api/dashboard/data")
 async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
-    try:
-        data = engine.get_dashboard_data()
-        
-        if not data:
-            return {"status": "initializing", "timestamp": datetime.now().isoformat()}
-
-        status_info = engine.get_status()
-        
-        return {
-            **data,
-            "engine_status": {
-                "running": status_info.running,
-                "circuit_breaker": status_info.circuit_breaker,
-                "cycle_count": status_info.cycle_count,
-            },
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Dashboard error: {e}")
-        raise HTTPException(500, str(e))
-
-
-# ==================== ENGINE CONTROL ====================
+    data = engine.get_dashboard_data()
+    return data if data else {"status": "init"}
 
 @app.get("/api/status")
 async def get_status(engine: VolGuard17Engine = Depends(get_engine)):
-    status = engine.get_status()
-    return status.to_dict()
+    return engine.get_status().to_dict()
 
 @app.post("/api/start")
-async def start_engine(
-    background_tasks: BackgroundTasks,
-    request: EngineStartRequest = EngineStartRequest(),
-    engine: VolGuard17Engine = Depends(get_engine)
-):
-    if engine.running:
-        raise HTTPException(400, "Engine already running")
-    
-    background_tasks.add_task(engine.run)
-    return {"status": "starting", "timestamp": datetime.now().isoformat()}
+async def start_engine(bt: BackgroundTasks, engine: VolGuard17Engine = Depends(get_engine)):
+    if engine.running: raise HTTPException(400, "Already running")
+    bt.add_task(engine.run)
+    return {"status": "starting"}
 
 @app.post("/api/stop")
 async def stop_engine(engine: VolGuard17Engine = Depends(get_engine)):
-    if not engine.running:
-        raise HTTPException(400, "Engine not running")
-    
     await engine.shutdown()
-    return {"status": "stopping", "timestamp": datetime.now().isoformat()}
-
-# ==================== MANAGEMENT ENDPOINTS ====================
+    return {"status": "stopping"}
 
 @app.post("/api/token/refresh")
-async def refresh_token(
-    request: TokenUpdateRequest,
-    engine: VolGuard17Engine = Depends(get_engine)
-):
-    """
-    Updates the Upstox Access Token across all modules at runtime.
-    """
-    new_token = request.access_token
-    logger.info("🔐 Received Token Refresh Request")
-
+async def refresh_token(req: TokenUpdateRequest, engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        # 1. Update Global Settings
-        settings.UPSTOX_ACCESS_TOKEN = new_token
-
-        # 2. Update Live Data Feed (Triggers reconnect)
-        if hasattr(engine, "data_feed"):
-            engine.data_feed.update_token(new_token)
-        
-        # 3. Update Execution API
-        if hasattr(engine, "api"):
-            engine.api.token = new_token
-            engine.api.headers["Authorization"] = f"Bearer {new_token}"
-            if engine.api.session and not engine.api.session.closed:
-                await engine.api.session.close()
-                engine.api.session = None
-                
-        # 4. Update Greek Validator
-        if hasattr(engine, "greek_validator"):
-            engine.greek_validator.token = new_token
-
-        logger.info("✅ Token updated successfully.")
-        return {
-            "status": "success", 
-            "message": "Token refreshed. System is using new credentials.",
-            "timestamp": datetime.now().isoformat()
-        }
-
+        settings.UPSTOX_ACCESS_TOKEN = req.access_token
+        if hasattr(engine, "data_feed"): engine.data_feed.update_token(req.access_token)
+        if hasattr(engine, "api"): 
+            engine.api.token = req.access_token
+            engine.api.headers["Authorization"] = f"Bearer {req.access_token}"
+            if engine.api.session: await engine.api.session.close()
+            engine.api.session = None
+        if hasattr(engine, "greek_validator"): engine.greek_validator.token = req.access_token
+        return {"status": "success"}
     except Exception as e:
-        logger.critical(f"❌ Token refresh failed: {e}")
-        raise HTTPException(500, f"Token refresh failed: {str(e)}")
+        raise HTTPException(500, str(e))
 
 @app.post("/api/capital/adjust")
 async def adjust_capital(
     request: CapitalAdjustmentRequest,
+    dry_run: bool = Query(False),
     engine: VolGuard17Engine = Depends(get_engine)
 ):
     """
-    Dynamically rebalance capital allocation percentages.
+    Safe Capital Rebalancing with Validation.
     """
     try:
         new_allocation = {
@@ -263,31 +118,46 @@ async def adjust_capital(
             "intraday_adjustments": request.intraday_pct
         }
         
-        # Update Allocator
-        engine.capital_allocator.bucket_config = new_allocation
+        # VALIDATION: Check against current usage
+        current_status = engine.capital_allocator.get_status()
+        violations = []
         
-        # Update Global Settings
+        for bucket, pct in new_allocation.items():
+            new_limit = settings.ACCOUNT_SIZE * pct
+            current_used = current_status["used"].get(bucket, 0)
+            
+            if current_used > new_limit:
+                violations.append({
+                    "bucket": bucket,
+                    "used": current_used,
+                    "new_limit": new_limit,
+                    "shortfall": current_used - new_limit
+                })
+        
+        if violations:
+            msg = "New limits are below current usage! Close positions first."
+            if not dry_run:
+                raise HTTPException(400, detail={"error": msg, "violations": violations})
+            return {"status": "blocked", "violations": violations}
+
+        if dry_run:
+            return {"status": "safe_to_apply", "allocation": new_allocation}
+
+        # Apply
+        engine.capital_allocator.bucket_config = new_allocation
         settings.CAPITAL_ALLOCATION = new_allocation
         
-        logger.info(f"💰 Capital Allocation Updated: {new_allocation}")
-        return {
-            "status": "success",
-            "message": "Capital allocation updated",
-            "new_allocation": new_allocation,
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Capital adjustment failed: {e}")
-        raise HTTPException(500, str(e))
+        return {"status": "success", "new_allocation": new_allocation}
 
-# ==================== EMERGENCY CONTROLS ====================
+    except HTTPException: raise
+    except Exception as e:
+        logger.error(f"Capital adjustment error: {e}")
+        raise HTTPException(500, str(e))
 
 @app.post("/api/emergency/flatten")
 async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
     await engine._emergency_flatten()
-    return {"status": "emergency_flatten_initiated"}
-
-# ==================== METRICS ====================
+    return {"status": "flatten_initiated"}
 
 @app.get("/api/metrics")
 async def metrics():
