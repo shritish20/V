@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Dict
+from typing import Dict, Any, Union
 from datetime import datetime
 import aiohttp
 
@@ -11,6 +11,9 @@ from analytics.pricing import HybridPricingEngine
 logger = logging.getLogger("GreekValidator")
 
 class GreekValidator:
+    """
+    FIXED: Added robust error handling and type safety for broker Greek data.
+    """
     def __init__(self, validated_cache: Dict[str, dict], sabr_model: EnhancedSABRModel, refresh_sec: int = 15, tolerance_pct: float = 15.0):
         self.cache = validated_cache
         self.sabr = sabr_model
@@ -39,28 +42,53 @@ class GreekValidator:
                 logger.error(f"Greek validation loop error: {e}")
             await asyncio.sleep(self.refresh_sec)
 
+    def _safe_float(self, val: Any, default: float = 0.0) -> float:
+        """
+        CRITICAL FIX: Safely convert broker response values to float.
+        Handles None, 'null', strings, and malformed data to prevent crashes.
+        """
+        try:
+            if val in (None, "", "null"):
+                return default
+            return float(val)
+        except (ValueError, TypeError):
+            return default
+
     async def _validate_once(self):
         if not self.subscribed: return
 
         broker_data = await self._fetch_broker_greeks()
         sabr_data = self._compute_sabr_greeks(broker_data.keys())
 
-        # FIX: Locked Update
+        # FIX: Locked Update with Type Validation
         async with self._update_lock:
             for key, broker in broker_data.items():
+                # Ensure broker data is a valid dictionary
+                if not isinstance(broker, dict):
+                    continue
+
                 sabr = sabr_data.get(key)
+                
+                # If SABR failed or not ready, fallback to sanitized broker data
                 if not sabr:
-                    self.cache[key] = broker 
+                    sanitized_broker = {}
+                    for g in ("delta", "theta", "gamma", "vega", "iv"):
+                        sanitized_broker[g] = self._safe_float(broker.get(g))
+                    sanitized_broker["timestamp"] = datetime.now(IST)
+                    self.cache[key] = sanitized_broker
                     continue
 
                 trusted = {}
                 for g in ("delta", "theta", "gamma", "vega", "iv"):
-                    b = broker.get(g, 0)
-                    s = sabr.get(g, 0)
+                    # Use safe float conversion
+                    b = self._safe_float(broker.get(g))
+                    s = self._safe_float(sabr.get(g))
                     
                     denom = max(abs(s), 1e-6)
                     disc = abs(b - s) * 100 / denom
 
+                    # If discrepancy is high, trust the Broker (Market Maker) values
+                    # If discrepancy is low, trust our SABR model (smoothness)
                     if disc > self.tolerance_pct:
                         trusted[g] = b
                     else:
@@ -84,7 +112,8 @@ class GreekValidator:
                     async with session.get(self.url, headers=headers, params=params) as r:
                         if r.status == 200:
                             data = await r.json()
-                            results.update(data.get("data", {}))
+                            if data.get("status") == "success":
+                                results.update(data.get("data", {}))
                 except Exception as e:
                     logger.error(f"Broker Greek fetch error: {e}")
         return results
@@ -103,7 +132,12 @@ class GreekValidator:
                     
                     strike = float(row.iloc[0]['strike'])
                     opt_type = row.iloc[0]['option_type']
-                    expiry = row.iloc[0]['expiry'].strftime("%Y-%m-%d")
+                    # Ensure date parsing is robust
+                    try:
+                        expiry_raw = row.iloc[0]['expiry']
+                        expiry = expiry_raw.strftime("%Y-%m-%d") if hasattr(expiry_raw, 'strftime') else str(expiry_raw)
+                    except Exception:
+                        continue
                     
                     gsnap = engine.calculate_greeks(spot, strike, opt_type, expiry)
                     
@@ -114,5 +148,6 @@ class GreekValidator:
             except Exception:
                 continue
         return out
+
 
 
