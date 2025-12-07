@@ -2,7 +2,7 @@ import aiohttp
 import asyncio
 import logging
 import calendar
-from datetime import datetime, timedelta
+from datetime import datetime, date
 from typing import Dict, List, Optional, Tuple, Any
 from core.config import settings, get_full_url
 from core.models import Order
@@ -19,6 +19,11 @@ class EnhancedUpstoxAPI:
             "Api-Version": "2.0",
         }
         self.session: Optional[aiohttp.ClientSession] = None
+        self.instrument_master = None  # Will be set by engine
+
+    def set_instrument_master(self, master):
+        """Link the InstrumentMaster for accurate symbol resolution"""
+        self.instrument_master = master
 
     async def _session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
@@ -64,7 +69,12 @@ class EnhancedUpstoxAPI:
             return True, f"SIM-{int(asyncio.get_event_loop().time())}"
 
         url = get_full_url("place_order")
-        # V2 API requires 'instrument_token'
+        
+        # FINAL SAFETY CHECK: Ensure we aren't sending a raw symbol like "NIFTY..."
+        if "|" not in order.instrument_key:
+            logger.critical(f"🛑 BLOCKED: Attempted to place order with invalid key: {order.instrument_key}")
+            return False, None
+
         payload = {
             "instrument_token": order.instrument_key,
             "transaction_type": order.transaction_type,
@@ -126,47 +136,48 @@ class EnhancedUpstoxAPI:
             logger.error(f"Failed to fetch Upstox Greeks: {e}")
         return {}
 
-    # --- DYNAMIC FUTURES SYMBOL GENERATION (Fixed logic) ---
+    # --- RESOLUTION LOGIC (The Fixed Part) ---
+
     async def get_current_future_symbol(self, index_key: str = "NSE_INDEX|Nifty 50") -> str:
-        """
-        Dynamically calculates the NIFTY Futures symbol for the current expiry.
-        Format expected: NSE_FO|NIFTY{YY}{MMM}FUT (e.g., NSE_FO|NIFTY24DECFUT)
-        """
+        """Returns the real instrument key for current month futures."""
+        if self.instrument_master:
+            # Use Master (Accurate)
+            token = self.instrument_master.get_current_future("NIFTY")
+            if token: return token
+            
+        # Fallback (heuristic)
         now = datetime.now()
-        year = now.year
-        month = now.month
-
-        # Calculate Last Thursday of current month
-        last_thursday = self._get_last_thursday(year, month)
-
-        # If we are past the expiry, move to next month
-        if now.date() > last_thursday:
-            month += 1
-            if month > 12:
-                month = 1
-                year += 1
-        
-        # Format: YY + MMM (uppercase)
-        yy = str(year)[-2:]
-        mmm = calendar.month_abbr[month].upper()
-        
-        symbol = f"NSE_FO|NIFTY{yy}{mmm}FUT"
-        logger.debug(f"Resolved Futures Symbol: {symbol}")
-        return symbol
-
-    def _get_last_thursday(self, year, month):
-        cal = calendar.monthcalendar(year, month)
-        # The 4th column (index 3) is Thursday
-        last_thursday_day = max(week[3] for week in cal if week[3] != 0)
-        return datetime(year, month, last_thursday_day).date()
+        yy = str(now.year)[-2:]
+        mmm = calendar.month_abbr[now.month].upper()
+        fallback = f"NSE_FO|NIFTY{yy}{mmm}FUT"
+        logger.warning(f"⚠️ Using fallback Future symbol: {fallback}")
+        return fallback
 
     async def resolve_instrument_key(self, strike: float, type: str, expiry: str) -> str:
-        dt = datetime.strptime(expiry, "%Y-%m-%d")
-        yy = str(dt.year)[-2:]
-        mmm = dt.strftime("%b").upper()
+        """
+        Resolves NIFTY 21000 CE 2024-12-28 -> NSE_FO|12345
+        """
+        expiry_date = datetime.strptime(expiry, "%Y-%m-%d").date()
+        
+        # 1. Try Master File (Primary Method)
+        if self.instrument_master:
+            token = self.instrument_master.get_option_token("NIFTY", strike, type, expiry_date)
+            if token:
+                return token
+                
+        # 2. Fallback (Only if master fails or is missing)
+        # Warning: This heuristic often fails for Weekly options
+        logger.warning(f"⚠️ Master lookup failed for {strike} {type} {expiry}. Using heuristic.")
+        
+        yy = str(expiry_date.year)[-2:]
+        mmm = expiry_date.strftime("%b").upper()
+        day = expiry_date.day
+        
+        # Upstox Weekly format often looks like '24D07' (Year + MonthChar + Day)
+        # But for safety, we default to the standard monthly format here.
+        # This is why having InstrumentMaster loaded is crucial.
         return f"NSE_FO|NIFTY{yy}{mmm}{int(strike)}{type}"
 
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
-
