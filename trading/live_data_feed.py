@@ -3,6 +3,7 @@ import time
 import logging
 from threading import Thread, Event
 from typing import Dict, Optional, Set
+from datetime import datetime
 from upstox_client.feeder.market_data_feed import MarketDataFeed
 
 from core.config import settings
@@ -25,14 +26,13 @@ class LiveDataFeed:
         self.is_connected = False
 
     def subscribe_instrument(self, key: str):
-        if not key or key in self.sub_list:
-            return
+        if not key or key in self.sub_list: return
         self.sub_list.add(key)
         if self.is_connected and self.feed:
             try:
                 self.feed.subscribe([key])
-            except Exception as e:
-                logger.warning(f"Dynamic subscribe failed: {e}")
+            except Exception:
+                pass
 
     def update_token(self, new_token: str):
         if new_token == self.token: return
@@ -44,24 +44,20 @@ class LiveDataFeed:
         self.last_tick_time = time.time()
         self.is_connected = True
         try:
-            # FIX: Better Validation
-            if "feeds" not in message:
-                return
-            
+            if "feeds" not in message: return
             for key, feed in message["feeds"].items():
                 if "ltpc" in feed:
                     ltp = feed["ltpc"].get("ltp")
                     if ltp:
                         self.rt_quotes[key] = float(ltp)
-        except Exception as e:
-            logger.error(f"Feed Parse Error: {e}", exc_info=True)
+        except Exception:
+            pass
 
     def on_error(self, error):
         logger.error(f"Upstox Feed Error: {error}")
         self.is_connected = False
 
     def on_close(self):
-        logger.warning("Upstox Feed Connection Closed")
         self.is_connected = False
 
     def _run_feed_process(self):
@@ -74,19 +70,14 @@ class LiveDataFeed:
             self.feed.on_market_data = self.on_market_data
             self.feed.on_error = self.on_error
             self.feed.on_close = self.on_close
-            
-            logger.info(f"🔌 Connecting Feed with {len(self.sub_list)} instruments...")
             self.feed.connect()
-        except Exception as e:
-            logger.error(f"Feed Thread Crash: {e}")
+        except Exception:
             self.is_connected = False
 
     def disconnect(self):
         if self.feed:
-            try:
-                self.feed.disconnect()
-            except Exception:
-                pass
+            try: self.feed.disconnect()
+            except Exception: pass
         self.feed = None
         self.is_connected = False
 
@@ -96,16 +87,29 @@ class LiveDataFeed:
         logger.info("🚀 Live Data Feed Supervisor Started")
 
         while not self.stop_event.is_set():
-            if self.feed_thread is None or not self.feed_thread.is_alive():
-                self.feed_thread = Thread(target=self._run_feed_process, daemon=True)
-                self.feed_thread.start()
-                await asyncio.sleep(2)
+            # FIX: Market Hours Check
+            now = datetime.now(settings.IST).time()
+            is_market_open = settings.MARKET_OPEN_TIME <= now <= settings.MARKET_CLOSE_TIME
+            
+            # Only force restart if market is open or we are in testing/shadow mode
+            should_run = is_market_open or settings.SAFETY_MODE != "live"
 
-            # Watchdog
-            if time.time() - self.last_tick_time > 60:
-                logger.warning("⚠️ Feed Stalled. Restarting...")
-                self.disconnect()
-                self.last_tick_time = time.time()
+            if should_run:
+                if self.feed_thread is None or not self.feed_thread.is_alive():
+                    self.feed_thread = Thread(target=self._run_feed_process, daemon=True)
+                    self.feed_thread.start()
+                    await asyncio.sleep(2)
+
+                # Watchdog
+                if time.time() - self.last_tick_time > 60:
+                    logger.warning("⚠️ Feed Stalled. Restarting...")
+                    self.disconnect()
+                    self.last_tick_time = time.time()
+            else:
+                # Market Closed
+                if self.is_connected:
+                    logger.info("🌙 Market Closed. Pausing Feed.")
+                    self.disconnect()
 
             await asyncio.sleep(5)
 
