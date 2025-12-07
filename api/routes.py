@@ -19,7 +19,7 @@ logger = logging.getLogger("VolGuardAPI")
 # ==================== FASTAPI APP ====================
 app = FastAPI(
     title="VolGuard 19.0 API",
-    description="Intelligent Trading System with Capital Allocation (Endgame Architecture)",
+    description="Institutional-Grade Algorithmic Trading System with Capital Allocation (Endgame Architecture)",
     version="19.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
@@ -29,7 +29,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your frontend URL
+    allow_origins=["*"],  # In production, restrict this to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,7 +39,6 @@ app.add_middleware(
 dashboard_path = Path(DASHBOARD_DATA_DIR)
 dashboard_path.mkdir(exist_ok=True)
 app.mount("/dashboard/static", StaticFiles(directory=dashboard_path), name="dashboard_static")
-
 
 # ==================== PYDANTIC MODELS ====================
 
@@ -85,7 +84,6 @@ class StrategyRecommendationRequest(BaseModel):
     event_risk: Optional[float] = Field(None, ge=0.0, le=5.0)
     spot_price: Optional[float] = Field(None, gt=0.0)
 
-
 # ==================== DEPENDENCIES ====================
 
 def get_engine(request: Request) -> VolGuard17Engine:
@@ -99,7 +97,6 @@ def get_engine(request: Request) -> VolGuard17Engine:
             detail="Engine is still initializing. Please wait."
         )
     return engine
-
 
 # ==================== ROOT & HEALTH ====================
 
@@ -145,7 +142,6 @@ async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
     except Exception as e:
         raise HTTPException(500, f"Health check failed: {str(e)}")
 
-
 # ==================== DASHBOARD ENDPOINTS ====================
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -175,7 +171,6 @@ async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
         raise HTTPException(500, str(e))
-
 
 # ==================== ENGINE CONTROL ====================
 
@@ -212,7 +207,8 @@ async def refresh_token(
     engine: VolGuard17Engine = Depends(get_engine)
 ):
     """
-    Updates the Upstox Access Token across all modules at runtime.
+    FIXED: Updates the Upstox Access Token across all modules at runtime.
+    Now uses locks to prevent race conditions during token swap.
     Critical for 24/7 operation.
     """
     new_token = request.access_token
@@ -229,17 +225,24 @@ async def refresh_token(
         # 3. Update Execution API
         if hasattr(engine, "api"):
             engine.api.token = new_token
-            engine.api.headers["Authorization"] = f"Bearer {new_token}"
+            # Rebuild headers dictionary to ensure consistency
+            engine.api.headers = {
+                "Authorization": f"Bearer {new_token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "Api-Version": "2.0",
+            }
+            
             # Force session close to ensure new session gets new headers
             if engine.api.session and not engine.api.session.closed:
                 await engine.api.session.close()
-                engine.api.session = None
+            engine.api.session = None
                 
-        # 4. FIX: Update Greek Validator
+        # 4. CRITICAL FIX: Update Greek Validator with Lock
         if hasattr(engine, "greek_validator"):
-            engine.greek_validator.token = new_token
+            await engine.greek_validator.update_token(new_token)
 
-        logger.info("✅ Token updated successfully.")
+        logger.info("✅ Token updated successfully across all modules.")
         return {
             "status": "success", 
             "message": "Token refreshed. System is using new credentials.",
