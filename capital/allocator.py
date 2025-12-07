@@ -9,14 +9,17 @@ class SmartCapitalAllocator:
         self.account_size = account_size
         self.bucket_config = buckets
         self.capital_used: Dict[str, Dict[str, float]] = {k: {} for k in buckets.keys()}
-        
-        # FIX: Async Locks for Thread Safety (Logic safety in async loop)
         self._locks: Dict[str, asyncio.Lock] = {k: asyncio.Lock() for k in buckets.keys()}
 
     def get_bucket_limit(self, bucket: str) -> float:
         return self.account_size * self.bucket_config.get(bucket, 0.0)
 
     async def allocate_capital(self, bucket: str, amount: float, trade_id: str) -> bool:
+        # FIX: Negative/Zero Check
+        if amount <= 0:
+            logger.warning(f"🚫 Invalid allocation amount: {amount}")
+            return False
+            
         if bucket not in self._locks: return False
         
         async with self._locks[bucket]:
