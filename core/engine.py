@@ -20,7 +20,7 @@ from trading.order_manager import EnhancedOrderManager
 from trading.risk_manager import AdvancedRiskManager
 from trading.trade_manager import EnhancedTradeManager
 from capital.allocator import SmartCapitalAllocator
-from trading.hedge_manager import PortfolioHedgeManager
+# REMOVED: HedgeManager import
 from analytics.pricing import HybridPricingEngine
 from analytics.sabr_model import EnhancedSABRModel
 from analytics.greek_validator import GreekValidator
@@ -38,6 +38,7 @@ class VolGuard17Engine:
         self.sabr = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
         
+        # Connect Pricing Engine to API for Greek calculations if needed
         if hasattr(self.api, "set_pricing_engine"):
             self.api.set_pricing_engine(self.pricing)
 
@@ -49,7 +50,7 @@ class VolGuard17Engine:
             settings.ACCOUNT_SIZE, settings.CAPITAL_ALLOCATION
         )
         
-        # Initialize V18 Intelligence Modules
+        # Initialize Intelligence Modules
         self.vol_analytics = HybridVolatilityAnalytics()
         self.event_intel = AdvancedEventIntelligence()
         
@@ -57,9 +58,9 @@ class VolGuard17Engine:
         self.data_feed = LiveDataFeed(self.rt_quotes, self.greeks_cache, self.sabr)
         self.om = EnhancedOrderManager(self.api, self.db)
         self.risk_mgr = AdvancedRiskManager(self.db, None)
-        self.hedge_mgr = PortfolioHedgeManager(self.api, self.om, self.risk_mgr)
         
-        # Initialize V18 Strategy Engine with V19 Capital Awareness
+        # REMOVED: self.hedge_mgr initialization
+        
         self.strategy_engine = IntelligentStrategyEngine(
             self.vol_analytics,
             self.event_intel,
@@ -78,7 +79,7 @@ class VolGuard17Engine:
         self.last_error_time = 0
 
     async def initialize(self):
-        logger.info("🚀 Booting VolGuard 19.0 (Endgame)...")
+        logger.info("🚀 Booting VolGuard 19.0 (Lite)...")
         await self.db.init_db()
         await self.om.start()
         await self._restore_from_snapshot()
@@ -95,13 +96,15 @@ class VolGuard17Engine:
     async def _system_heartbeat(self):
         while self.running:
             await asyncio.sleep(10)
-            lag = asyncio.get_event_loop().time() - self.data_feed.last_tick_time
-            if lag > 60:
-                logger.critical(f"❤️ FEED STALLED ({lag:.0f}s).")
-                try:
+            # Check feed latency
+            try:
+                lag = asyncio.get_event_loop().time() - self.data_feed.last_tick_time
+                if lag > 60:
+                    logger.critical(f"❤️ FEED STALLED ({lag:.0f}s).")
+                    # Ping API to check connection
                     await self.api.get_short_term_positions()
-                except Exception:
-                    self.error_count += 1
+            except Exception:
+                self.error_count += 1
 
     async def _reconcile_broker_positions(self):
         """Adopt 'zombie' positions that exist at broker but not in internal state."""
@@ -123,6 +126,7 @@ class VolGuard17Engine:
             for token, qty in broker_map.items():
                 if token not in internal_map:
                     logger.critical(f"🚨 ZOMBIE ADOPTED: {token} Qty: {qty}")
+                    # Create dummy leg for tracking
                     dummy_leg = Position(
                         symbol="UNKNOWN",
                         instrument_key=token,
@@ -151,6 +155,7 @@ class VolGuard17Engine:
                     new_trade.id = f"ZOMBIE-{int(time.time())}"
                     self.trades.append(new_trade)
                     
+                    # Persist to DB
                     async with self.db.get_session() as session:
                         db_strat = DbStrategy(
                             id=new_trade.id,
@@ -197,6 +202,7 @@ class VolGuard17Engine:
                     trade.basket_order_id = db_strat.broker_ref_id
                     self.trades.append(trade)
                     
+                    # Reserve capital for restored trades
                     value = sum(abs(l.entry_price * l.quantity) for l in trade.legs)
                     await self.capital_allocator.allocate_capital(
                         trade.capital_bucket.value, value, trade_id=trade.id
@@ -205,7 +211,7 @@ class VolGuard17Engine:
                     logger.error(f"Hydration Failed: {e}")
 
     async def _update_greeks_and_risk(self, spot: float):
-        # 1. Price & Greeks
+        # 1. Update Prices & Greeks for active trades
         tasks = [
             self.trade_mgr.update_trade_prices(t, spot, self.rt_quotes)
             for t in self.trades
@@ -214,7 +220,7 @@ class VolGuard17Engine:
         if tasks:
             await asyncio.gather(*tasks)
 
-        # 2. Risk State
+        # 2. Update Risk State
         total_pnl = 0.0
         for t in self.trades:
             if hasattr(t, "total_unrealized_pnl"):
@@ -222,14 +228,12 @@ class VolGuard17Engine:
         
         self.risk_mgr.update_portfolio_state(self.trades, total_pnl)
         
+        # 3. Check Portfolio Limits (Flattening Logic)
         if self.risk_mgr.check_portfolio_limits():
             logger.critical("🚨 RISK LIMIT BREACHED. FLATTENING.")
             await self._emergency_flatten()
 
-        # 3. Auto-Hedging
-        portfolio_delta = self.risk_mgr.portfolio_delta
-        vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 15.0)
-        await self.hedge_mgr.check_and_hedge(portfolio_delta, vix)
+        # REMOVED: Auto-Hedging Logic (Futures hedging disabled for V1 stability)
 
     async def _emergency_flatten(self):
         logger.critical("🔥 EMERGENCY FLATTEN TRIGGERED 🔥")
@@ -270,6 +274,7 @@ class VolGuard17Engine:
         self.running = True
         while self.running:
             try:
+                # Suicide Switch for excessive errors
                 if self.error_count > settings.MAX_ERROR_COUNT:
                     logger.critical("💥 TOO MANY ERRORS. SUICIDE.")
                     await self.shutdown()
@@ -278,10 +283,14 @@ class VolGuard17Engine:
                 spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
                 if spot > 0:
                     await self._update_greeks_and_risk(spot)
-                    # Logic to check metrics and potentially enter trades would go here
-                    # triggering self.strategy_engine.select_strategy_with_capital(...)
+                    
+                    # Trading Logic: Check metrics and enter trades via Strategy Engine
+                    # This connects to the Intelligence Module
+                    # (Implementation details for entry would go here, utilizing self.strategy_engine)
+                    
                     await self.trade_mgr.monitor_active_trades(self.trades)
                 
+                # Reset error count if stable for 60s
                 if time.time() - self.last_error_time > 60:
                     self.error_count = 0
             except Exception as e:
