@@ -1,6 +1,6 @@
 import pytz
 from datetime import time as dtime
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from pydantic_core import MultiHostUrl
@@ -15,7 +15,7 @@ UPSTOX_API_ENDPOINTS = {
     "market_quote": "/v2/market-quote/quotes",
     "margin": "/v2/charges/margin",
     "ws_auth": "/v2/feed/market-data-feed/authorize",
-    "option_greek": "/v3/market-quote/option-greek",  # V3 Greeks
+    "option_greek": "/v3/market-quote/option-greek",
 }
 
 class Settings(BaseSettings):
@@ -27,7 +27,6 @@ class Settings(BaseSettings):
     PAPER_TRADING: bool = Field(default=True, env="PAPER_TRADING")
 
     # --- Safety Mode (Primary Switch) ---
-    # "paper" / "shadow" / "live"
     SAFETY_MODE: str = Field(default="paper", env="SAFETY_MODE")
 
     # --- Postgres ---
@@ -58,6 +57,7 @@ class Settings(BaseSettings):
     # --- Account / Capital ---
     ACCOUNT_SIZE: float = Field(default=2_000_000.0, env="ACCOUNT_SIZE")
     LOT_SIZE: int = Field(default=75, env="LOT_SIZE")
+    
     CAPITAL_ALLOCATION: Dict[str, float] = {
         "weekly_expiries": 0.40,
         "monthly_expiries": 0.50,
@@ -73,7 +73,8 @@ class Settings(BaseSettings):
     # Portfolio Limits
     MAX_PORTFOLIO_VEGA: float = Field(default=1000.0, env="MAX_VEGA")
     MAX_PORTFOLIO_DELTA: float = Field(default=300.0, env="MAX_PORTFOLIO_DELTA")
-    
+    MAX_PORTFOLIO_THETA: float = Field(default=-1500.0, env="MAX_THETA")
+    MAX_PORTFOLIO_GAMMA: float = Field(default=50.0, env="MAX_GAMMA")
     MAX_ERROR_COUNT: int = 5
 
     # Exit Rules
@@ -88,6 +89,21 @@ class Settings(BaseSettings):
     # Safety
     DTE_THRESHOLD_WEEKLY: int = 2
     VIX_MIN_THRESHOLD: float = 13.0
+
+    # Transaction Costs (ADDED)
+    BROKERAGE_PER_ORDER: float = Field(default=20.0, env="BROKERAGE_PER_ORDER")
+    GST_RATE: float = Field(default=0.18, env="GST_RATE")
+
+    # Pricing Parameters (ADDED)
+    RISK_FREE_RATE: float = Field(default=0.065, env="RISK_FREE_RATE")
+
+    # SABR Calibration Bounds (ADDED)
+    SABR_BOUNDS: Dict[str, Tuple[float, float]] = {
+        'alpha': (0.01, 2.0),
+        'beta': (0.1, 1.0),
+        'rho': (-0.99, 0.99),
+        'nu': (0.01, 2.0)
+    }
 
     # Runtime / Data
     PERSISTENT_DATA_DIR: str = "./data"
