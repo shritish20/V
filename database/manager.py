@@ -15,14 +15,15 @@ class HybridDatabaseManager:
 
     async def init_db(self):
         if self.engine is None:
-            # FIX: Tuned Pool Settings for High Frequency
+            # FIX: High-Performance Pool Settings
             self.engine = create_async_engine(
                 settings.DATABASE_URL,
                 echo=False,
-                pool_pre_ping=True,
-                pool_size=20,       # Increased from 5
-                max_overflow=40,    # Increased from 10
-                pool_recycle=3600   # Recycle every hour
+                pool_pre_ping=True,  # Check connection health before using
+                pool_size=20,        # Base connections (Increased)
+                max_overflow=40,     # Burst connections (Increased)
+                pool_recycle=3600,   # Recycle every hour
+                pool_timeout=30      # Fail if no connection available after 30s
             )
             
             self.async_session = async_sessionmaker(
@@ -31,11 +32,11 @@ class HybridDatabaseManager:
                 class_=AsyncSession
             )
             
-            # Create tables if they don't exist
+            # Auto-create tables
             async with self.engine.begin() as conn:
                 await conn.run_sync(Base.metadata.create_all)
                 
-            logger.info("✓ Database engine initialized (High Perf Pool).")
+            logger.info("✓ Database initialized (Pool: 20+40)")
 
     @asynccontextmanager
     async def get_session(self):
@@ -59,3 +60,9 @@ class HybridDatabaseManager:
         except Exception as e:
             logger.error(f"Commit failed, retrying: {e}")
             raise
+
+    async def close(self):
+        """Cleanup method for Engine shutdown"""
+        if self.engine:
+            await self.engine.dispose()
+            logger.info("✓ Database connections closed.")
