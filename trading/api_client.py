@@ -66,17 +66,18 @@ class EnhancedUpstoxAPI:
 
         url = get_full_url("place_order")
         
-        # FIX: Schema Compliance & Enum Conversion
+        # FIX: Strict Schema Compliance
+        # Upstox V2 requires specific field names and types
         payload = {
             "instrument_token": order.instrument_key,
             "transaction_type": order.transaction_type,
             "quantity": abs(order.quantity),
-            "order_type": order.order_type, # Expecting string e.g. "MARKET"
-            "price": float(order.price),
+            "order_type": order.order_type, 
             "product": order.product,
             "validity": order.validity,
+            "price": float(order.price), # Ensure float
+            "trigger_price": float(order.trigger_price), # Ensure float
             "disclosed_quantity": 0,
-            "trigger_price": float(order.trigger_price),
             "is_amo": order.is_amo,
             "tag": "VG19"
         }
