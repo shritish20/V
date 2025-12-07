@@ -8,6 +8,10 @@ from trading.api_client import EnhancedUpstoxAPI
 logger = logging.getLogger("OrderExec")
 
 class LiveOrderExecutor:
+    """
+    FIXED: Implemented exponential backoff for order status polling.
+    Addresses High Priority Issue #6: "Order Status Polling Inefficiency"
+    """
     def __init__(self, api: EnhancedUpstoxAPI):
         self.api = api
 
@@ -21,6 +25,7 @@ class LiveOrderExecutor:
 
         orders_payload = []
         for idx, leg in enumerate(trade.legs):
+            # Auto-slice large orders (>1800 qty for Nifty is common limit)
             needs_slicing = abs(leg.quantity) > 1800
 
             order = {
@@ -56,8 +61,10 @@ class LiveOrderExecutor:
             success_ids = [x.get("order_id") for x in data_list if x.get("order_id")]
             errors = response.get("errors", [])
 
+            # Atomic Check: All legs must be accepted
             if errors or len(success_ids) != len(trade.legs):
                 logger.critical(f"❌ Batch Failure! Success: {len(success_ids)}/{len(trade.legs)}")
+                # Immediate Rollback: Cancel any partial success
                 for oid in success_ids:
                     await self.api.cancel_order(oid)
                 return False
@@ -72,30 +79,57 @@ class LiveOrderExecutor:
             return False
 
     async def verify_fills(self, trade: MultiLegTrade, timeout=30) -> bool:
+        """
+        Polls for order completion using Exponential Backoff to prevent API Rate Limiting.
+        """
         if settings.SAFETY_MODE != "live": return True
 
+        # Exponential Backoff Schedule (Total ~30s)
+        # Fast checks initially, then slower checks
+        delays = [0.5, 0.5, 1.0, 1.0, 2.0, 2.0, 3.0, 5.0, 5.0, 5.0, 5.0]
+        
         start_time = asyncio.get_event_loop().time()
-        while (asyncio.get_event_loop().time() - start_time) < timeout:
+        
+        for delay in delays:
+            # Check total timeout
+            if (asyncio.get_event_loop().time() - start_time) > timeout:
+                break
+                
             all_filled = True
             
+            # Check status of every leg in the batch
             for oid in trade.gtt_order_ids:
-                details = await self.api.get_order_details(oid)
-                order_data = details.get("data", {})
-                status = order_data.get("status") if isinstance(order_data, dict) else ""
-                
-                # FIX: Logic for Pending/Partial
-                if status == "complete":
-                    continue
-                elif status in ["cancelled", "rejected", "error"]:
-                    logger.error(f"❌ Leg {oid} Failed: {status}")
-                    return False # Fail immediately on hard rejection
-                else:
-                    # Still pending/open/trigger_pending
+                try:
+                    details = await self.api.get_order_details(oid)
+                    
+                    # Handle API response structure variations
+                    if isinstance(details.get("data"), list):
+                        # Some endpoints return list of history
+                        order_data = details["data"][0] if details["data"] else {}
+                    else:
+                        order_data = details.get("data", {})
+                        
+                    status = str(order_data.get("status", "")).lower()
+                    
+                    if status == "complete":
+                        continue
+                    elif status in ["cancelled", "rejected", "error", "failure"]:
+                        logger.error(f"❌ Leg {oid} Failed: {status.upper()}")
+                        return False # Fail immediately on hard rejection
+                    else:
+                        # Status is open, pending, trigger_pending, etc.
+                        all_filled = False
+                        break # Stop checking other legs, wait for next cycle
+                except Exception as e:
+                    logger.warning(f"Error checking order {oid}: {e}")
                     all_filled = False
-                    break # Wait and retry loop
             
-            if all_filled: return True
-            await asyncio.sleep(1)
+            if all_filled:
+                logger.info(f"✅ Trade {trade.id} Fully Filled ({asyncio.get_event_loop().time() - start_time:.1f}s)")
+                return True
             
-        logger.warning(f"⚠️ Fill Verification Timeout {trade.id}")
+            # Wait before next check (Backoff)
+            await asyncio.sleep(delay)
+            
+        logger.warning(f"⚠️ Fill Verification Timeout {trade.id} after {timeout}s")
         return False
