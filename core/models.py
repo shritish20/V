@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from datetime import datetime
 from pydantic import BaseModel, Field, validator
@@ -6,7 +6,7 @@ from enum import Enum
 from core.config import settings, IST
 from core.enums import *
 
-# --- MISSING ENUMS & MODELS ADDED HERE ---
+# --- MISSING ENUMS & MODELS ---
 
 class OrderStatus(Enum):
     PENDING = "PENDING"
@@ -49,6 +49,13 @@ class GreeksSnapshot:
 
     def is_stale(self, max_age: float = 30.0) -> bool:
         return (datetime.now(IST) - self.timestamp).total_seconds() > max_age
+    
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'delta': self.delta, 'gamma': self.gamma, 'theta': self.theta,
+            'vega': self.vega, 'iv': self.iv, 'pop': self.pop,
+            'timestamp': self.timestamp.isoformat()
+        }
 
 class Position(BaseModel):
     symbol: str
@@ -64,6 +71,12 @@ class Position(BaseModel):
     expiry_type: ExpiryType = ExpiryType.WEEKLY
     capital_bucket: CapitalBucket = CapitalBucket.WEEKLY
     tags: List[str] = Field(default_factory=list)
+
+    @validator('option_type')
+    def validate_option_type(cls, v):
+        if v not in ['CE', 'PE']:
+            raise ValueError('option_type must be either "CE" or "PE"')
+        return v
 
     def unrealized_pnl(self) -> float:
         return (self.current_price - self.entry_price) * self.quantity
@@ -106,6 +119,18 @@ class MultiLegTrade(BaseModel):
         self.trade_gamma = sum((leg.current_greeks.gamma or 0) * leg.quantity for leg in self.legs)
         self.trade_theta = sum((leg.current_greeks.theta or 0) * leg.quantity for leg in self.legs)
         self.trade_vega = sum((leg.current_greeks.vega or 0) * leg.quantity for leg in self.legs)
+        
+    def calculate_max_loss(self):
+        # Placeholder for complex spread calculations
+        self.max_loss_per_lot = self.net_premium_per_share # Simple default
+
+    def calculate_max_profit(self):
+        self.max_profit_per_lot = self.net_premium_per_share
+
+    def calculate_breakevens(self):
+        # Simplified default
+        self.breakeven_lower = 0.0
+        self.breakeven_upper = 0.0
 
 @dataclass
 class AdvancedMetrics:
@@ -126,6 +151,19 @@ class AdvancedMetrics:
     sabr_beta: float
     sabr_rho: float
     sabr_nu: float
+    
+    def dict(self):
+        return {k: str(v) if isinstance(v, datetime) else v for k, v in self.__dict__.items()}
+
+@dataclass
+class DashboardData:
+    """Data model for dashboard visualizations"""
+    spot_price: float
+    vix: float
+    pnl: float
+    capital: Dict[str, Dict[str, float]]
+    trades: List[Dict]
+    metrics: Dict[str, Any]
 
 @dataclass
 class EngineStatus:
@@ -137,3 +175,11 @@ class EngineStatus:
     max_equity: float
     last_metrics: Optional[AdvancedMetrics]
     dashboard_ready: bool
+    
+    def to_dict(self):
+        return {
+            "running": self.running,
+            "circuit_breaker": self.circuit_breaker,
+            "total_trades": self.total_trades,
+            "daily_pnl": self.daily_pnl
+        }
