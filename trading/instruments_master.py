@@ -19,7 +19,7 @@ CACHE_FILE = DATA_DIR / "instruments_lite.csv"
 class InstrumentMaster:
     """
     FIXED: Implemented Stale Cache Recovery mechanism.
-    Addresses High Priority Issue #7: "Missing Instrument Master Corruption Recovery"
+    FIXED: Properly deletes stale cache files to prevent infinite loops.
     """
     def __init__(self):
         self.df: Optional[pd.DataFrame] = None
@@ -73,7 +73,8 @@ class InstrumentMaster:
 
     def _load_from_cache(self) -> bool:
         """
-        Checks cache validity. If stale, loads it into memory backup before returning False.
+        FIXED: Checks cache validity. If stale, loads it into memory backup before returning False.
+        Now properly deletes expired cache files to prevent infinite loops.
         """
         if not CACHE_FILE.exists():
             return False
@@ -82,7 +83,7 @@ class InstrumentMaster:
             mtime = datetime.fromtimestamp(CACHE_FILE.stat().st_mtime).date()
             df = pd.read_csv(CACHE_FILE)
             
-            # Validation
+            # Validation: Check structure
             required_cols = {'instrument_key', 'name', 'strike', 'option_type', 'expiry', 'instrument_type'}
             if not required_cols.issubset(df.columns):
                 logger.error("❌ Cache corrupted: Missing columns")
@@ -99,23 +100,26 @@ class InstrumentMaster:
                 CACHE_FILE.unlink()
                 return False
 
-            # Check for Future Expiries (validity check)
-            # We convert expiry just for this check
+            # CRITICAL FIX: Check for Future Expiries (validity check)
             temp_expiry = pd.to_datetime(df['expiry'], errors='coerce').dt.date
             today = date.today()
+            
             if not temp_expiry[temp_expiry >= today].any():
-                logger.error("❌ Cache Useless: All instruments expired")
-                # Don't unlink, maybe history is useful, but don't use it for trading
+                logger.error("❌ Cache Useless: All instruments expired. Forcing re-download.")
+                try:
+                    CACHE_FILE.unlink()  # Delete stale file to prevent infinite loops
+                except Exception as unlink_err:
+                    logger.warning(f"Could not delete stale cache: {unlink_err}")
                 return False
 
-            # CRITICAL FIX: Cache is valid structure-wise.
-            # If it is old, keep a copy in memory before forcing download.
+            # Cache is valid structure-wise.
+            # If it is old (not today), keep a copy in memory before forcing download.
             if mtime < date.today():
-                logger.info(f"Cache exists but stale (Date: {mtime}). keeping memory backup.")
-                self._stale_cache = df.copy() # Save for emergency
-                return False # Return False to trigger download
+                logger.info(f"📦 Cache exists but dated ({mtime}). Keeping memory backup.")
+                self._stale_cache = df.copy()  # Save for emergency
+                return False  # Return False to trigger download
 
-            # If fresh, use it
+            # If fresh (today), use it
             self.df = df
             self._post_load_processing()
             return True
@@ -123,8 +127,10 @@ class InstrumentMaster:
         except Exception as e:
             logger.warning(f"Cache load failed: {e}")
             if CACHE_FILE.exists():
-                try: CACHE_FILE.unlink()
-                except: pass
+                try: 
+                    CACHE_FILE.unlink()
+                except: 
+                    pass
             return False
 
     async def _download_and_process(self):
@@ -139,6 +145,7 @@ class InstrumentMaster:
 
         full_df = pd.DataFrame(json_data)
 
+        # Filter to NIFTY/BANKNIFTY/FINNIFTY Options and Futures
         filtered_df = full_df[
             (full_df['segment'] == 'NSE_FO') & 
             (full_df['name'].isin(['NIFTY', 'BANKNIFTY', 'FINNIFTY']))
@@ -149,6 +156,7 @@ class InstrumentMaster:
         filtered_df['expiry'] = pd.to_datetime(filtered_df['expiry'], errors='coerce').dt.date
         filtered_df = filtered_df.dropna(subset=['expiry'])
 
+        # Save to disk
         filtered_df.to_csv(CACHE_FILE, index=False)
         self.df = filtered_df
         self._post_load_processing()
@@ -159,16 +167,18 @@ class InstrumentMaster:
 
         # Ensure expiry is date object, not string/timestamp
         if self.df['expiry'].dtype == 'object' or self.df['expiry'].dtype == 'string':
-             self.df['expiry'] = pd.to_datetime(self.df['expiry']).dt.date
+            self.df['expiry'] = pd.to_datetime(self.df['expiry']).dt.date
         elif pd.api.types.is_datetime64_any_dtype(self.df['expiry']):
-             self.df['expiry'] = self.df['expiry'].dt.date
+            self.df['expiry'] = self.df['expiry'].dt.date
 
         self._cache_index_fut.clear()
         self._cache_options.clear()
         self.last_updated = datetime.now()
 
     def get_current_future(self, symbol: str = "NIFTY") -> Optional[str]:
-        if self.df is None or self.df.empty: return None
+        if self.df is None or self.df.empty: 
+            return None
+        
         today = date.today()
         cache_key = f"{symbol}_FUT_{today}"
         
@@ -182,7 +192,9 @@ class InstrumentMaster:
                 (self.df['expiry'] >= today)
             ].sort_values('expiry')
 
-            if futs.empty: return None
+            if futs.empty: 
+                return None
+            
             token = futs.iloc[0]['instrument_key']
             self._cache_index_fut[cache_key] = token
             return token
@@ -190,9 +202,12 @@ class InstrumentMaster:
             return None
 
     def get_option_token(self, symbol: str, strike: float, option_type: str, expiry_date: date) -> Optional[str]:
-        if self.df is None: return None
+        if self.df is None: 
+            return None
+        
         cache_key = f"{symbol}_{strike}_{option_type}_{expiry_date}"
-        if cache_key in self._cache_options: return self._cache_options[cache_key]
+        if cache_key in self._cache_options: 
+            return self._cache_options[cache_key]
 
         try:
             opt = self.df[
@@ -202,7 +217,9 @@ class InstrumentMaster:
                 (self.df['option_type'] == option_type) & 
                 (self.df['expiry'] == expiry_date)
             ]
-            if opt.empty: return None
+            if opt.empty: 
+                return None
+            
             token = opt.iloc[0]['instrument_key']
             self._cache_options[cache_key] = token
             return token
@@ -210,11 +227,14 @@ class InstrumentMaster:
             return None
 
     def get_all_expiries(self, symbol: str = "NIFTY") -> List[date]:
-        if self.df is None: return []
+        if self.df is None: 
+            return []
         try:
+            today = date.today()
             dates = self.df[
                 (self.df['name'] == symbol) & 
-                (self.df['instrument_type'] == 'OPTIDX')
+                (self.df['instrument_type'] == 'OPTIDX') & 
+                (self.df['expiry'] >= today)  # Only future expiries
             ]['expiry'].unique()
             return sorted(dates)
         except:
