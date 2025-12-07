@@ -9,7 +9,7 @@ from pathlib import Path
 import logging
 
 from core.engine import VolGuard17Engine
-from core.config import DASHBOARD_DATA_DIR
+from core.config import DASHBOARD_DATA_DIR, settings
 from core.enums import CapitalBucket
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from starlette.responses import Response
@@ -29,7 +29,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, you should restrict this
+    allow_origins=["*"], # In production, restrict this
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,11 +40,17 @@ dashboard_path = Path(DASHBOARD_DATA_DIR)
 dashboard_path.mkdir(exist_ok=True)
 app.mount("/dashboard/static", StaticFiles(directory=dashboard_path), name="dashboard_static")
 
+
 # ==================== PYDANTIC MODELS ====================
+
 class EngineStartRequest(BaseModel):
     """Engine start request model"""
     continuous: bool = Field(default=True, description="Run continuously")
     initialize_dashboard: bool = Field(default=True, description="Initialize dashboard on start")
+
+class TokenUpdateRequest(BaseModel):
+    """Token update request model"""
+    access_token: str = Field(..., min_length=10, description="New Upstox Access Token")
 
 class TradeRequest(BaseModel):
     """Trade request model"""
@@ -79,7 +85,9 @@ class StrategyRecommendationRequest(BaseModel):
     event_risk: Optional[float] = Field(None, ge=0.0, le=5.0)
     spot_price: Optional[float] = Field(None, gt=0.0)
 
+
 # ==================== DEPENDENCIES ====================
+
 def get_engine(request: Request) -> VolGuard17Engine:
     """
     CRITICAL FIX: Retrieves the single engine instance initialized in main.py.
@@ -93,18 +101,20 @@ def get_engine(request: Request) -> VolGuard17Engine:
         )
     return engine
 
+
 # ==================== ROOT & HEALTH ====================
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
     html_content = """
     <!DOCTYPE html>
     <html>
-        <head><title>VolGuard 19.0</title></head>
-        <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-            <h1>🚀 VolGuard 19.0 Active</h1>
-            <p>Endgame Production Architecture</p>
-            <p><a href="/dashboard">Go to Dashboard</a> | <a href="/api/docs">API Docs</a></p>
-        </body>
+    <head><title>VolGuard 19.0</title></head>
+    <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+        <h1>🛡 VolGuard 19.0 Active</h1>
+        <p>Endgame Production Architecture</p>
+        <p><a href="/dashboard">Go to Dashboard</a> | <a href="/api/docs">API Docs</a></p>
+    </body>
     </html>
     """
     return HTMLResponse(content=html_content)
@@ -136,7 +146,9 @@ async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
     except Exception as e:
         raise HTTPException(500, f"Health check failed: {str(e)}")
 
+
 # ==================== DASHBOARD ENDPOINTS ====================
+
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_home():
     """Interactive dashboard placeholder"""
@@ -146,11 +158,13 @@ async def dashboard_home():
 async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
     try:
         data = engine.get_dashboard_data()
+        
         if not data:
             # If dashboard isn't ready, return basic status instead of 404
             return {"status": "initializing", "timestamp": datetime.now().isoformat()}
-            
+
         status_info = engine.get_status()
+        
         return {
             **data,
             "engine_status": {
@@ -164,7 +178,9 @@ async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
         logger.error(f"Dashboard error: {e}")
         raise HTTPException(500, str(e))
 
+
 # ==================== ENGINE CONTROL ====================
+
 @app.get("/api/status")
 async def get_status(engine: VolGuard17Engine = Depends(get_engine)):
     status = engine.get_status()
@@ -192,14 +208,64 @@ async def stop_engine(engine: VolGuard17Engine = Depends(get_engine)):
     await engine.shutdown()
     return {"status": "stopping", "timestamp": datetime.now().isoformat()}
 
+# ==================== TOKEN MANAGEMENT (NEW) ====================
+
+@app.post("/api/token/refresh")
+async def refresh_token(
+    request: TokenUpdateRequest,
+    engine: VolGuard17Engine = Depends(get_engine)
+):
+    """
+    CRITICAL: Updates the Upstox Access Token across all modules at runtime.
+    Call this endpoint every morning or when token expires.
+    """
+    new_token = request.access_token
+    logger.info("🔐 Received Token Refresh Request")
+
+    try:
+        # 1. Update Global Settings (Best effort for components reading directly)
+        settings.UPSTOX_ACCESS_TOKEN = new_token
+
+        # 2. Update Live Data Feed (Triggers reconnect)
+        if hasattr(engine, "data_feed"):
+            engine.data_feed.update_token(new_token)
+        
+        # 3. Update Execution API
+        if hasattr(engine, "api"):
+            engine.api.token = new_token
+            # Update headers for next request
+            engine.api.headers["Authorization"] = f"Bearer {new_token}"
+            # Force session close to ensure new session gets new headers
+            if engine.api.session and not engine.api.session.closed:
+                await engine.api.session.close()
+                engine.api.session = None
+                
+        # 4. Update Greek Validator
+        if hasattr(engine, "greek_validator"):
+            engine.greek_validator.token = new_token
+
+        logger.success("✅ Token updated successfully across Engine, Feed, and API.")
+        return {
+            "status": "success", 
+            "message": "Token refreshed. System is using new credentials.",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.critical(f"❌ Token refresh failed: {e}")
+        raise HTTPException(500, f"Token refresh failed: {str(e)}")
+
+
 # ==================== EMERGENCY CONTROLS ====================
+
 @app.post("/api/emergency/flatten")
 async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
+    # EMERGENCY FLATTEN
     await engine._emergency_flatten()
     return {"status": "emergency_flatten_initiated"}
 
 # ==================== METRICS ====================
+
 @app.get("/api/metrics")
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
