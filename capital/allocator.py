@@ -15,11 +15,7 @@ class SmartCapitalAllocator:
         return self.account_size * self.bucket_config.get(bucket, 0.0)
 
     async def allocate_capital(self, bucket: str, amount: float, trade_id: str) -> bool:
-        # FIX: Negative/Zero Check
-        if amount <= 0:
-            logger.warning(f"🚫 Invalid allocation amount: {amount}")
-            return False
-            
+        if amount <= 0: return False
         if bucket not in self._locks: return False
         
         async with self._locks[bucket]:
@@ -27,11 +23,11 @@ class SmartCapitalAllocator:
             limit = self.get_bucket_limit(bucket)
 
             if used + amount > limit:
-                logger.warning(f"🚫 Capital Denied: {bucket} (Req: {amount:.0f}, Avail: {limit-used:.0f})")
+                logger.warning(f"🚫 Capital Denied: {bucket}")
                 return False
 
             self.capital_used[bucket][trade_id] = amount
-            logger.info(f"💰 Allocated {amount:.0f} to {trade_id} ({bucket})")
+            logger.info(f"💰 Allocated {amount:.0f} to {trade_id}")
             return True
 
     async def release_capital(self, bucket: str, trade_id: str):
@@ -39,9 +35,12 @@ class SmartCapitalAllocator:
         
         async with self._locks[bucket]:
             bucket_map = self.capital_used.get(bucket, {})
+            # FIX: Validation Check
             if trade_id in bucket_map:
                 freed = bucket_map.pop(trade_id)
                 logger.info(f"💸 Released {freed:.0f} from {trade_id}")
+            else:
+                logger.debug(f"⚠️ Release ignored: Trade {trade_id} not found in {bucket}")
 
     def get_status(self) -> Dict[str, Dict[str, float]]:
         status = {"available": {}, "used": {}, "limit": {}}
