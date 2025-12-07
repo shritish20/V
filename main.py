@@ -15,29 +15,29 @@ from utils.logger import setup_logger
 from api.routes import app
 
 logger = setup_logger("Main")
+
 engine_instance = None
 
 async def startup_sequence():
     """Initializes DB and Engine, then attaches Engine to API state"""
     global engine_instance
-    logger.info("🚀 VOLGUARD 19.0 - PRODUCTION LITE")
-    logger.info(f"📊 Account: ₹{settings.ACCOUNT_SIZE:,.0f} | Mode: {settings.SAFETY_MODE}")
     
-    # Initialize Database
+    logger.info("🛡️ STARTING VOLGUARD 19.0 (PRODUCTION)")
+    logger.info(f"💰 Account: {settings.ACCOUNT_SIZE:,.0f} | Mode: {settings.SAFETY_MODE}")
+
+    # 1. Initialize Database
     db_manager = HybridDatabaseManager()
     await db_manager.init_db()
-    
-    # Initialize Engine
+
+    # 2. Initialize Engine
     engine_instance = VolGuard17Engine()
     
-    # CRITICAL: Attach the running engine to FastAPI state
-    # This ensures the API controls the SAME engine that is trading
+    # 3. Attach to API State (Crucial for API control)
     app.state.engine = engine_instance
     
     return engine_instance
 
 async def shutdown_sequence(sig=None):
-    """Graceful shutdown handler"""
     if sig:
         logger.info(f"🛑 Signal received: {sig.name}")
     
@@ -45,21 +45,23 @@ async def shutdown_sequence(sig=None):
         logger.info("Shutting down Trading Engine...")
         await engine_instance.shutdown()
     
-    logger.info("System Shutdown Complete.")
+    logger.info("👋 System Shutdown Complete.")
 
 async def main():
-    # Handle Ctrl+C and Termination signals
     loop = asyncio.get_running_loop()
+    
+    # Signal Handlers
     for s in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(
             s, lambda sig=s: asyncio.create_task(shutdown_sequence(sig))
         )
 
     try:
-        # Start Engine
+        # Bootup
         active_engine = await startup_sequence()
-        
-        # Run Engine and API Server concurrently
+
+        # Run Engine and API concurrently
+        # Engine runs in background, API blocks until exit
         await asyncio.gather(
             active_engine.run(),
             uvicorn.Server(
@@ -69,7 +71,7 @@ async def main():
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        logger.critical(f"FATAL ERROR: {e}")
+        logger.critical(f"🔥 FATAL ERROR: {e}")
     finally:
         await shutdown_sequence()
 
@@ -77,4 +79,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass  # Handled by signal handler
+        pass
