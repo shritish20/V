@@ -17,9 +17,17 @@ DATA_DIR = Path("data")
 CACHE_FILE = DATA_DIR / "instruments_lite.csv"
 
 class InstrumentMaster:
+    """
+    FIXED: Implemented Stale Cache Recovery mechanism.
+    Addresses High Priority Issue #7: "Missing Instrument Master Corruption Recovery"
+    """
     def __init__(self):
         self.df: Optional[pd.DataFrame] = None
         self.last_updated: Optional[datetime] = None
+        
+        # Memory backup for stale data in case download fails
+        self._stale_cache: Optional[pd.DataFrame] = None
+        
         self._cache_index_fut: Dict[str, str] = {}
         self._cache_options: Dict[str, str] = {}
         
@@ -27,35 +35,54 @@ class InstrumentMaster:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     async def download_and_load(self):
+        """
+        Tries to load fresh data. Fallbacks to stale data if download fails.
+        """
+        # 1. Try loading local cache
         if self._load_from_cache():
-            logger.info("🚀 Instrument Master loaded from local cache")
+            logger.info("🚀 Instrument Master loaded from local cache (Fresh)")
             return
 
+        # 2. If we are here, cache is missing or stale. Attempt download.
         logger.info("🌐 Downloading Instrument Master from Upstox...")
         try:
             await self._download_and_process()
             logger.info(f"✅ Download complete. Saved to {CACHE_FILE}")
+            
         except Exception as e:
             logger.error(f"❌ Download failed: {e}")
-            if CACHE_FILE.exists():
-                logger.warning("⚠️ Using STALE local cache due to download failure.")
-                self.df = pd.read_csv(CACHE_FILE)
+            
+            # 3. CRITICAL FIX: Restore from in-memory stale cache if available
+            if self._stale_cache is not None:
+                logger.warning("⚠️ NETWORK ERROR: Restoring STALE cache as emergency backup.")
+                self.df = self._stale_cache
                 self._post_load_processing()
+                return
+
+            # 4. Last Resort: Try reading file again if logic skipped _stale_cache population
+            if CACHE_FILE.exists():
+                logger.warning("⚠️ Using STALE local file due to download failure.")
+                try:
+                    self.df = pd.read_csv(CACHE_FILE)
+                    self._post_load_processing()
+                except Exception as read_err:
+                    logger.critical(f"❌ Stale file read failed: {read_err}")
+                    raise RuntimeError("Critical: Cannot load instruments. Download failed and Cache corrupt.") from e
             else:
-                raise RuntimeError("Critical: Cannot load instruments. No cache and download failed.") from e
+                raise RuntimeError("Critical: No instruments available (No Cache + Download Failed).") from e
 
     def _load_from_cache(self) -> bool:
+        """
+        Checks cache validity. If stale, loads it into memory backup before returning False.
+        """
         if not CACHE_FILE.exists():
             return False
 
         try:
             mtime = datetime.fromtimestamp(CACHE_FILE.stat().st_mtime).date()
-            if mtime < date.today():
-                logger.info(f"Cache expired (Date: {mtime}). Refreshing...")
-                return False
-
             df = pd.read_csv(CACHE_FILE)
             
+            # Validation
             required_cols = {'instrument_key', 'name', 'strike', 'option_type', 'expiry', 'instrument_type'}
             if not required_cols.issubset(df.columns):
                 logger.error("❌ Cache corrupted: Missing columns")
@@ -67,32 +94,37 @@ class InstrumentMaster:
                 CACHE_FILE.unlink()
                 return False
 
-            # FIX: Deep Data Validation
             if df['strike'].min() < 100 or df['strike'].max() > 200000:
                 logger.error("❌ Cache corrupted: Strike prices out of bounds")
                 CACHE_FILE.unlink()
                 return False
 
-            # Check expiries are parsed
-            # (Done in post_load)
-
-            self.df = df
-            self._post_load_processing()
-            
-            # Check for future expiries
+            # Check for Future Expiries (validity check)
+            # We convert expiry just for this check
+            temp_expiry = pd.to_datetime(df['expiry'], errors='coerce').dt.date
             today = date.today()
-            valid = self.df[self.df['expiry'] >= today]
-            if len(valid) == 0:
-                logger.error("❌ Cache stale: No future expiries found")
-                CACHE_FILE.unlink()
+            if not temp_expiry[temp_expiry >= today].any():
+                logger.error("❌ Cache Useless: All instruments expired")
+                # Don't unlink, maybe history is useful, but don't use it for trading
                 return False
 
+            # CRITICAL FIX: Cache is valid structure-wise.
+            # If it is old, keep a copy in memory before forcing download.
+            if mtime < date.today():
+                logger.info(f"Cache exists but stale (Date: {mtime}). keeping memory backup.")
+                self._stale_cache = df.copy() # Save for emergency
+                return False # Return False to trigger download
+
+            # If fresh, use it
+            self.df = df
+            self._post_load_processing()
             return True
             
         except Exception as e:
             logger.warning(f"Cache load failed: {e}")
             if CACHE_FILE.exists():
-                CACHE_FILE.unlink()
+                try: CACHE_FILE.unlink()
+                except: pass
             return False
 
     async def _download_and_process(self):
@@ -125,8 +157,11 @@ class InstrumentMaster:
         if self.df is None or self.df.empty:
             raise ValueError("Loaded instrument data is empty!")
 
+        # Ensure expiry is date object, not string/timestamp
         if self.df['expiry'].dtype == 'object' or self.df['expiry'].dtype == 'string':
              self.df['expiry'] = pd.to_datetime(self.df['expiry']).dt.date
+        elif pd.api.types.is_datetime64_any_dtype(self.df['expiry']):
+             self.df['expiry'] = self.df['expiry'].dt.date
 
         self._cache_index_fut.clear()
         self._cache_options.clear()
