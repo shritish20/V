@@ -30,6 +30,10 @@ from utils.logger import setup_logger
 logger = setup_logger("Engine")
 
 class VolGuard17Engine:
+    """
+    FIXED: Offloaded SABR calibration to ProcessPoolExecutor to prevent event loop blocking.
+    Addresses High Priority Issue #5 from Code Review.
+    """
     def __init__(self):
         self.db = HybridDatabaseManager()
         self.api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
@@ -81,9 +85,11 @@ class VolGuard17Engine:
         self.last_error_time = 0
         self.last_metrics = None
         self.last_sabr_calibration = 0
+        
+        # Dedicated executor for CPU-heavy tasks (SABR Calibration)
         self.executor = ProcessPoolExecutor(max_workers=1)
         
-        # FIX: Lock for Thread/Task Safety during Greek aggregation
+        # Lock for Thread/Task Safety during Greek aggregation
         self._greek_update_lock = asyncio.Lock()
 
     async def initialize(self):
@@ -251,6 +257,9 @@ class VolGuard17Engine:
                     logger.error(f"Hydration Failed for {db_strat.id}: {e}")
 
     async def _run_sabr_calibration(self):
+        """
+        Runs SABR calibration in a separate process to avoid blocking the main event loop.
+        """
         spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
         if spot <= 0: return
 
@@ -287,7 +296,10 @@ class VolGuard17Engine:
                 strikes, market_vols, spot, time_to_expiry
             )
             
-            success = await loop.run_in_executor(None, func)
+            # CRITICAL FIX: Use self.executor (ProcessPool) instead of default ThreadPool
+            # This ensures heavy math doesn't block the AsyncIO loop
+            success = await loop.run_in_executor(self.executor, func)
+            
             if success:
                 self.last_sabr_calibration = time.time()
                 logger.info(f"🧮 SABR Calibrated (NIFTY {expiry})")
@@ -301,7 +313,7 @@ class VolGuard17Engine:
             self.sabr.calibrated = False
 
     async def _update_greeks_and_risk(self, spot: float):
-        # FIX: Async Lock to prevent race condition during Greek aggregation
+        # Async Lock to prevent race condition during Greek aggregation
         async with self._greek_update_lock:
             tasks = []
             for t in self.trades:
@@ -494,5 +506,6 @@ class VolGuard17Engine:
         await self._emergency_flatten()
         await self.save_final_snapshot()
         await self.api.close()
+        # FIX: Ensure executor is properly shutdown
         self.executor.shutdown(wait=False)
         logger.info("👋 Engine Shutdown Complete")
