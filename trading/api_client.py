@@ -1,10 +1,7 @@
 import aiohttp
 import asyncio
 import logging
-import calendar
-from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
-
 from core.config import settings, get_full_url
 from core.models import Order
 
@@ -26,12 +23,11 @@ class EnhancedUpstoxAPI:
         self.instrument_master = master
         
     def set_pricing_engine(self, pricing):
-        pass # Placeholder for interface compatibility
+        pass 
 
     async def _session(self) -> aiohttp.ClientSession:
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(headers=self.headers, timeout=timeout)
+            self.session = aiohttp.ClientSession(headers=self.headers, timeout=aiohttp.ClientTimeout(total=30))
         return self.session
 
     async def _request_with_retry(self, method: str, url: str, **kwargs) -> Dict:
@@ -44,11 +40,9 @@ class EnhancedUpstoxAPI:
                         text = await response.text()
                         logger.error(f"Client error {response.status} on {url}: {text}")
                         return {"status": "error", "message": text}
-                    
                     if response.status >= 500:
                         await asyncio.sleep(1)
                         continue
-                        
                     return await response.json()
             except Exception as e:
                 logger.error(f"Request exception on {url}: {e}")
@@ -58,23 +52,12 @@ class EnhancedUpstoxAPI:
     async def get_quotes(self, instrument_keys: List[str]) -> Dict:
         if not instrument_keys: return {}
         url = get_full_url("market_quote")
-        return await self._request_with_retry(
-            "GET", url, params={"instrument_key": ",".join(instrument_keys)}
-        )
+        return await self._request_with_retry("GET", url, params={"instrument_key": ",".join(instrument_keys)})
     
-    # --- NEW METHOD FOR SABR FIX ---
     async def get_option_chain(self, instrument_key: str, expiry_date: str) -> Dict:
-        """
-        Fetches option chain for SABR calibration.
-        """
-        # Note: Upstox /v2/option/chain endpoint
         url = f"{settings.API_BASE_V2}/option/chain"
-        params = {
-            "instrument_key": instrument_key,
-            "expiry_date": expiry_date
-        }
+        params = {"instrument_key": instrument_key, "expiry_date": expiry_date}
         return await self._request_with_retry("GET", url, params=params)
-    # -------------------------------
 
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
@@ -83,21 +66,18 @@ class EnhancedUpstoxAPI:
 
         url = get_full_url("place_order")
         
-        # Safety check
-        if "|" not in order.instrument_key:
-             return False, None
-
+        # FIX: Schema Compliance & Enum Conversion
         payload = {
             "instrument_token": order.instrument_key,
             "transaction_type": order.transaction_type,
             "quantity": abs(order.quantity),
-            "order_type": order.order_type, # Fixed: was order.order_type.value
-            "price": round(order.price, 2),
+            "order_type": order.order_type, # Expecting string e.g. "MARKET"
+            "price": float(order.price),
             "product": order.product,
-            "validity": "DAY",
+            "validity": order.validity,
             "disclosed_quantity": 0,
-            "trigger_price": 0.0,
-            "is_amo": False,
+            "trigger_price": float(order.trigger_price),
+            "is_amo": order.is_amo,
             "tag": "VG19"
         }
         
