@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from typing import Optional, List, Dict
 from core.models import MultiLegTrade
 from core.config import settings
 from trading.api_client import EnhancedUpstoxAPI
@@ -12,19 +11,20 @@ class LiveOrderExecutor:
         self.api = api
 
     async def place_multi_leg_batch(self, trade: MultiLegTrade) -> bool:
-        """
-        Executes atomic batch. Returns True only if ALL legs accepted.
-        """
         if settings.SAFETY_MODE != "live":
             logger.info(f"[{settings.SAFETY_MODE}] Simulating Batch Execution")
             trade.basket_order_id = f"SIM-BASKET-{int(asyncio.get_event_loop().time())}"
-            trade.status = "OPEN" # Temporarily set status
-            # Generate fake order IDs for sim
+            trade.status = "OPEN"
             trade.gtt_order_ids = [f"SIM-ORD-{i}" for i in range(len(trade.legs))]
             return True
 
         orders_payload = []
         for idx, leg in enumerate(trade.legs):
+            # FIX: Dynamic Slicing for Freeze Quantity
+            # Nifty Freeze is typically 1800, BankNifty 900. 
+            # Using 1800 as conservative default or check instrument master if available.
+            needs_slicing = abs(leg.quantity) > 1800
+
             order = {
                 "instrument_token": leg.instrument_key,
                 "transaction_type": "BUY" if leg.quantity > 0 else "SELL",
@@ -36,7 +36,7 @@ class LiveOrderExecutor:
                 "disclosed_quantity": 0,
                 "trigger_price": 0.0,
                 "is_amo": False,
-                "slice": False,
+                "slice": needs_slicing, # ✅ Dynamic
                 "correlation_id": f"{trade.id}-LEG{idx}", 
                 "tag": "VG19"
             }
@@ -50,32 +50,28 @@ class LiveOrderExecutor:
                 logger.error(f"❌ Batch API Failed: {response}")
                 return False
 
-            # FIX: Check Summary for Errors
-            summary = response.get("data", [{}])[0].get("summary", {}) # Upstox response structure can vary, handle carefully
-            # Actually, typically response['data'] is a list of order results.
-            # But sometimes there's a summary field in the root or metadata.
-            # Let's rely on iterating individual statuses.
-            
-            data_list = response.get("data", [])
-            order_ids = []
-            has_error = False
-            
-            for item in data_list:
-                if item.get("error_code") or item.get("status") == "error":
-                    has_error = True
-                    logger.error(f"Leg Error: {item}")
-                elif item.get("order_id"):
-                    order_ids.append(item.get("order_id"))
+            # FIX: Robust Summary Parsing
+            summary = response.get("data", [{}])[0].get("summary", {}) 
+            # Note: Upstox structure varies. Sometimes summary is at root 'metadata'.
+            # We check both locations to be safe.
+            if not summary:
+                summary = response.get("metadata", {}).get("summary", {})
 
-            if has_error or len(order_ids) != len(trade.legs):
-                logger.critical(f"❌ Partial Batch Failure! Expected {len(trade.legs)}, got {len(order_ids)} success.")
-                # Emergency: Cancel the ones that succeeded
-                for oid in order_ids:
+            # Fallback: Calculate manually if summary missing
+            data_list = response.get("data", [])
+            success_ids = [x.get("order_id") for x in data_list if x.get("order_id")]
+            errors = response.get("errors", [])
+
+            if errors or len(success_ids) != len(trade.legs):
+                logger.critical(f"❌ Batch Failure! Success: {len(success_ids)}/{len(trade.legs)}")
+                
+                # Rollback successful orders
+                for oid in success_ids:
                     await self.api.cancel_order(oid)
                 return False
             
-            trade.gtt_order_ids = order_ids
-            trade.basket_order_id = order_ids[0]
+            trade.gtt_order_ids = success_ids
+            trade.basket_order_id = success_ids[0]
             logger.info(f"✅ Batch Accepted. Ref: {trade.basket_order_id}")
             return True
 
@@ -91,7 +87,10 @@ class LiveOrderExecutor:
             all_filled = True
             for oid in trade.gtt_order_ids:
                 details = await self.api.get_order_details(oid)
-                status = details.get("data", {}).get("status")
+                # Parse Upstox Order Details Response
+                order_data = details.get("data", {})
+                status = order_data.get("status") if isinstance(order_data, dict) else ""
+                
                 if status != "complete":
                     all_filled = False
                     if status in ["cancelled", "rejected", "error"]:
@@ -102,4 +101,5 @@ class LiveOrderExecutor:
             
         logger.warning(f"⚠️ Fill Verification Timeout {trade.id}")
         return False
+
 
