@@ -17,9 +17,6 @@ DATA_DIR = Path("data")
 CACHE_FILE = DATA_DIR / "instruments_lite.csv"
 
 class InstrumentMaster:
-    """
-    Robust Instrument Master with Cache Integrity Checks.
-    """
     def __init__(self):
         self.df: Optional[pd.DataFrame] = None
         self.last_updated: Optional[datetime] = None
@@ -57,30 +54,45 @@ class InstrumentMaster:
                 logger.info(f"Cache expired (Date: {mtime}). Refreshing...")
                 return False
 
-            # Load and Validate
             df = pd.read_csv(CACHE_FILE)
             
-            # INTEGRITY CHECK 1: Required Columns
             required_cols = {'instrument_key', 'name', 'strike', 'option_type', 'expiry', 'instrument_type'}
             if not required_cols.issubset(df.columns):
                 logger.error("❌ Cache corrupted: Missing columns")
                 CACHE_FILE.unlink()
                 return False
                 
-            # INTEGRITY CHECK 2: Empty Data
             if len(df) < 100:
                 logger.error("❌ Cache corrupted: File too small")
                 CACHE_FILE.unlink()
                 return False
 
+            # FIX: Deep Data Validation
+            if df['strike'].min() < 100 or df['strike'].max() > 200000:
+                logger.error("❌ Cache corrupted: Strike prices out of bounds")
+                CACHE_FILE.unlink()
+                return False
+
+            # Check expiries are parsed
+            # (Done in post_load)
+
             self.df = df
             self._post_load_processing()
+            
+            # Check for future expiries
+            today = date.today()
+            valid = self.df[self.df['expiry'] >= today]
+            if len(valid) == 0:
+                logger.error("❌ Cache stale: No future expiries found")
+                CACHE_FILE.unlink()
+                return False
+
             return True
             
         except Exception as e:
             logger.warning(f"Cache load failed: {e}")
             if CACHE_FILE.exists():
-                CACHE_FILE.unlink() # Nuke corrupt file
+                CACHE_FILE.unlink()
             return False
 
     async def _download_and_process(self):
@@ -95,7 +107,6 @@ class InstrumentMaster:
 
         full_df = pd.DataFrame(json_data)
 
-        # Optimize: Filter strictly for NSE_FO & Indices
         filtered_df = full_df[
             (full_df['segment'] == 'NSE_FO') & 
             (full_df['name'].isin(['NIFTY', 'BANKNIFTY', 'FINNIFTY']))
