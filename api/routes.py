@@ -29,7 +29,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this
+    allow_origins=["*"], # In production, restrict this to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -90,8 +90,7 @@ class StrategyRecommendationRequest(BaseModel):
 
 def get_engine(request: Request) -> VolGuard17Engine:
     """
-    CRITICAL FIX: Retrieves the single engine instance initialized in main.py.
-    Prevents creating a second zombie engine.
+    Retrieves the single engine instance initialized in main.py.
     """
     engine = getattr(request.app.state, "engine", None)
     if not engine:
@@ -160,7 +159,6 @@ async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
         data = engine.get_dashboard_data()
         
         if not data:
-            # If dashboard isn't ready, return basic status instead of 404
             return {"status": "initializing", "timestamp": datetime.now().isoformat()}
 
         status_info = engine.get_status()
@@ -195,8 +193,6 @@ async def start_engine(
     if engine.running:
         raise HTTPException(400, "Engine already running")
     
-    # In V19, the engine loop is usually started by main.py
-    # But if it was stopped via API, we can restart it here
     background_tasks.add_task(engine.run)
     return {"status": "starting", "timestamp": datetime.now().isoformat()}
 
@@ -208,7 +204,7 @@ async def stop_engine(engine: VolGuard17Engine = Depends(get_engine)):
     await engine.shutdown()
     return {"status": "stopping", "timestamp": datetime.now().isoformat()}
 
-# ==================== TOKEN MANAGEMENT (NEW) ====================
+# ==================== MANAGEMENT ENDPOINTS ====================
 
 @app.post("/api/token/refresh")
 async def refresh_token(
@@ -216,14 +212,13 @@ async def refresh_token(
     engine: VolGuard17Engine = Depends(get_engine)
 ):
     """
-    CRITICAL: Updates the Upstox Access Token across all modules at runtime.
-    Call this endpoint every morning or when token expires.
+    Updates the Upstox Access Token across all modules at runtime.
     """
     new_token = request.access_token
     logger.info("🔐 Received Token Refresh Request")
 
     try:
-        # 1. Update Global Settings (Best effort for components reading directly)
+        # 1. Update Global Settings
         settings.UPSTOX_ACCESS_TOKEN = new_token
 
         # 2. Update Live Data Feed (Triggers reconnect)
@@ -233,9 +228,7 @@ async def refresh_token(
         # 3. Update Execution API
         if hasattr(engine, "api"):
             engine.api.token = new_token
-            # Update headers for next request
             engine.api.headers["Authorization"] = f"Bearer {new_token}"
-            # Force session close to ensure new session gets new headers
             if engine.api.session and not engine.api.session.closed:
                 await engine.api.session.close()
                 engine.api.session = None
@@ -244,7 +237,7 @@ async def refresh_token(
         if hasattr(engine, "greek_validator"):
             engine.greek_validator.token = new_token
 
-        logger.success("✅ Token updated successfully across Engine, Feed, and API.")
+        logger.info("✅ Token updated successfully.")
         return {
             "status": "success", 
             "message": "Token refreshed. System is using new credentials.",
@@ -255,12 +248,42 @@ async def refresh_token(
         logger.critical(f"❌ Token refresh failed: {e}")
         raise HTTPException(500, f"Token refresh failed: {str(e)}")
 
+@app.post("/api/capital/adjust")
+async def adjust_capital(
+    request: CapitalAdjustmentRequest,
+    engine: VolGuard17Engine = Depends(get_engine)
+):
+    """
+    Dynamically rebalance capital allocation percentages.
+    """
+    try:
+        new_allocation = {
+            "weekly_expiries": request.weekly_pct,
+            "monthly_expiries": request.monthly_pct,
+            "intraday_adjustments": request.intraday_pct
+        }
+        
+        # Update Allocator
+        engine.capital_allocator.bucket_config = new_allocation
+        
+        # Update Global Settings
+        settings.CAPITAL_ALLOCATION = new_allocation
+        
+        logger.info(f"💰 Capital Allocation Updated: {new_allocation}")
+        return {
+            "status": "success",
+            "message": "Capital allocation updated",
+            "new_allocation": new_allocation,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Capital adjustment failed: {e}")
+        raise HTTPException(500, str(e))
 
 # ==================== EMERGENCY CONTROLS ====================
 
 @app.post("/api/emergency/flatten")
 async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
-    # EMERGENCY FLATTEN
     await engine._emergency_flatten()
     return {"status": "emergency_flatten_initiated"}
 
