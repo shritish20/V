@@ -16,6 +16,7 @@ UPSTOX_API_ENDPOINTS = {
     "margin": "/v2/charges/margin",
     "ws_auth": "/v2/feed/market-data-feed/authorize",
     "option_greek": "/v3/market-quote/option-greek",
+    "holidays": "/v2/market/holidays",
 }
 
 class Settings(BaseSettings):
@@ -58,6 +59,13 @@ class Settings(BaseSettings):
     ACCOUNT_SIZE: float = Field(default=2_000_000.0, env="ACCOUNT_SIZE")
     LOT_SIZE: int = Field(default=75, env="LOT_SIZE")
     
+    # CRITICAL FIX: Added MAX_LOTS Configuration
+    MAX_LOTS: int = Field(default=10, env="MAX_LOTS", description="Maximum lots per trade")
+    
+    # CRITICAL FIX: Added Exchange Freeze Quantity Limits
+    NIFTY_FREEZE_QTY: int = Field(default=1800, env="NIFTY_FREEZE_QTY")
+    BANKNIFTY_FREEZE_QTY: int = Field(default=900, env="BANKNIFTY_FREEZE_QTY")
+    
     CAPITAL_ALLOCATION: Dict[str, float] = {
         "weekly_expiries": 0.40,
         "monthly_expiries": 0.50,
@@ -90,14 +98,14 @@ class Settings(BaseSettings):
     DTE_THRESHOLD_WEEKLY: int = 2
     VIX_MIN_THRESHOLD: float = 13.0
 
-    # Transaction Costs (ADDED)
+    # Transaction Costs
     BROKERAGE_PER_ORDER: float = Field(default=20.0, env="BROKERAGE_PER_ORDER")
     GST_RATE: float = Field(default=0.18, env="GST_RATE")
 
-    # Pricing Parameters (ADDED)
+    # Pricing Parameters
     RISK_FREE_RATE: float = Field(default=0.065, env="RISK_FREE_RATE")
 
-    # SABR Calibration Bounds (ADDED)
+    # SABR Calibration Bounds
     SABR_BOUNDS: Dict[str, Tuple[float, float]] = {
         'alpha': (0.01, 2.0),
         'beta': (0.1, 1.0),
