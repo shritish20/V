@@ -1,6 +1,8 @@
 import aiohttp
 import asyncio
 import logging
+import calendar
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from core.config import settings, get_full_url
 from core.models import Order
@@ -31,14 +33,11 @@ class EnhancedUpstoxAPI:
                 session = await self._session()
                 async with session.request(method, url, **kwargs) as response:
                     if 400 <= response.status < 500:
-                        logger.error(
-                            f"Client error {response.status} on {url}: {await response.text()}"
-                        )
-                        return {}
+                        text = await response.text()
+                        logger.error(f"Client error {response.status} on {url}: {text}")
+                        return {"status": "error", "message": text}
                     if response.status >= 500:
-                        logger.warning(
-                            f"Server error {response.status} on {url}, retry {i+1}/{retries}"
-                        )
+                        logger.warning(f"Server error {response.status} on {url}, retry {i+1}/{retries}")
                         await asyncio.sleep(1)
                         continue
                     return await response.json()
@@ -65,6 +64,7 @@ class EnhancedUpstoxAPI:
             return True, f"SIM-{int(asyncio.get_event_loop().time())}"
 
         url = get_full_url("place_order")
+        # V2 API requires 'instrument_token'
         payload = {
             "instrument_token": order.instrument_key,
             "transaction_type": order.transaction_type,
@@ -81,6 +81,7 @@ class EnhancedUpstoxAPI:
         res = await self._request_with_retry("POST", url, json=payload)
         if res.get("status") == "success":
             return True, res["data"]["order_id"]
+        
         logger.error(f"Order Failed: {res}")
         return False, None
 
@@ -125,17 +126,47 @@ class EnhancedUpstoxAPI:
             logger.error(f"Failed to fetch Upstox Greeks: {e}")
         return {}
 
-    async def get_current_future_symbol(self, index_key: str) -> str:
-        # NOTE: Implement proper resolution via instruments dump in future
-        return "NSE_FO|NIFTY24DECFUT"
+    # --- DYNAMIC FUTURES SYMBOL GENERATION (Fixed logic) ---
+    async def get_current_future_symbol(self, index_key: str = "NSE_INDEX|Nifty 50") -> str:
+        """
+        Dynamically calculates the NIFTY Futures symbol for the current expiry.
+        Format expected: NSE_FO|NIFTY{YY}{MMM}FUT (e.g., NSE_FO|NIFTY24DECFUT)
+        """
+        now = datetime.now()
+        year = now.year
+        month = now.month
+
+        # Calculate Last Thursday of current month
+        last_thursday = self._get_last_thursday(year, month)
+
+        # If we are past the expiry, move to next month
+        if now.date() > last_thursday:
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        
+        # Format: YY + MMM (uppercase)
+        yy = str(year)[-2:]
+        mmm = calendar.month_abbr[month].upper()
+        
+        symbol = f"NSE_FO|NIFTY{yy}{mmm}FUT"
+        logger.debug(f"Resolved Futures Symbol: {symbol}")
+        return symbol
+
+    def _get_last_thursday(self, year, month):
+        cal = calendar.monthcalendar(year, month)
+        # The 4th column (index 3) is Thursday
+        last_thursday_day = max(week[3] for week in cal if week[3] != 0)
+        return datetime(year, month, last_thursday_day).date()
 
     async def resolve_instrument_key(self, strike: float, type: str, expiry: str) -> str:
-        # Placeholder: In production this should query a local instrument master DB
-        # Format: NSE_FO|NIFTY23DEC21000CE
-        from datetime import datetime
-        formatted_date = datetime.strptime(expiry, "%Y-%m-%d").strftime("%y%b").upper()
-        return f"NSE_FO|NIFTY{formatted_date}{int(strike)}{type}"
+        dt = datetime.strptime(expiry, "%Y-%m-%d")
+        yy = str(dt.year)[-2:]
+        mmm = dt.strftime("%b").upper()
+        return f"NSE_FO|NIFTY{yy}{mmm}{int(strike)}{type}"
 
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
+
