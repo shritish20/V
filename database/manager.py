@@ -15,22 +15,33 @@ class HybridDatabaseManager:
 
     async def init_db(self):
         if self.engine is None:
+            # FIX: Tuned Pool Settings for High Frequency
             self.engine = create_async_engine(
                 settings.DATABASE_URL,
                 echo=False,
                 pool_pre_ping=True,
-                pool_size=5,
-                max_overflow=10,
+                pool_size=20,       # Increased from 5
+                max_overflow=40,    # Increased from 10
+                pool_recycle=3600   # Recycle every hour
             )
+            
             self.async_session = async_sessionmaker(
-                bind=self.engine, expire_on_commit=False, class_=AsyncSession
+                bind=self.engine, 
+                expire_on_commit=False, 
+                class_=AsyncSession
             )
-            logger.info("✅ Database engine initialized.")
+            
+            # Create tables if they don't exist
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                
+            logger.info("✓ Database engine initialized (High Perf Pool).")
 
     @asynccontextmanager
     async def get_session(self):
         if self.async_session is None:
             await self.init_db()
+        
         session: AsyncSession = self.async_session()
         try:
             yield session
