@@ -1,3 +1,4 @@
+
 import logging
 import sys
 import re
@@ -52,3 +53,7 @@ def setup_logger(name: str = "VolGuard18") -> logging.Logger:
     logger.addHandler(file_handler)
     
     return logger
+
+# FIX: Added alias for compatibility with margin_guard.py
+def get_logger(name: str = "VolGuard18") -> logging.Logger:
+    return setup_logger(name)
