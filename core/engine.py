@@ -32,7 +32,7 @@ logger = setup_logger("Engine")
 class VolGuard17Engine:
     """
     FIXED: Offloaded SABR calibration to ProcessPoolExecutor to prevent event loop blocking.
-    Addresses High Priority Issue #5 from Code Review.
+    FIXED: Injected InstrumentMaster into StrategyEngine for real expiry lookups.
     """
     def __init__(self):
         self.db = HybridDatabaseManager()
@@ -71,6 +71,9 @@ class VolGuard17Engine:
             self.capital_allocator,
             self.pricing 
         )
+        
+        # CRITICAL FIX: Inject InstrumentMaster into Strategy Engine
+        self.strategy_engine.set_instruments_master(self.instruments_master)
 
         self.trade_mgr = EnhancedTradeManager(
             self.api, self.db, self.om, self.pricing, self.risk_mgr, None, self.capital_allocator
@@ -297,7 +300,6 @@ class VolGuard17Engine:
             )
             
             # CRITICAL FIX: Use self.executor (ProcessPool) instead of default ThreadPool
-            # This ensures heavy math doesn't block the AsyncIO loop
             success = await loop.run_in_executor(self.executor, func)
             
             if success:
@@ -313,7 +315,6 @@ class VolGuard17Engine:
             self.sabr.calibrated = False
 
     async def _update_greeks_and_risk(self, spot: float):
-        # Async Lock to prevent race condition during Greek aggregation
         async with self._greek_update_lock:
             tasks = []
             for t in self.trades:
@@ -506,6 +507,5 @@ class VolGuard17Engine:
         await self._emergency_flatten()
         await self.save_final_snapshot()
         await self.api.close()
-        # FIX: Ensure executor is properly shutdown
         self.executor.shutdown(wait=False)
         logger.info("👋 Engine Shutdown Complete")
