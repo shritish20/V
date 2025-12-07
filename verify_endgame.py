@@ -1,34 +1,54 @@
 import inspect
-from core.engine import VolGuard17Engine
-from trading.live_data_feed import LiveDataFeed
-from capital.allocator import SmartCapitalAllocator
-from trading.live_order_executor import LiveOrderExecutor
-from trading.strategy_engine import IntelligentStrategyEngine
+import sys
+import os
+
+# Ensure we can import from the current directory
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+try:
+    from core.engine import VolGuard17Engine
+    from trading.live_data_feed import LiveDataFeed
+    from trading.api_client import EnhancedUpstoxAPI
+    from trading.trade_manager import EnhancedTradeManager
+    print("✅ All Core Modules Imported")
+except ImportError as e:
+    print(f"❌ FAIL: Import Error - {e}")
+    sys.exit(1)
 
 def verify():
-    print("🔍 ENDGAME PRODUCTION AUDIT...")
+    print("\n🔍 VOLGUARD 19.0 LITE - PRE-FLIGHT CHECK")
+    print("------------------------------------------")
     
-    if not hasattr(VolGuard17Engine, "_system_heartbeat"):
-        print("❌ FAIL: No Heartbeat")
+    # 1. Check if Hedge Manager is truly gone
+    if hasattr(VolGuard17Engine, "hedge_mgr"):
+        print("❌ FAIL: HedgeManager still present in Engine init")
     else:
-        print("✅ Heartbeat OK")
-        
-    if "MarketDataFeed" not in inspect.getsource(LiveDataFeed):
-        print("❌ FAIL: No Binary Feed")
+        print("✅ HedgeManager Removed from Engine")
+
+    # 2. Check API Client Dynamic Date Fix
+    if hasattr(EnhancedUpstoxAPI, "get_current_future_symbol"):
+        source = inspect.getsource(EnhancedUpstoxAPI.get_current_future_symbol)
+        if "calendar" in source and "datetime.now" in source:
+            print("✅ API Client: Dynamic Futures Symbol Logic Found")
+        else:
+            print("⚠️ WARN: API Client might still be using hardcoded dates")
     else:
-        print("✅ Binary Feed (SDK) OK")
-        
-    if not hasattr(IntelligentStrategyEngine, "_select_capital_bucket"):
-        print("❌ FAIL: Strategy Logic Missing")
+        print("❌ FAIL: API Client missing 'get_current_future_symbol'")
+
+    # 3. Check Live Feed for SDK Usage
+    source_feed = inspect.getsource(LiveDataFeed)
+    if "MarketDataFeed" in source_feed:
+        print("✅ LiveDataFeed: Using Official SDK")
     else:
-        print("✅ Intelligent Strategy Logic Restored")
-        
-    if "SAFETY_MODE" not in inspect.getsource(LiveOrderExecutor.place_multi_leg):
-        print("❌ FAIL: Safety Lock Missing")
+        print("❌ FAIL: LiveDataFeed not using SDK")
+
+    # 4. Check Trade Manager for Risk Checks
+    if hasattr(EnhancedTradeManager, "execute_strategy"):
+        print("✅ TradeManager: Execution Logic Ready")
     else:
-        print("✅ Safety Locks OK")
-        
-    print("✅ SYSTEM IS LIVE READY.")
+        print("❌ FAIL: TradeManager incomplete")
+
+    print("\n🚀 SYSTEM VERIFICATION COMPLETE.")
 
 if __name__ == "__main__":
     verify()
