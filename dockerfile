@@ -3,7 +3,7 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system build dependencies (required for some python packages)
+# Install system build dependencies
 RUN apt-get update && apt-get install -y \
     gcc \
     g++ \
