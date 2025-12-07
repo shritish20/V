@@ -2,7 +2,8 @@ from core.models import MultiLegTrade, Order, OrderStatus
 from core.enums import TradeStatus, ExitReason
 from core.config import settings
 from utils.logger import setup_logger
-from trading.live_order_executor import LiveOrderExecutor # Correct Import
+from trading.live_order_executor import LiveOrderExecutor
+from trading.margin_guard import MarginGuard
 
 logger = setup_logger("TradeMgr")
 
@@ -15,28 +16,34 @@ class EnhancedTradeManager:
         self.risk = risk
         self.capital = capital
         self.feed = None
-        
-        # INJECT THE NEW EXECUTOR
         self.executor = LiveOrderExecutor(self.api)
+        # FIX: Initialize Margin Guard
+        self.margin_guard = MarginGuard()
 
     async def execute_strategy(self, trade: MultiLegTrade) -> bool:
         """
-        Entry Point: Uses Atomic Batch Execution
+        Entry Point: Atomic Batch Execution with Margin Check
         """
-        # 1. Pre-Trade Risk Check
+        # 1. Pre-Trade Risk Check (Greeks/Exposure)
         if not self.risk.check_pre_trade(trade):
             return False
 
-        # 2. Allocate Capital
+        # 2. FIX: Margin Check (Buying Power)
+        is_sufficient, margin_req = await self.margin_guard.is_margin_ok(trade)
+        if not is_sufficient:
+            logger.warning(f"🚫 Margin Block: Required {margin_req:.0f} > Available")
+            return False
+
+        # 3. Allocate Capital (Internal Buckets)
         val = sum(abs(l.entry_price * l.quantity) for l in trade.legs)
         if not await self.capital.allocate_capital(trade.capital_bucket.value, val, trade.id):
             return False
 
-        # 3. ATOMIC EXECUTION (The Counter)
+        # 4. Atomic Execution
         success = await self.executor.place_multi_leg_batch(trade)
         
         if success:
-            # 4. Verify Fills
+            # 5. Verify Fills
             filled = await self.executor.verify_fills(trade)
             if filled:
                 trade.status = TradeStatus.OPEN
@@ -44,25 +51,19 @@ class EnhancedTradeManager:
                 return True
             else:
                 logger.critical(f"❌ Trade {trade.id} Partial Fill / Timeout! Manual Intervention Needed.")
-                # Optional: Trigger auto-flatten for this specific trade ID here
                 return False
         else:
-            # Release capital if rejected
             await self.capital.release_capital(trade.capital_bucket.value, trade.id)
             return False
 
     async def close_trade(self, trade: MultiLegTrade, reason: ExitReason):
         logger.info(f"Closing Trade {trade.id} Reason: {reason}")
         
-        # Create a reverse trade object for closing
         close_trade_obj = trade.copy()
         for leg in close_trade_obj.legs:
-            # Flip side for exit
             leg.quantity = leg.quantity * -1 
-            # Market order for exit
             leg.entry_price = 0.0 
             
-        # Execute closing batch
         await self.executor.place_multi_leg_batch(close_trade_obj)
         
         trade.status = TradeStatus.CLOSED
@@ -70,7 +71,6 @@ class EnhancedTradeManager:
         await self.capital.release_capital(trade.capital_bucket.value, trade.id)
 
     async def update_trade_prices(self, trade: MultiLegTrade, spot: float, quotes: dict):
-        # ... (Same as before) ...
         updated = False
         for leg in trade.legs:
             if leg.instrument_key in quotes:
@@ -80,6 +80,29 @@ class EnhancedTradeManager:
             trade.calculate_trade_greeks()
 
     async def monitor_active_trades(self, trades):
-        # ... (Same as before) ...
-        pass
+        """
+        FIX: Real-time Profit/Loss Monitoring logic.
+        """
+        for trade in trades:
+            if trade.status != TradeStatus.OPEN:
+                continue
 
+            # Calculate PnL % based on Premium Captured
+            # For selling strategies: Max Profit = Net Premium
+            pnl = trade.total_unrealized_pnl()
+            max_profit = trade.net_premium_per_share * trade.lots * settings.LOT_SIZE 
+            
+            # Avoid division by zero
+            if max_profit <= 0: max_profit = 1.0 
+            
+            pnl_pct = (pnl / max_profit) * 100
+
+            # Take Profit (Default 50% of max profit)
+            if pnl_pct >= (settings.TAKE_PROFIT_PCT * 100):
+                logger.info(f"💰 Target Hit ({pnl_pct:.1f}%). Closing {trade.id}")
+                await self.close_trade(trade, ExitReason.PROFIT_TARGET)
+            
+            # Stop Loss (Default -200% of max profit)
+            elif pnl_pct <= -(settings.STOP_LOSS_PCT * 100):
+                logger.warning(f"🛑 Stop Loss Hit ({pnl_pct:.1f}%). Closing {trade.id}")
+                await self.close_trade(trade, ExitReason.STOP_LOSS)
