@@ -29,6 +29,7 @@ class EnhancedTradeManager:
             return False
 
         # 2. FIX: Margin Check (Buying Power)
+        # Actually ask Upstox if we have money before allocating internal buckets
         is_sufficient, margin_req = await self.margin_guard.is_margin_ok(trade)
         if not is_sufficient:
             logger.warning(f"🚫 Margin Block: Required {margin_req:.0f} > Available")
@@ -59,11 +60,15 @@ class EnhancedTradeManager:
     async def close_trade(self, trade: MultiLegTrade, reason: ExitReason):
         logger.info(f"Closing Trade {trade.id} Reason: {reason}")
         
+        # Create a reverse trade object for closing
         close_trade_obj = trade.copy()
         for leg in close_trade_obj.legs:
+            # Flip quantity for exit
             leg.quantity = leg.quantity * -1 
+            # Market order for immediate exit
             leg.entry_price = 0.0 
             
+        # Execute closing batch
         await self.executor.place_multi_leg_batch(close_trade_obj)
         
         trade.status = TradeStatus.CLOSED
@@ -82,18 +87,18 @@ class EnhancedTradeManager:
     async def monitor_active_trades(self, trades):
         """
         FIX: Real-time Profit/Loss Monitoring logic.
+        Checks every open trade against Take Profit and Stop Loss limits.
         """
         for trade in trades:
             if trade.status != TradeStatus.OPEN:
                 continue
 
             # Calculate PnL % based on Premium Captured
-            # For selling strategies: Max Profit = Net Premium
             pnl = trade.total_unrealized_pnl()
-            max_profit = trade.net_premium_per_share * trade.lots * settings.LOT_SIZE 
             
-            # Avoid division by zero
-            if max_profit <= 0: max_profit = 1.0 
+            # Estimate max profit (Net Premium for credit strategies)
+            max_profit = trade.net_premium_per_share * trade.lots * settings.LOT_SIZE 
+            if max_profit <= 0: max_profit = 1.0 # Avoid div/0
             
             pnl_pct = (pnl / max_profit) * 100
 
@@ -106,3 +111,4 @@ class EnhancedTradeManager:
             elif pnl_pct <= -(settings.STOP_LOSS_PCT * 100):
                 logger.warning(f"🛑 Stop Loss Hit ({pnl_pct:.1f}%). Closing {trade.id}")
                 await self.close_trade(trade, ExitReason.STOP_LOSS)
+ 
