@@ -3,39 +3,72 @@ version: '3.8'
 services:
   volguard:
     build: .
+    container_name: volguard_engine
     ports:
       - "8000:8000"
-    environment:
-      - ENV=production
-      - UPSTOX_ACCESS_TOKEN=${UPSTOX_ACCESS_TOKEN}
-      - PAPER_TRADING=${PAPER_TRADING:-True}
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
+      - ./dashboard_data:/app/dashboard_data
+      - ./logs:/app/logs
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vg_net
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: vg_postgres
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-volguard_user}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-secure_trading_password}
+      - POSTGRES_DB=${POSTGRES_DB:-volguard_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-volguard_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - vg_net
 
   prometheus:
     image: prom/prometheus:latest
+    container_name: vg_prometheus
     ports:
       - "9090:9090"
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--web.enable-lifecycle'
+      - prometheus_data:/prometheus
     restart: unless-stopped
+    networks:
+      - vg_net
 
   grafana:
     image: grafana/grafana:latest
+    container_name: vg_grafana
     ports:
       - "3000:3000"
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning
-      - ./grafana/dashboards:/var/lib/grafana/dashboards
-    restart: unless-stopped
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - vg_net
+
+networks:
+  vg_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
