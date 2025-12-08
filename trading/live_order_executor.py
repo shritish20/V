@@ -22,10 +22,13 @@ class LiveOrderExecutor:
             trade.gtt_order_ids = [f"SIM-{i}" for i in range(len(trade.legs))]
             return True
 
-        # Freeze Limit Check
+        # STRICT NIFTY 50 FREEZE CHECK
         for leg in trade.legs:
-            if abs(leg.quantity) > settings.NIFTY_FREEZE_QTY:
-                logger.error(f"🚫 FREEZE LIMIT: {leg.instrument_key} Qty {abs(leg.quantity)}")
+            # Enforce NIFTY 50 limits only (1800 qty)
+            limit = settings.NIFTY_FREEZE_QTY
+                
+            if abs(leg.quantity) > limit:
+                logger.error(f"🚫 FREEZE LIMIT: {leg.symbol} Qty {abs(leg.quantity)} > {limit}")
                 return False
 
         if use_gtt:
@@ -123,7 +126,6 @@ class LiveOrderExecutor:
     async def place_gtt_order(self, leg: Position, trigger_price: float, trigger_type: str = "ABOVE") -> Optional[str]:
         """
         FIXED: Matches GttPlaceOrderRequest Schema.
-        Removes invalid fields (order_type, price, validity) that cause 400 errors.
         """
         payload = {
             "type": "SINGLE",
@@ -155,7 +157,6 @@ class LiveOrderExecutor:
     async def monitor_gtt_oco(self, trade: MultiLegTrade):
         """
         The 'Janitor': Monitors GTT legs. If one fires, cancels the other(s).
-        Crucial for preventing double exposure.
         """
         logger.info(f"👀 GTT Janitor started for {trade.id}")
         active_ids = set(trade.gtt_order_ids)
