@@ -285,12 +285,31 @@ class VolGuard17Engine:
     async def _adopt_zombie_trade(self, token, qty):
         current_price = 1.0
         greeks = GreeksSnapshot(timestamp=datetime.now(settings.IST))
+        
+        # Parsed details default
+        symbol_code = "UNKNOWN"
+        strike_price = 0.0
+        opt_type = "CE"
+
         try:
             quotes = await self.api.get_quotes([token])
             if quotes.get("status") == "success":
                 data = quotes["data"].get(token, {})
                 current_price = data.get("last_price", 1.0)
-            
+                
+                # CRITICAL FIX: Parse Trading Symbol for details (e.g. "NIFTY 22000 CE")
+                trading_symbol = data.get("symbol", "") or data.get("trading_symbol", "")
+                if trading_symbol:
+                    parts = trading_symbol.split()
+                    for p in parts:
+                        if p.isdigit() and float(p) > 1000: # Heuristic for Strike
+                            strike_price = float(p)
+                        if p in ["CE", "PE"]:
+                            opt_type = p
+                        # NIFTY ONLY STRICT CHECK
+                        if "NIFTY" in p:
+                            symbol_code = p
+
             if settings.GREEK_VALIDATION:
                 broker_greeks = await self.api.get_option_greeks([token])
                 if broker_greeks:
@@ -304,9 +323,10 @@ class VolGuard17Engine:
         except Exception:
             pass
 
+        # Adopt with best-guess details so Risk Manager isn't blind
         dummy_leg = Position(
-            symbol="UNKNOWN", instrument_key=token, strike=0,
-            option_type="CE", quantity=qty, entry_price=current_price,
+            symbol=symbol_code, instrument_key=token, strike=strike_price,
+            option_type=opt_type, quantity=qty, entry_price=current_price,
             entry_time=datetime.now(settings.IST), current_price=current_price,
             current_greeks=greeks, expiry_type=ExpiryType.INTRADAY,
             capital_bucket=CapitalBucket.INTRADAY
@@ -321,6 +341,7 @@ class VolGuard17Engine:
         )
         self.trades.append(new_trade)
         self.data_feed.subscribe_instrument(token)
+        logger.info(f"🧟 Adopted Zombie: {symbol_code} {strike_price} {opt_type}")
 
     async def _restore_from_snapshot(self):
         logger.info("💾 Restoring open trades from DB...")
@@ -383,11 +404,12 @@ class VolGuard17Engine:
             loop = asyncio.get_running_loop()
             
             try:
+                # CRITICAL FIX: Increased timeout to 15s for slower VPS
                 success = await asyncio.wait_for(
                     loop.run_in_executor(
                         self.executor, self.sabr.calibrate_to_chain,
                         strikes, market_vols, spot, time_to_expiry
-                    ), timeout=5.0
+                    ), timeout=15.0
                 )
                 if success:
                     self.last_sabr_calibration = time.time()
@@ -395,7 +417,7 @@ class VolGuard17Engine:
                 else:
                     self.sabr.reset()
             except asyncio.TimeoutError:
-                logger.error("SABR calibration timeout (>5s)")
+                logger.error("SABR calibration timeout (>15s)")
                 self.sabr.reset()
         except Exception as e:
             logger.error(f"SABR Calibration Crashed: {e}")
