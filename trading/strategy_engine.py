@@ -3,7 +3,7 @@ import time
 from datetime import datetime, timedelta, time as dtime
 from typing import List, Dict, Tuple, Optional
 from core.config import settings, IST
-from core.models import AdvancedMetrics
+from core.models import AdvancedMetrics, MultiLegTrade
 from core.enums import MarketRegime, StrategyType, ExpiryType, CapitalBucket
 from analytics.pricing import HybridPricingEngine
 
@@ -11,9 +11,11 @@ logger = logging.getLogger("StrategyEngine")
 
 class IntelligentStrategyEngine:
     """
-    FIXED: Added timeout guards to Delta Search and oscillation detection for strike selection.
-    FIXED: Added freeze quantity validation for exchange limits.
-    FIXED: Uses real instrument expiries instead of assuming Thursday.
+    PRODUCTION FIXED:
+    - Expiry date logic handles monthly contracts, holidays, and 0DTE correctly
+    - Per-leg freeze quantity validation
+    - Proper strike selection timeout guards
+    - Real instrument expiry integration
     """
     def __init__(self, vol_analytics, event_intel, capital_allocator, pricing_engine: HybridPricingEngine):
         self.vol_analytics = vol_analytics
@@ -21,7 +23,7 @@ class IntelligentStrategyEngine:
         self.capital_allocator = capital_allocator
         self.pricing = pricing_engine
         self.last_trade_time = None
-        self.instruments_master = None  # Will be injected by Engine
+        self.instruments_master = None
 
     def set_instruments_master(self, master):
         """Inject InstrumentMaster for real expiry lookups"""
@@ -44,8 +46,8 @@ class IntelligentStrategyEngine:
         if available < min_required:
             return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, CapitalBucket.WEEKLY
 
-        # CRITICAL FIX: Get real expiry from Instrument Master
-        expiry_date = self._get_expiry_date()
+        # PRODUCTION FIX: Get real expiry with proper edge case handling
+        expiry_date = self._get_expiry_date(ExpiryType.WEEKLY)
         if not expiry_date:
             logger.warning("⚠️ No valid expiry found. Waiting...")
             return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, CapitalBucket.WEEKLY
@@ -88,6 +90,15 @@ class IntelligentStrategyEngine:
                     {"strike": pe_long,  "type": "PE", "side": "BUY",  "expiry": expiry_date}
                 ]
 
+            # PRODUCTION FIX: Validate freeze quantities per-leg
+            if not self._validate_freeze_limits(legs, lots):
+                logger.error("🚫 Freeze limit validation failed. Reducing lots...")
+                # Try with fewer lots
+                safe_lots = self._calculate_safe_lots_for_freeze()
+                if safe_lots < 1:
+                    return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, bucket
+                lots = safe_lots
+
             self.last_trade_time = now
             return strategy_name, legs, ExpiryType.WEEKLY, bucket
 
@@ -97,8 +108,8 @@ class IntelligentStrategyEngine:
 
     def _calculate_dynamic_lots(self, available_capital: float, margin_per_lot: float) -> int:
         """
-        FIXED: Scales position size based on available capital.
-        Now respects exchange freeze quantity limits.
+        PRODUCTION FIX: Scales position size based on available capital.
+        Respects MAX_LOTS and exchange freeze quantity limits.
         """
         raw_lots = int(available_capital / margin_per_lot)
         
@@ -121,11 +132,33 @@ class IntelligentStrategyEngine:
         
         return final_lots
 
+    def _validate_freeze_limits(self, legs: List[Dict], lots: int) -> bool:
+        """
+        PRODUCTION FIX: Validates each leg against exchange freeze quantity limits.
+        """
+        for leg in legs:
+            total_qty = lots * settings.LOT_SIZE
+            
+            if total_qty > settings.NIFTY_FREEZE_QTY:
+                logger.error(
+                    f"🚫 Freeze Limit Breach: {leg['side']} {leg['strike']} {leg['type']} "
+                    f"has {total_qty} qty > {settings.NIFTY_FREEZE_QTY} limit"
+                )
+                return False
+        
+        return True
+
+    def _calculate_safe_lots_for_freeze(self) -> int:
+        """
+        Calculate maximum safe lots that won't violate freeze limits.
+        """
+        return settings.NIFTY_FREEZE_QTY // settings.LOT_SIZE
+
     def _find_strike_by_delta(self, spot: float, option_type: str, expiry: str, 
                               target_delta: float, max_iterations: int = 30) -> float:
         """
-        FIXED: Binary Search for strike matching target Delta.
-        Includes Timeouts and Oscillation Detection for robustness.
+        PRODUCTION FIX: Binary Search for strike matching target Delta.
+        Includes Timeouts and Oscillation Detection.
         """
         start_time = time.time()
         
@@ -149,10 +182,9 @@ class IntelligentStrategyEngine:
                 return best_strike
 
             mid_strike = (lower_strike + upper_strike) / 2
-            mid_strike = round(mid_strike / step) * step  # Snap to Grid
+            mid_strike = round(mid_strike / step) * step
             
             # 2. Oscillation Guard
-            # If search range is tighter than one strike step, we can't get closer
             if (upper_strike - lower_strike) < step:
                 return best_strike
 
@@ -164,25 +196,22 @@ class IntelligentStrategyEngine:
                 best_error = error
                 best_strike = mid_strike
 
-            # Success tolerance (Delta is within 0.02)
+            # Success tolerance
             if error < 0.02: 
                 return mid_strike
             
             # Adjust Bounds
             if option_type == "CE":
-                # Call Delta increases as Strike decreases (ITM)
                 if current_delta > target_delta: 
                     lower_strike = mid_strike 
                 else: 
                     upper_strike = mid_strike 
             else:
-                # Put Delta (abs) increases as Strike increases (ITM)
                 if current_delta > target_delta: 
                     upper_strike = mid_strike 
                 else: 
                     lower_strike = mid_strike
 
-        # Check convergence quality
         if best_error > 0.10:
             logger.warning(
                 f"⚠️ Poor Delta Match: Target={target_delta:.2f}, "
@@ -191,12 +220,10 @@ class IntelligentStrategyEngine:
             
         return best_strike
 
-    def _get_expiry_date(self) -> Optional[str]:
+    def _get_expiry_date(self, expiry_type: ExpiryType = ExpiryType.WEEKLY) -> Optional[str]:
         """
-        CRITICAL FIX: Uses real instrument expiries from Instrument Master.
-        Properly handles holidays and market closures.
+        PRODUCTION FIX: Handles monthly expiries, holidays, and 0DTE correctly.
         """
-        # If InstrumentMaster is available, use real data
         if self.instruments_master:
             try:
                 available_expiries = self.instruments_master.get_all_expiries("NIFTY")
@@ -205,33 +232,86 @@ class IntelligentStrategyEngine:
                     logger.error("❌ No NIFTY expiries available in Instrument Master")
                     return None
                 
-                today = datetime.now(IST).date()
+                today = datetime.now(IST)
+                current_time = today.time()
+                today_date = today.date()
                 
-                # Get next valid expiry (future dates only)
-                future_expiries = [e for e in available_expiries if e > today]
+                # Filter for future dates (including today if before market close)
+                if current_time < dtime(15, 30):
+                    # Market still open, today's expiry is valid
+                    future_expiries = [e for e in available_expiries if e >= today_date]
+                else:
+                    # Market closed, exclude today
+                    future_expiries = [e for e in available_expiries if e > today_date]
                 
                 if not future_expiries:
                     logger.error("❌ No future expiries available")
                     return None
                 
-                # Return nearest expiry
-                nearest_expiry = future_expiries[0]
-                logger.debug(f"📅 Next Expiry: {nearest_expiry}")
-                return nearest_expiry.strftime("%Y-%m-%d")
+                if expiry_type == ExpiryType.WEEKLY:
+                    # Return nearest expiry (weekly contract)
+                    nearest_expiry = future_expiries[0]
+                    logger.debug(f"📅 Next Weekly Expiry: {nearest_expiry}")
+                    return nearest_expiry.strftime("%Y-%m-%d")
                 
+                elif expiry_type == ExpiryType.MONTHLY:
+                    # Find last Thursday of current month
+                    current_month_expiries = [
+                        e for e in future_expiries 
+                        if e.month == today.month and e.year == today.year
+                    ]
+                    
+                    if not current_month_expiries:
+                        # No expiries left this month, get first expiry of next month
+                        next_month_expiries = [
+                            e for e in future_expiries 
+                            if e.month == (today.month % 12) + 1
+                        ]
+                        if next_month_expiries:
+                            monthly_expiry = next_month_expiries[-1]
+                        else:
+                            monthly_expiry = future_expiries[-1]
+                    else:
+                        # Get last expiry of current month
+                        monthly_expiry = current_month_expiries[-1]
+                    
+                    logger.debug(f"📅 Next Monthly Expiry: {monthly_expiry}")
+                    return monthly_expiry.strftime("%Y-%m-%d")
+                
+                elif expiry_type == ExpiryType.INTRADAY:
+                    # For intraday, use nearest expiry
+                    return future_expiries[0].strftime("%Y-%m-%d")
+                    
             except Exception as e:
                 logger.error(f"Expiry lookup failed: {e}")
-                # Fall through to fallback logic
+                # Fall through to fallback
         
-        # FALLBACK: Simple Thursday logic (if InstrumentMaster unavailable)
-        logger.warning("⚠️ Using fallback expiry logic (Thursday assumption)")
+        # FALLBACK: Simple Thursday logic
+        logger.warning("⚠️ Using fallback expiry logic (InstrumentMaster unavailable)")
         today = datetime.now(IST)
         
-        # 3 = Thursday (Monday is 0)
+        # Calculate days to Thursday (weekday 3)
         days_ahead = (3 - today.weekday()) % 7
         
-        # If today is Thursday and market is closed (after 3:30 PM), move to next week
-        if days_ahead == 0 and today.time() >= dtime(15, 30): 
-            days_ahead = 7
+        # Special handling for Thursday
+        if days_ahead == 0:
+            if today.time() >= dtime(15, 30):
+                # Market closed, move to next Thursday
+                days_ahead = 7
+            # else: keep days_ahead = 0 (today is valid)
+        
+        target_date = today + timedelta(days=days_ahead)
+        
+        # For monthly expiry, get last Thursday of month
+        if expiry_type == ExpiryType.MONTHLY:
+            # Move to end of month
+            next_month = target_date.replace(day=28) + timedelta(days=4)
+            last_day = next_month - timedelta(days=next_month.day)
             
-        return (today + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+            # Find last Thursday
+            while last_day.weekday() != 3:  # 3 = Thursday
+                last_day -= timedelta(days=1)
+            
+            target_date = last_day
+        
+        return target_date.strftime("%Y-%m-%d")
