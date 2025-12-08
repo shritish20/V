@@ -13,7 +13,10 @@ logger = logging.getLogger("LiveFeed")
 
 class LiveDataFeed:
     """
-    PRODUCTION-READY: Fixed WebSocket Race Condition with Double-Check Locking
+    PRODUCTION FIXED:
+    - Double-check locking for thread safety
+    - Exponential backoff on reconnection failures
+    - Prevents API hammering when broker is down
     """
     def __init__(self, rt_quotes: Dict[str, float], greeks_cache: Dict, sabr_model):
         self.rt_quotes = rt_quotes
@@ -29,9 +32,13 @@ class LiveDataFeed:
         self.feed_thread: Optional[Thread] = None
         self.is_connected = False
         
-        # CRITICAL FIX: Async lock with atomic state tracking
+        # Thread safety
         self._restart_lock = asyncio.Lock()
-        self._thread_starting = False  # Prevents duplicate starts
+        self._thread_starting = False
+        
+        # PRODUCTION FIX: Exponential backoff state
+        self._reconnect_attempts = 0
+        self._max_backoff = 300  # 5 minutes max
 
     def subscribe_instrument(self, key: str):
         if not key or key in self.sub_list: 
@@ -53,6 +60,10 @@ class LiveDataFeed:
     def on_market_data(self, message):
         self.last_tick_time = time.time()
         self.is_connected = True
+        
+        # PRODUCTION FIX: Reset reconnect counter on successful data
+        self._reconnect_attempts = 0
+        
         try:
             if "feeds" not in message: 
                 return
@@ -73,9 +84,7 @@ class LiveDataFeed:
         self.is_connected = False
 
     def _run_feed_process(self):
-        """
-        Blocking method to run in a separate thread.
-        """
+        """Blocking method to run in separate thread"""
         try:
             self.feed = MarketDataFeed(
                 settings.API_BASE_V3,
@@ -109,39 +118,45 @@ class LiveDataFeed:
 
     async def _ensure_thread_running(self):
         """
-        PRODUCTION FIX: Double-Check Locking Pattern
-        Prevents race conditions during thread spawning.
+        PRODUCTION FIX: Double-check locking with exponential backoff.
         """
-        # Fast path: Check without lock
+        # Fast path
         if self.feed_thread and self.feed_thread.is_alive() and not self._thread_starting:
-            return  # Already running
+            return
 
-        # Slow path: Acquire lock and re-check
+        # Slow path with lock
         async with self._restart_lock:
             # Double-check inside lock
             if self.feed_thread and self.feed_thread.is_alive():
-                return  # Another coroutine already started it
+                return
             
             if self._thread_starting:
-                # Another coroutine is currently starting the thread
-                # Wait for it to complete
-                for _ in range(20):  # Max 10 seconds
+                # Wait for other coroutine to finish starting
+                for _ in range(20):
                     await asyncio.sleep(0.5)
                     if not self._thread_starting:
                         break
                 return
 
-            # Mark as starting (prevents duplicate attempts)
+            # PRODUCTION FIX: Apply exponential backoff
+            if self._reconnect_attempts > 0:
+                backoff = min(2 ** self._reconnect_attempts, self._max_backoff)
+                logger.info(
+                    f"🔄 Backoff: Waiting {backoff}s before reconnect "
+                    f"(attempt {self._reconnect_attempts})"
+                )
+                await asyncio.sleep(backoff)
+
             self._thread_starting = True
             
             # Kill zombie threads
             if self.feed_thread is not None:
                 self.disconnect()
                 if self.feed_thread.is_alive():
-                    logger.warning("⚠️ Waiting for zombie thread to die...")
+                    logger.warning("⚠️ Waiting for zombie thread...")
                     self.feed_thread.join(timeout=5)
                     if self.feed_thread.is_alive():
-                        logger.error("❌ Zombie thread won't die. Proceeding anyway.")
+                        logger.error("❌ Zombie thread won't die.")
 
             # Spawn new thread
             logger.info("🚀 Starting Feed Thread...")
@@ -152,63 +167,65 @@ class LiveDataFeed:
             )
             self.feed_thread.start()
             
-            # Wait for connection OR failure (max 10 seconds)
+            # Wait for connection or failure
             for _ in range(20):
                 await asyncio.sleep(0.5)
                 if self.is_connected:
                     logger.info("✅ Feed Connected")
+                    self._reconnect_attempts = 0  # Reset on success
                     break
                 if not self.feed_thread.is_alive():
                     logger.error("❌ Feed thread died immediately")
+                    self._reconnect_attempts += 1
                     self._thread_starting = False
                     break
             else:
-                # Timeout - connection didn't establish in 10s
+                # Timeout
                 if not self.is_connected:
-                    logger.warning("⚠️ Connection timeout (10s). Will retry.")
+                    logger.warning("⚠️ Connection timeout (10s)")
+                    self._reconnect_attempts += 1
             
             self._thread_starting = False
 
     async def start(self):
-        """
-        Main supervisor loop. Manages the background thread safely.
-        """
+        """Main supervisor loop with backoff logic"""
         self.stop_event.clear()
         self.last_tick_time = time.time()
         logger.info("🚀 Live Data Feed Supervisor Started")
 
         while not self.stop_event.is_set():
             try:
-                # Market Hours Check
+                # Market hours check
                 now = datetime.now(settings.IST).time()
                 is_market_open = settings.MARKET_OPEN_TIME <= now <= settings.MARKET_CLOSE_TIME
                 
-                # Run feed during market hours or in testing mode
                 should_run = is_market_open or settings.SAFETY_MODE != "live"
 
                 if should_run:
-                    # PRODUCTION FIX: Use atomic thread manager
                     await self._ensure_thread_running()
 
-                    # Watchdog: Restart if no ticks for 60 seconds
+                    # Watchdog: Restart if stalled
                     tick_age = time.time() - self.last_tick_time
                     if tick_age > 60 and self.is_connected:
-                        logger.warning(f"⚠️ Feed Stalled ({tick_age:.0f}s). Triggering Restart...")
+                        logger.warning(f"⚠️ Feed Stalled ({tick_age:.0f}s). Restarting...")
                         self.disconnect()
-                        # Force thread cleanup
                         async with self._restart_lock:
                             self.feed_thread = None
-                        # Reset timer to avoid rapid restart loops
+                        # Increment reconnect counter
+                        self._reconnect_attempts += 1
                         self.last_tick_time = time.time()
                 else:
-                    # Market Closed
+                    # Market closed
                     if self.is_connected:
                         logger.info("🌙 Market Closed. Pausing Feed.")
                         self.disconnect()
+                        # Reset backoff during market closure
+                        self._reconnect_attempts = 0
 
             except Exception as e:
                 logger.error(f"Supervisor Loop Error: {e}")
                 logger.debug(traceback.format_exc())
+                self._reconnect_attempts += 1
             
             await asyncio.sleep(5)
 
@@ -218,7 +235,6 @@ class LiveDataFeed:
         self.stop_event.set()
         self.disconnect()
         
-        # Wait for thread to finish
         if self.feed_thread and self.feed_thread.is_alive():
             logger.info("Waiting for feed thread to exit...")
             await asyncio.sleep(2)
