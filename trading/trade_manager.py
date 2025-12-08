@@ -10,8 +10,11 @@ logger = setup_logger("TradeMgr")
 
 class EnhancedTradeManager:
     """
-    FIXED: Corrected PnL calculation logic for Debit vs Credit strategies.
-    FIXED: MarginGuard now properly initialized with API client.
+    PRODUCTION FIXED v2.0:
+    - Correct PnL calculation for Iron Condors (max loss based on spread width)
+    - Proper handling of credit vs debit spreads
+    - Enhanced logging for monitoring
+    - MarginGuard properly initialized with API client
     """
     def __init__(self, api, db, om, pricing, risk, alerts, capital):
         self.api = api
@@ -116,8 +119,10 @@ class EnhancedTradeManager:
 
     async def monitor_active_trades(self, trades):
         """
-        FIXED: Real-time Profit/Loss Monitoring logic.
-        Now correctly handles Debit Spreads vs Credit Spreads calculation.
+        PRODUCTION FIXED v2.0: Real-time Profit/Loss Monitoring
+        - Correct Iron Condor max loss calculation
+        - Proper handling of credit vs debit spreads
+        - Enhanced logging for monitoring
         """
         for trade in trades:
             if trade.status != TradeStatus.OPEN:
@@ -126,31 +131,15 @@ class EnhancedTradeManager:
             # Calculate Absolute PnL
             pnl = trade.total_unrealized_pnl()
             
-            # Determine Basis for % Calculation
-            net_premium_total = trade.net_premium_per_share * trade.lots * settings.LOT_SIZE
+            # CRITICAL FIX: Determine basis for % calculation based on strategy type
+            basis = self._calculate_trade_basis(trade)
             
-            basis = 1.0  # Default to avoid div/0
-            
-            if net_premium_total > 0:
-                # CREDIT Strategy (e.g., Short Strangle, Iron Condor)
-                # Target is % of Max Profit (Premium Received)
-                # PnL is positive when premium decays (good for seller)
-                basis = net_premium_total
-            elif net_premium_total < 0:
-                # DEBIT Strategy (e.g., Bull Call Spread, Long Strangle)
-                # Target is % Return on Investment (ROI on Cost)
-                # PnL is positive when spread widens (good for buyer)
-                basis = abs(net_premium_total)
-            else:
-                # Zero Cost (Unlikely, but fallback to conservative margin estimate)
-                basis = 10000.0
+            pnl_pct = (pnl / basis) * 100 if basis > 0 else 0.0
 
-            pnl_pct = (pnl / basis) * 100
-
-            # Detailed logging for monitoring
-            if abs(pnl_pct) > 20:  # Log if PnL > 20%
-                logger.debug(
-                    f"Trade {trade.id} | {trade.strategy_type.value} | "
+            # Enhanced logging for monitoring
+            if abs(pnl_pct) > 15:  # Log if PnL > 15%
+                logger.info(
+                    f"📊 Trade {trade.id[:8]} | {trade.strategy_type.value} | "
                     f"PnL: ₹{pnl:,.0f} ({pnl_pct:+.1f}%) | "
                     f"Basis: ₹{basis:,.0f}"
                 )
@@ -164,3 +153,70 @@ class EnhancedTradeManager:
             elif pnl_pct <= -(settings.STOP_LOSS_PCT * 100):
                 logger.warning(f"🛑 STOP LOSS HIT ({pnl_pct:+.1f}%). Closing {trade.id}")
                 await self.close_trade(trade, ExitReason.STOP_LOSS)
+
+    def _calculate_trade_basis(self, trade: MultiLegTrade) -> float:
+        """
+        PRODUCTION FIX v2.0: Calculate proper basis for PnL percentage
+        
+        Credit Spreads (Iron Condor, Short Strangle):
+        - Basis = Premium Received (your max profit)
+        - Target: % of max profit captured
+        
+        Debit Spreads (Bull Call Spread, Long Strangle):
+        - Basis = Premium Paid (your investment)
+        - Target: % ROI on investment
+        
+        Defined Risk Spreads (Iron Condor):
+        - Basis = Max Loss = (Spread Width - Net Credit) × Lot Size
+        """
+        net_premium_total = trade.net_premium_per_share * trade.lots * settings.LOT_SIZE
+        
+        # Strategy-specific logic
+        if trade.strategy_type == StrategyType.IRON_CONDOR:
+            # Calculate true max loss based on spread widths
+            ce_legs = [l for l in trade.legs if l.option_type == "CE"]
+            pe_legs = [l for l in trade.legs if l.option_type == "PE"]
+            
+            if len(ce_legs) >= 2 and len(pe_legs) >= 2:
+                # Get strikes for each wing
+                ce_strikes = sorted([l.strike for l in ce_legs])
+                pe_strikes = sorted([l.strike for l in pe_legs])
+                
+                # Calculate spread widths
+                ce_width = ce_strikes[-1] - ce_strikes[0]
+                pe_width = pe_strikes[-1] - pe_strikes[0]
+                
+                # Max loss is the larger spread width minus net credit
+                max_spread_width = max(ce_width, pe_width)
+                max_loss_per_share = max_spread_width - abs(net_premium_total / (trade.lots * settings.LOT_SIZE))
+                max_loss = max_loss_per_share * trade.lots * settings.LOT_SIZE
+                
+                return max(max_loss, 1000.0)  # Minimum basis to avoid div/0
+            else:
+                # Fallback if leg structure is unexpected
+                return max(abs(net_premium_total), 10000.0)
+        
+        elif trade.strategy_type in [StrategyType.SHORT_STRANGLE, StrategyType.ATM_STRADDLE]:
+            # Credit Strategy: Basis is premium received (max profit)
+            if net_premium_total > 0:
+                return net_premium_total
+            else:
+                # If somehow net premium is negative, use absolute value
+                return max(abs(net_premium_total), 10000.0)
+        
+        elif trade.strategy_type in [StrategyType.BULL_PUT_SPREAD]:
+            # Debit Strategy: Basis is premium paid (investment)
+            if net_premium_total < 0:
+                return abs(net_premium_total)
+            else:
+                # If somehow net premium is positive, use absolute value
+                return max(abs(net_premium_total), 10000.0)
+        
+        else:
+            # Generic fallback for other strategies
+            if abs(net_premium_total) > 0:
+                return abs(net_premium_total)
+            else:
+                # Conservative fallback if no premium data
+                # Use 10% of lot value as basis
+                return trade.lots * settings.LOT_SIZE * 150.0
