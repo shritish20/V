@@ -11,10 +11,11 @@ logger = logging.getLogger("StrategyEngine")
 
 class IntelligentStrategyEngine:
     """
-    PRODUCTION FIXED:
-    - Expiry date logic handles monthly contracts, holidays, and 0DTE correctly
+    PRODUCTION FIXED v2.0:
+    - Uses SAFE_TRADE_END (3:15 PM) to prevent 0DTE trades near close
+    - Proper expiry date logic with holiday handling
     - Per-leg freeze quantity validation
-    - Proper strike selection timeout guards
+    - Strike selection timeout guards
     - Real instrument expiry integration
     """
     def __init__(self, vol_analytics, event_intel, capital_allocator, pricing_engine: HybridPricingEngine):
@@ -222,7 +223,10 @@ class IntelligentStrategyEngine:
 
     def _get_expiry_date(self, expiry_type: ExpiryType = ExpiryType.WEEKLY) -> Optional[str]:
         """
-        PRODUCTION FIX: Handles monthly expiries, holidays, and 0DTE correctly.
+        PRODUCTION FIX v2.0: 
+        - Uses SAFE_TRADE_END (3:15 PM) instead of market close (3:30 PM)
+        - Handles monthly expiries, holidays, and 0DTE correctly
+        - Prevents trades in last 15 minutes of trading day
         """
         if self.instruments_master:
             try:
@@ -236,13 +240,15 @@ class IntelligentStrategyEngine:
                 current_time = today.time()
                 today_date = today.date()
                 
-                # Filter for future dates (including today if before market close)
-                if current_time < dtime(15, 30):
-                    # Market still open, today's expiry is valid
+                # CRITICAL FIX: Use SAFE_TRADE_END (3:15 PM) instead of market close (3:30 PM)
+                # This prevents 0DTE trades in the last 15 minutes when gamma risk is extreme
+                if current_time < settings.SAFE_TRADE_END:
+                    # Market still open AND before safe cutoff, today's expiry is valid
                     future_expiries = [e for e in available_expiries if e >= today_date]
                 else:
-                    # Market closed, exclude today
+                    # After 3:15 PM or market closed, exclude today
                     future_expiries = [e for e in available_expiries if e > today_date]
+                    logger.debug(f"⏰ After {settings.SAFE_TRADE_END.strftime('%H:%M')} - excluding today's expiry")
                 
                 if not future_expiries:
                     logger.error("❌ No future expiries available")
@@ -293,12 +299,12 @@ class IntelligentStrategyEngine:
         # Calculate days to Thursday (weekday 3)
         days_ahead = (3 - today.weekday()) % 7
         
-        # Special handling for Thursday
+        # CRITICAL FIX: Use SAFE_TRADE_END instead of market close
         if days_ahead == 0:
-            if today.time() >= dtime(15, 30):
-                # Market closed, move to next Thursday
+            if today.time() >= settings.SAFE_TRADE_END:
+                # After safe cutoff, move to next Thursday
                 days_ahead = 7
-            # else: keep days_ahead = 0 (today is valid)
+            # else: keep days_ahead = 0 (today is valid and before cutoff)
         
         target_date = today + timedelta(days=days_ahead)
         
