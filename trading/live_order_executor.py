@@ -37,7 +37,7 @@ class LiveOrderExecutor:
     async def _place_regular_batch(self, trade: MultiLegTrade) -> bool:
         orders_payload = []
         for idx, leg in enumerate(trade.legs):
-            # [span_1](start_span)Schema: MultiOrderRequest[span_1](end_span)
+            [span_0](start_span)[span_1](start_span)# Schema: MultiOrderRequest
             orders_payload.append({
                 "instrument_token": leg.instrument_key,
                 "transaction_type": "BUY" if leg.quantity > 0 else "SELL",
@@ -55,7 +55,7 @@ class LiveOrderExecutor:
             })
 
         try:
-            # [span_2](start_span)Endpoint: /v2/order/multi/place[span_2](end_span)
+            #[span_0](end_span)[span_1](end_span) Endpoint: /v2/order/multi/place
             response = await self.api.place_multi_order(orders_payload)
             
             if response.get("status") != "success":
@@ -65,16 +65,23 @@ class LiveOrderExecutor:
             # Atomic Validation
             metadata = response.get("metadata", {})
             summary = metadata.get("summary", {})
+            data_list = response.get("data", [])
             
-            # Ensure ALL orders succeeded (Atomic behavior)
+            # Extract Successful Order IDs immediately
+            success_ids = [item["order_id"] for item in data_list if "order_id" in item]
+
+            # CHECK FOR PARTIAL FAILURE
+            # If there are errors OR the number of successes doesn't match the number of legs
             if summary.get("error", 0) > 0 or summary.get("success", 0) != len(trade.legs):
-                logger.critical("❌ Batch Atomic Violation! Rolling back...")
-                # NOTE: Logic to cancel partials should ideally be implemented here
+                logger.critical(f"❌ Batch Atomic Violation! Success: {len(success_ids)}/{len(trade.legs)}")
+                
+                # TRIGGER THE ROLLBACK for any orders that did succeed
+                if success_ids:
+                    await self._rollback_partial_orders(success_ids)
+                
                 return False
 
-            # Extract Order IDs
-            data_list = response.get("data", [])
-            success_ids = [item["order_id"] for item in data_list if "order_id" in item]
+            # If atomic check passed
             trade.gtt_order_ids = success_ids  # Reusing field for tracking IDs
             logger.info(f"✅ Batch Filled: {len(success_ids)} legs")
             return True
@@ -82,6 +89,28 @@ class LiveOrderExecutor:
         except Exception as e:
             logger.error(f"Batch Exception: {e}")
             return False
+
+    async def _rollback_partial_orders(self, order_ids: List[str]):
+        """
+        Emergency Rollback: Cancels orders that were part of a failed batch.
+        """
+        if not order_ids:
+            return
+
+        logger.warning(f"⚠️ Rolling back {len(order_ids)} partial orders...")
+        
+        # [span_2](start_span)Create cancel tasks for all successful IDs using[span_2](end_span) /v2/order/cancel
+        tasks = [self.api.cancel_order(oid) for oid in order_ids]
+        
+        # Execute all cancels concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Audit the rollback results
+        for oid, res in zip(order_ids, results):
+            if res is True:
+                logger.info(f"✔ Rollback: Cancelled {oid}")
+            else:
+                logger.critical(f"❌ Rollback FAILED for {oid}. MANUAL INTERVENTION REQUIRED.")
 
     async def _place_gtt_batch(self, trade: MultiLegTrade) -> bool:
         gtt_ids = []
@@ -111,13 +140,13 @@ class LiveOrderExecutor:
         FIXED: Strictly compliant with Upstox GttPlaceOrderRequest Schema.
         Removes invalid fields (order_type, price, validity) that cause 400 errors.
         """
-        # [span_3](start_span)Schema: GttPlaceOrderRequest[span_3](end_span)
+        [span_3](start_span)# Schema: GttPlaceOrderRequest
         payload = {
             "type": "SINGLE",
             "quantity": abs(leg.quantity),
             "product": "D",  # GTT is typically Delivery
             "rules": [{
-                # [span_4](start_span)Schema: GttRule[span_4](end_span)
+                # Schema: GttRule
                 "strategy": "ENTRY",
                 "trigger_type": trigger_type,
                 "trigger_price": float(trigger_price),
@@ -133,7 +162,7 @@ class LiveOrderExecutor:
             response = await self.api._request_with_retry("POST", url, json=payload)
 
             if response.get("status") == "success":
-                # [span_5](start_span)Schema: GttTriggerOrderResponse -> GttOrderData[span_5](end_span)
+                # Schema: GttTriggerOrderResponse -> GttOrderData
                 return response.get("data", {}).get("gtt_order_ids", [])[0]
             
             logger.error(f"GTT Failed: {response}")
@@ -153,7 +182,7 @@ class LiveOrderExecutor:
             
             for oid in trade.gtt_order_ids:
                 try:
-                    # [span_6](start_span)Endpoint: /v2/order/details[span_6](end_span)
+                    #[span_3](end_span) Endpoint: /v2/order/details
                     details = await self.api.get_order_details(oid)
                     data = details.get("data", [])
                     # Check status in list (Upstox returns list for history/details)
@@ -183,7 +212,7 @@ class LiveOrderExecutor:
             # Reverse direction for exit
             reversed_qty = leg.quantity * -1
             
-            # [span_7](start_span)Schema: MultiOrderRequest[span_7](end_span)
+            [span_4](start_span)#[span_4](end_span) Schema: MultiOrderRequest
             orders_payload.append({
                 "instrument_token": leg.instrument_key,
                 "transaction_type": "BUY" if reversed_qty > 0 else "SELL",
