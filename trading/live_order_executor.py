@@ -9,11 +9,11 @@ logger = logging.getLogger("OrderExec")
 
 class LiveOrderExecutor:
     """
-    PRODUCTION FIXED:
-    - Schema-compliant multi-order placement
-    - GTT order support for overnight hedging
+    PRODUCTION FIXED v2.0:
+    - Complete GTT payload with all required fields per Upstox schema
+    - Uses metadata.summary for more reliable atomic validation
+    - Enhanced error messages
     - Proper freeze quantity validation
-    - Atomic rollback on partial fills
     """
     def __init__(self, api: EnhancedUpstoxAPI):
         self.api = api
@@ -45,7 +45,7 @@ class LiveOrderExecutor:
             return await self._place_regular_batch(trade)
 
     async def _place_regular_batch(self, trade: MultiLegTrade) -> bool:
-        """Standard intraday multi-order placement"""
+        """Standard intraday multi-order placement with enhanced atomic validation"""
         orders_payload = []
         for idx, leg in enumerate(trade.legs):
             order = {
@@ -72,28 +72,48 @@ class LiveOrderExecutor:
                 logger.error(f"❌ Batch API Failed: {response}")
                 return False
 
-            # Parse response
+            # PRODUCTION FIX v2.0: Use metadata.summary for more reliable validation
+            metadata = response.get("metadata", {})
+            summary = metadata.get("summary", {})
+            
+            total_sent = summary.get("total", 0)
+            success_count = summary.get("success", 0)
+            error_count = summary.get("error", 0)
+            payload_error_count = summary.get("payload_error", 0)
+            
+            # Also collect actual order IDs from data array
             data_list = response.get("data", [])
-            errors = response.get("errors", [])
-
             success_ids = []
             for item in data_list:
                 if "order_id" in item:
                     success_ids.append(item["order_id"])
 
-            # PRODUCTION FIX: Atomic check - all or nothing
-            if errors or len(success_ids) != len(trade.legs):
+            # CRITICAL FIX: Use summary counts (more reliable than parsing data array)
+            if error_count > 0 or payload_error_count > 0 or success_count != len(trade.legs):
                 logger.critical(
-                    f"❌ Batch Partial Fill! Success: {len(success_ids)}/{len(trade.legs)}"
+                    f"❌ Batch Atomic Violation!\n"
+                    f"   Sent: {len(trade.legs)} legs\n"
+                    f"   Success: {success_count}\n"
+                    f"   Errors: {error_count}\n"
+                    f"   Payload Errors: {payload_error_count}\n"
+                    f"   Order IDs Received: {len(success_ids)}"
                 )
+                
                 # Rollback all successful orders
-                for oid in success_ids:
-                    await self.api.cancel_order(oid)
+                if success_ids:
+                    logger.warning(f"🔄 Rolling back {len(success_ids)} successful orders...")
+                    rollback_tasks = [self.api.cancel_order(oid) for oid in success_ids]
+                    await asyncio.gather(*rollback_tasks, return_exceptions=True)
+                
                 return False
             
+            # Success: All legs filled atomically
             trade.gtt_order_ids = success_ids
-            trade.basket_order_id = success_ids[0]
-            logger.info(f"✅ Batch Accepted. Ref: {trade.basket_order_id}")
+            trade.basket_order_id = success_ids[0] if success_ids else None
+            logger.info(
+                f"✅ Batch Accepted Atomically: {success_count}/{len(trade.legs)} legs filled. "
+                f"Ref: {trade.basket_order_id}"
+            )
             return True
 
         except Exception as e:
@@ -102,7 +122,7 @@ class LiveOrderExecutor:
 
     async def _place_gtt_batch(self, trade: MultiLegTrade) -> bool:
         """
-        PRODUCTION NEW: GTT (Good Till Triggered) order placement.
+        PRODUCTION FIX v2.0: GTT (Good Till Triggered) order placement with complete schema.
         Used for overnight hedging or post-market triggers.
         """
         gtt_order_ids = []
@@ -122,8 +142,10 @@ class LiveOrderExecutor:
             if not gtt_order_id:
                 logger.error(f"❌ GTT Order Failed for Leg {idx}")
                 # Rollback previous GTT orders
-                for prev_id in gtt_order_ids:
-                    await self.cancel_gtt_order(prev_id)
+                if gtt_order_ids:
+                    logger.warning(f"🔄 Rolling back {len(gtt_order_ids)} GTT orders...")
+                    rollback_tasks = [self.cancel_gtt_order(prev_id) for prev_id in gtt_order_ids]
+                    await asyncio.gather(*rollback_tasks, return_exceptions=True)
                 return False
             
             gtt_order_ids.append(gtt_order_id)
@@ -136,12 +158,19 @@ class LiveOrderExecutor:
     async def place_gtt_order(self, leg: Position, trigger_price: float, 
                              trigger_type: str = "ABOVE") -> Optional[str]:
         """
-        PRODUCTION NEW: Place single GTT order.
+        PRODUCTION FIX v2.0: Complete GTT order payload per Upstox OpenAPI schema.
         Schema: /v3/order/gtt/place
+        
+        FIXED: Added all required fields that were previously missing:
+        - order_type (LIMIT)
+        - price (trigger price)
+        - validity (DAY)
+        - disclosed_quantity (0)
         """
         if settings.SAFETY_MODE != "live":
             return f"SIM-GTT-{int(asyncio.get_event_loop().time())}"
         
+        # CRITICAL FIX: Complete payload per Upstox schema
         payload = {
             "type": "SINGLE",
             "quantity": abs(leg.quantity),
@@ -153,7 +182,13 @@ class LiveOrderExecutor:
                 "trailing_gap": 0.0
             }],
             "instrument_token": leg.instrument_key,
-            "transaction_type": "BUY" if leg.quantity > 0 else "SELL"
+            "transaction_type": "BUY" if leg.quantity > 0 else "SELL",
+            
+            # CRITICAL FIX: Add missing required fields
+            "order_type": "LIMIT",  # ← Was missing
+            "price": float(trigger_price),  # ← Was missing
+            "validity": "DAY",  # ← Was missing
+            "disclosed_quantity": 0  # ← Was missing
         }
         
         try:
@@ -163,9 +198,10 @@ class LiveOrderExecutor:
             if response.get("status") == "success":
                 gtt_ids = response.get("data", {}).get("gtt_order_ids", [])
                 if gtt_ids:
+                    logger.debug(f"✅ GTT Order Placed: {gtt_ids[0]}")
                     return gtt_ids[0]
             
-            logger.error(f"GTT Placement Failed: {response}")
+            logger.error(f"GTT Placement Failed: {response.get('message', 'Unknown error')}")
             return None
             
         except Exception as e:
@@ -185,7 +221,14 @@ class LiveOrderExecutor:
             payload = {"gtt_order_id": gtt_order_id}
             
             response = await self.api._request_with_retry("DELETE", url, json=payload)
-            return response.get("status") == "success"
+            success = response.get("status") == "success"
+            
+            if success:
+                logger.debug(f"✅ GTT Order Cancelled: {gtt_order_id}")
+            else:
+                logger.warning(f"⚠️ GTT Cancel Failed: {gtt_order_id}")
+            
+            return success
             
         except Exception as e:
             logger.error(f"GTT Cancel Failed: {e}")
@@ -274,8 +317,10 @@ class LiveOrderExecutor:
             response = await self.api.place_multi_order(orders_payload)
             
             if response.get("status") == "success":
-                data_list = response.get("data", [])
-                success_count = len([d for d in data_list if "order_id" in d])
+                # Use summary for validation
+                metadata = response.get("metadata", {})
+                summary = metadata.get("summary", {})
+                success_count = summary.get("success", 0)
                 
                 logger.info(f"✅ Close Orders Placed: {success_count}/{len(trade.legs)}")
                 return success_count == len(trade.legs)
