@@ -2,10 +2,14 @@ import aiohttp
 import asyncio
 import logging
 from typing import Dict, List, Optional, Tuple, Any
-from core.config import settings, get_full_url
+from core.config import settings
 from core.models import Order
 
 logger = logging.getLogger("UpstoxAPI")
+
+class TokenExpiredError(Exception):
+    """Custom exception to signal immediate token refresh"""
+    pass
 
 class EnhancedUpstoxAPI:
     """
@@ -32,15 +36,12 @@ class EnhancedUpstoxAPI:
         self.pricing_engine = pricing
 
     async def update_token(self, new_token: str):
-        """
-        FIXED: Thread-safe token rotation that prevents Deadlocks.
-        """
+        """FIXED: Thread-safe token rotation that prevents Deadlocks."""
         if new_token == self.token:
             return
 
         old_session = None
-        
-        # 1. Acquire Lock ONLY to swap credentials and detach session
+        # Acquire Lock ONLY to swap credentials and detach session
         async with self._session_lock:
             logger.info("🔐 Updating API token...")
             self.token = new_token
@@ -50,13 +51,10 @@ class EnhancedUpstoxAPI:
             if self.session and not self.session.closed:
                 old_session = self.session
                 self.session = None
-        
-        # 2. Close the old session OUTSIDE the lock
-        # This prevents the entire system from freezing if close() hangs
+
+        # Close the old session OUTSIDE the lock to prevent freezing
         if old_session:
             await old_session.close()
-            logger.info("✅ Old session closed successfully.")
-            
         logger.info("✅ Token rotation complete.")
 
     async def _session(self) -> aiohttp.ClientSession:
@@ -84,31 +82,33 @@ class EnhancedUpstoxAPI:
                         logger.warning(f"⛔ Rate Limit. Backing off {retry_after}s")
                         await asyncio.sleep(retry_after)
                         continue
-                        
-                    # Auth Error (401)
+                    
+                    # CRITICAL FIX: Auth Error (401)
                     if response.status == 401:
-                        logger.error(f"❌ 401 Unauthorized on {url}. Token expired?")
-                        # Don't retry 401s immediately, let the supervisor handle it
-                        return {"status": "error", "message": "Unauthorized", "code": 401}
-
+                        logger.critical(f"❌ 401 Unauthorized on {url}")
+                        # Raise exception so Engine can catch it and trigger refresh
+                        raise TokenExpiredError("Access Token Invalid or Expired")
+                    
                     # Server Error (5xx)
                     if response.status >= 500:
                         logger.warning(f"Server Error {response.status}. Retrying...")
                         await asyncio.sleep(1 * (i + 1))
                         continue
-
+                        
                     # Client Error (4xx) - usually fatal, don't retry
                     text = await response.text()
                     logger.error(f"Client error {response.status} on {url}: {text}")
                     return {"status": "error", "message": text, "code": response.status}
 
+            except TokenExpiredError:
+                raise  # Propagate up
             except asyncio.TimeoutError:
                 logger.warning(f"Request timeout on {url} (attempt {i+1}/{retries})")
                 await asyncio.sleep(1)
             except Exception as e:
                 logger.error(f"Request exception: {e}")
                 await asyncio.sleep(1)
-                
+        
         return {"status": "error", "message": "Max retries exceeded"}
 
     async def get_quotes(self, instrument_keys: List[str]) -> Dict:
@@ -151,7 +151,9 @@ class EnhancedUpstoxAPI:
     async def get_order_details(self, order_id: str) -> Dict:
         if str(order_id).startswith("SIM"):
             return {"status": "success", "data": [{"status": "complete", "average_price": 0.0}]}
-        url = "https://api-v2.upstox.com/v2/order/history"
+        
+        # NOTE: Using v2 order history/details endpoint
+        url = "https://api-v2.upstox.com/v2/order/details"
         return await self._request_with_retry("GET", url, params={"order_id": order_id})
 
     async def get_funds(self) -> Dict:
