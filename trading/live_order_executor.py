@@ -10,9 +10,8 @@ logger = logging.getLogger("OrderExec")
 class LiveOrderExecutor:
     """
     Production Order Executor.
-    Handles Atomic Batch Orders and GTT (Good Till Triggered) logic.
+    Handles Atomic Batch Orders and GTT (Good Till Triggered) logic with OCO monitoring.
     """
-
     def __init__(self, api: EnhancedUpstoxAPI):
         self.api = api
 
@@ -30,14 +29,18 @@ class LiveOrderExecutor:
                 return False
 
         if use_gtt:
-            return await self._place_gtt_batch(trade)
+            success = await self._place_gtt_batch(trade)
+            if success:
+                # Launch background janitor task to handle OCO logic
+                asyncio.create_task(self.monitor_gtt_oco(trade))
+            return success
         else:
             return await self._place_regular_batch(trade)
 
     async def _place_regular_batch(self, trade: MultiLegTrade) -> bool:
         orders_payload = []
         for idx, leg in enumerate(trade.legs):
-            [span_0](start_span)[span_1](start_span)# Schema: MultiOrderRequest
+            # Schema: MultiOrderRequest
             orders_payload.append({
                 "instrument_token": leg.instrument_key,
                 "transaction_type": "BUY" if leg.quantity > 0 else "SELL",
@@ -51,11 +54,11 @@ class LiveOrderExecutor:
                 "is_amo": False,
                 "slice": False,
                 "correlation_id": f"LEG{idx}-{trade.id[:10]}",
-                "tag": "VG19"
+                "tag": f"VG19-{trade.id}" # Tagged with Trade ID for reconciliation
             })
 
         try:
-            #[span_0](end_span)[span_1](end_span) Endpoint: /v2/order/multi/place
+            # Endpoint: /v2/order/multi/place
             response = await self.api.place_multi_order(orders_payload)
             
             if response.get("status") != "success":
@@ -67,22 +70,17 @@ class LiveOrderExecutor:
             summary = metadata.get("summary", {})
             data_list = response.get("data", [])
             
-            # Extract Successful Order IDs immediately
+            # Extract Successful Order IDs
             success_ids = [item["order_id"] for item in data_list if "order_id" in item]
 
-            # CHECK FOR PARTIAL FAILURE
-            # If there are errors OR the number of successes doesn't match the number of legs
+            # Partial Failure Check
             if summary.get("error", 0) > 0 or summary.get("success", 0) != len(trade.legs):
                 logger.critical(f"❌ Batch Atomic Violation! Success: {len(success_ids)}/{len(trade.legs)}")
-                
-                # TRIGGER THE ROLLBACK for any orders that did succeed
                 if success_ids:
                     await self._rollback_partial_orders(success_ids)
-                
                 return False
 
-            # If atomic check passed
-            trade.gtt_order_ids = success_ids  # Reusing field for tracking IDs
+            trade.gtt_order_ids = success_ids
             logger.info(f"✅ Batch Filled: {len(success_ids)} legs")
             return True
 
@@ -91,21 +89,11 @@ class LiveOrderExecutor:
             return False
 
     async def _rollback_partial_orders(self, order_ids: List[str]):
-        """
-        Emergency Rollback: Cancels orders that were part of a failed batch.
-        """
-        if not order_ids:
-            return
-
+        """Emergency Rollback: Cancels orders that were part of a failed batch."""
+        if not order_ids: return
         logger.warning(f"⚠️ Rolling back {len(order_ids)} partial orders...")
-        
-        # [span_2](start_span)Create cancel tasks for all successful IDs using[span_2](end_span) /v2/order/cancel
         tasks = [self.api.cancel_order(oid) for oid in order_ids]
-        
-        # Execute all cancels concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Audit the rollback results
         for oid, res in zip(order_ids, results):
             if res is True:
                 logger.info(f"✔ Rollback: Cancelled {oid}")
@@ -115,7 +103,6 @@ class LiveOrderExecutor:
     async def _place_gtt_batch(self, trade: MultiLegTrade) -> bool:
         gtt_ids = []
         for leg in trade.legs:
-            # Calculate Trigger based on direction
             trigger_offset = 0.05
             if leg.quantity > 0:
                 trigger_price = leg.entry_price * (1 + trigger_offset)
@@ -125,11 +112,9 @@ class LiveOrderExecutor:
                 trigger_type = "BELOW"
 
             oid = await self.place_gtt_order(leg, trigger_price, trigger_type)
-            
             if not oid:
                 logger.error("❌ GTT Batch Failed (Partial). Manual check needed.")
                 return False
-            
             gtt_ids.append(oid)
         
         trade.gtt_order_ids = gtt_ids
@@ -137,16 +122,14 @@ class LiveOrderExecutor:
 
     async def place_gtt_order(self, leg: Position, trigger_price: float, trigger_type: str = "ABOVE") -> Optional[str]:
         """
-        FIXED: Strictly compliant with Upstox GttPlaceOrderRequest Schema.
+        FIXED: Matches GttPlaceOrderRequest Schema.
         Removes invalid fields (order_type, price, validity) that cause 400 errors.
         """
-        [span_3](start_span)# Schema: GttPlaceOrderRequest
         payload = {
             "type": "SINGLE",
             "quantity": abs(leg.quantity),
             "product": "D",  # GTT is typically Delivery
             "rules": [{
-                # Schema: GttRule
                 "strategy": "ENTRY",
                 "trigger_type": trigger_type,
                 "trigger_price": float(trigger_price),
@@ -154,7 +137,6 @@ class LiveOrderExecutor:
             }],
             "instrument_token": leg.instrument_key,
             "transaction_type": "BUY" if leg.quantity > 0 else "SELL"
-            # REMOVED: order_type, price, validity, disclosed_quantity (Not in Schema)
         }
 
         try:
@@ -162,15 +144,51 @@ class LiveOrderExecutor:
             response = await self.api._request_with_retry("POST", url, json=payload)
 
             if response.get("status") == "success":
-                # Schema: GttTriggerOrderResponse -> GttOrderData
                 return response.get("data", {}).get("gtt_order_ids", [])[0]
             
             logger.error(f"GTT Failed: {response}")
             return None
-
         except Exception as e:
             logger.error(f"GTT Exception: {e}")
             return None
+
+    async def monitor_gtt_oco(self, trade: MultiLegTrade):
+        """
+        The 'Janitor': Monitors GTT legs. If one fires, cancels the other(s).
+        Crucial for preventing double exposure.
+        """
+        logger.info(f"👀 GTT Janitor started for {trade.id}")
+        active_ids = set(trade.gtt_order_ids)
+        
+        # Monitor while the trade is technically "OPEN" and we have active GTTs
+        while active_ids and trade.status == "OPEN":
+            triggered_any = False
+            for gtt_id in list(active_ids):
+                try:
+                    # Fetch details
+                    details = await self.api.get_order_details(gtt_id)
+                    data = details.get("data", [])
+                    if not data: continue
+                    
+                    # Check status
+                    status = str(data[0].get("status", "")).upper()
+                    if status in ["TRIGGERED", "FILLED", "COMPLETE"]:
+                        logger.info(f"⚡ GTT {gtt_id} Triggered! Cancelling siblings...")
+                        active_ids.remove(gtt_id)
+                        triggered_any = True
+                        break # Break to cancel others
+                except Exception as e:
+                    logger.debug(f"GTT Monitor error: {e}")
+            
+            if triggered_any:
+                # Cancel all remaining active GTTs for this trade
+                cancel_tasks = [self.api.cancel_order(oid) for oid in active_ids]
+                if cancel_tasks:
+                    await asyncio.gather(*cancel_tasks)
+                logger.info(f"✔ GTT OCO Cleanup Complete for {trade.id}")
+                return # Exit task
+
+            await asyncio.sleep(5)
 
     async def verify_fills(self, trade: MultiLegTrade, timeout=30) -> bool:
         if settings.SAFETY_MODE != "live":
@@ -180,13 +198,26 @@ class LiveOrderExecutor:
         while (asyncio.get_event_loop().time() - start_time) < timeout:
             all_filled = True
             
-            for oid in trade.gtt_order_ids:
+            # Check GTTs or Standard Orders (reusing gtt_order_ids field for IDs)
+            for idx, oid in enumerate(trade.gtt_order_ids):
                 try:
-                    #[span_3](end_span) Endpoint: /v2/order/details
                     details = await self.api.get_order_details(oid)
                     data = details.get("data", [])
-                    # Check status in list (Upstox returns list for history/details)
-                    if not data or str(data[0].get("status", "")).lower() != "complete":
+                    if not data:
+                        all_filled = False
+                        break
+                    
+                    order_data = data[0]
+                    status = str(order_data.get("status", "")).lower()
+                    
+                    if status == "complete":
+                        # CRITICAL FIX: Update entry price with ACTUAL execution price
+                        avg_price = float(order_data.get("average_price", 0.0))
+                        if avg_price > 0:
+                            if hasattr(trade.legs[idx], 'entry_price'):
+                                trade.legs[idx].entry_price = avg_price
+                                logger.info(f"💲 Price Corrected: Leg {idx} filled at {avg_price}")
+                    else:
                         all_filled = False
                         break
                 except:
@@ -194,7 +225,7 @@ class LiveOrderExecutor:
                     break
             
             if all_filled:
-                logger.info(f"✅ All {len(trade.gtt_order_ids)} legs filled")
+                logger.info(f"✅ All legs filled & prices updated")
                 return True
             
             await asyncio.sleep(2)
@@ -209,10 +240,7 @@ class LiveOrderExecutor:
 
         orders_payload = []
         for idx, leg in enumerate(trade.legs):
-            # Reverse direction for exit
             reversed_qty = leg.quantity * -1
-            
-            [span_4](start_span)#[span_4](end_span) Schema: MultiOrderRequest
             orders_payload.append({
                 "instrument_token": leg.instrument_key,
                 "transaction_type": "BUY" if reversed_qty > 0 else "SELL",
@@ -226,7 +254,7 @@ class LiveOrderExecutor:
                 "is_amo": False,
                 "slice": False,
                 "correlation_id": f"CLOSE-LEG{idx}-{trade.id[:10]}",
-                "tag": "VG19-EXIT"
+                "tag": f"VG19-EXIT-{trade.id}"
             })
 
         try:
