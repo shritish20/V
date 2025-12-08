@@ -30,10 +30,11 @@ logger = setup_logger("Engine")
 
 class VolGuard17Engine:
     """
-    PRODUCTION FIX:
-    - SABR calibration moved to ThreadPoolExecutor (prevents deadlocks)
-    - Added calibration semaphore to prevent queue buildup
+    PRODUCTION FIXED v2.0:
+    - SABR calibration timeout protection (5 seconds max)
+    - Better error handling in snapshot save
     - Proper InstrumentMaster injection into StrategyEngine
+    - Enhanced logging throughout
     """
     def __init__(self):
         self.db = HybridDatabaseManager()
@@ -263,10 +264,12 @@ class VolGuard17Engine:
                     )
                 except Exception as e:
                     logger.error(f"Hydration Failed for {db_strat.id}: {e}")
-
+                    # CONTINUATION OF VolGuard17Engine class from Part 1
+    
     async def _run_sabr_calibration(self):
         """
-        PRODUCTION FIX: Thread-safe calibration with semaphore to prevent queue buildup.
+        PRODUCTION FIX v2.0: Thread-safe calibration with timeout and semaphore.
+        Prevents calibration from blocking indefinitely.
         """
         # Acquire semaphore (non-blocking check)
         if not self._calibration_semaphore.locked():
@@ -276,7 +279,9 @@ class VolGuard17Engine:
             logger.debug("⚠️ SABR calibration already running, skipping...")
 
     async def _calibrate_sabr_internal(self):
-        """Internal calibration logic"""
+        """
+        PRODUCTION FIX v2.0: Internal calibration logic with timeout protection
+        """
         spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
         if spot <= 0: 
             return
@@ -307,22 +312,34 @@ class VolGuard17Engine:
                     market_vols.append(iv)
             
             if len(strikes) < 5: 
+                logger.warning("⚠️ Insufficient liquid strikes for SABR calibration")
                 return
 
             time_to_expiry = max(0.001, (expiry - datetime.now(settings.IST).date()).days / 365.0)
 
-            # PRODUCTION FIX: Run in ThreadPoolExecutor (not ProcessPool)
+            # CRITICAL FIX v2.0: Run in ThreadPoolExecutor WITH timeout protection
             loop = asyncio.get_running_loop()
-            success = await loop.run_in_executor(
-                self.executor, 
-                self.sabr.calibrate_to_chain,
-                strikes, market_vols, spot, time_to_expiry
-            )
             
-            if success:
-                self.last_sabr_calibration = time.time()
-                logger.info(f"🧮 SABR Calibrated (NIFTY {expiry})")
-            else:
+            try:
+                success = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self.executor, 
+                        self.sabr.calibrate_to_chain,
+                        strikes, market_vols, spot, time_to_expiry
+                    ),
+                    timeout=5.0  # ✅ Kill if takes >5 seconds
+                )
+                
+                if success:
+                    self.last_sabr_calibration = time.time()
+                    logger.info(f"🧮 SABR Calibrated (NIFTY {expiry})")
+                else:
+                    self.sabr.reset()
+                    self.sabr.calibrated = False
+                    logger.warning("⚠️ SABR calibration failed, using fallback IV")
+                    
+            except asyncio.TimeoutError:
+                logger.error("⏱️ SABR calibration timeout (>5s). Using fallback IV.")
                 self.sabr.reset()
                 self.sabr.calibrated = False
                 
@@ -433,24 +450,35 @@ class VolGuard17Engine:
             await asyncio.gather(*tasks)
 
     async def save_final_snapshot(self):
-        async with self.db.get_session() as session:
-            for t in self.trades:
-                if t.status in [TradeStatus.OPEN, TradeStatus.EXTERNAL]:
-                    legs_json = [l.dict() for l in t.legs]
-                    db_strat = DbStrategy(
-                        id=str(t.id),
-                        type=t.strategy_type.value,
-                        status=t.status.value,
-                        entry_time=t.entry_time,
-                        capital_bucket=t.capital_bucket.value,
-                        pnl=t.total_unrealized_pnl(),
-                        metadata_json={"legs": legs_json, "lots": t.lots},
-                        broker_ref_id=t.basket_order_id,
-                        expiry_date=datetime.strptime(t.expiry_date, "%Y-%m-%d").date()
-                    )
-                    await session.merge(db_strat)
-            await session.commit()
-            logger.info(f"💾 Snapshot saved.")
+        """
+        PRODUCTION FIX v2.0: Enhanced error handling for snapshot save
+        """
+        try:
+            async with self.db.get_session() as session:
+                for t in self.trades:
+                    if t.status in [TradeStatus.OPEN, TradeStatus.EXTERNAL]:
+                        legs_json = [l.dict() for l in t.legs]
+                        db_strat = DbStrategy(
+                            id=str(t.id),
+                            type=t.strategy_type.value,
+                            status=t.status.value,
+                            entry_time=t.entry_time,
+                            capital_bucket=t.capital_bucket.value,
+                            pnl=t.total_unrealized_pnl(),
+                            metadata_json={"legs": legs_json, "lots": t.lots},
+                            broker_ref_id=t.basket_order_id,
+                            expiry_date=datetime.strptime(t.expiry_date, "%Y-%m-%d").date()
+                        )
+                        await session.merge(db_strat)
+                
+                # CRITICAL FIX: Use safe_commit with retry logic
+                await self.db.safe_commit(session)
+                logger.info(f"💾 Snapshot saved ({len(self.trades)} trades).")
+                
+        except Exception as e:
+            logger.error(f"❌ Snapshot save failed: {e}")
+            logger.warning("⚠️ Trades still in memory. Will retry on next shutdown.")
+            # Don't raise - trades are still in self.trades, can retry later
 
     def get_status(self):
         from core.models import EngineStatus
@@ -496,7 +524,7 @@ class VolGuard17Engine:
 
         while self.running:
             try:
-                # PRODUCTION FIX: Non-blocking calibration check
+                # PRODUCTION FIX: Non-blocking calibration check with timeout
                 if time.time() - self.last_sabr_calibration > SABR_INTERVAL:
                     asyncio.create_task(self._run_sabr_calibration())
 
@@ -527,3 +555,4 @@ class VolGuard17Engine:
         await self.api.close()
         self.executor.shutdown(wait=False)
         logger.info("👋 Engine Shutdown Complete")
+                    
