@@ -1,67 +1,79 @@
 import aiohttp
+import logging
 from typing import Tuple, Optional, Dict, List, Any
 from core.models import MultiLegTrade
 from core.config import settings
-from utils.logger import get_logger
-from trading.api_client import EnhancedUpstoxAPI # CRITICAL IMPORT
+from trading.api_client import EnhancedUpstoxAPI
 
-logger = get_logger("MarginGuard")
+logger = logging.getLogger("MarginGuard")
 
 class MarginGuard:
     """
-    FIXED: Consolidated Margin Guard.
-    - Uses VIX-aware fallback.
-    - Delegates network calls to the resilient EnhancedUpstoxAPI.
+    Production Margin Guard.
+    - Handles Upstox Maintenance Mode (Error 423) gracefully.
+    - Uses safe fallbacks during off-hours (12 AM - 5:30 AM) or API outages.
     """
     
-    def __init__(self, api_client: EnhancedUpstoxAPI): # Requires API client injection
+    def __init__(self, api_client: EnhancedUpstoxAPI): 
         self.api = api_client
         self.available_margin = None 
         self.default_vix_safety = 25.0 
 
     async def is_margin_ok(self, trade: MultiLegTrade, current_vix: Optional[float] = None) -> Tuple[bool, float]:
         """
-        Check if sufficient margin is available using Upstox API with VIX-aware fallback.
+        Check margin with automatic fallback for API downtime/maintenance.
         """
         try:
-            # 1. Build Schema-Compliant Payload (MarginRequest)
+            # 1. Build Payload
             instruments_payload = []
             for leg in trade.legs:
                 instruments_payload.append({
                     "instrument_key": leg.instrument_key,
                     "quantity": abs(leg.quantity),
                     "transaction_type": "BUY" if leg.quantity > 0 else "SELL",
-                    "product": "I", # Intraday
+                    "product": "I", 
                     "price": float(leg.entry_price) if leg.entry_price > 0 else 0.0
                 })
 
-            # 2. Get Required Margin via resilient API client
+            # 2. Get Required Margin
             res_margin = await self.api.get_margin(instruments_payload)
             
-            if res_margin.get("status") != "success":
-                logger.error(f"Margin calculation failed: {res_margin.get('message', 'Unknown Error')}")
+            # --- HANDLE UPSTOX OFF-HOURS (Error 423) ---
+            # Upstox sends 423 or error code UDAPI100072 during maintenance
+            if res_margin.get("code") == 423 or "UDAPI100072" in str(res_margin):
+                if settings.SAFETY_MODE == "live":
+                    logger.debug("🌙 Upstox Funds API sleeping (Maintenance). Using fallback.")
                 return await self._fallback_margin_check(trade, current_vix)
 
-            # Extract required margin (Schema: MarginData)
+            if res_margin.get("status") != "success":
+                logger.error(f"Margin API Error: {res_margin.get('message', 'Unknown')}")
+                return await self._fallback_margin_check(trade, current_vix)
+
             margin_data = res_margin.get("data", {})
             required_margin = margin_data.get("required_margin", 0.0)
 
-            # 3. Get Available Funds via resilient API client
+            # 3. Get Available Funds
             funds = await self.api.get_funds()
-            available = funds.get("available_margin")
+            
+            # --- HANDLE UPSTOX OFF-HOURS FOR FUNDS ---
+            if funds.get("code") == 423 or "UDAPI100072" in str(funds):
+                available = self.available_margin if self.available_margin else (settings.ACCOUNT_SIZE * 0.40)
+            else:
+                available = funds.get("available_margin")
 
             if available is None:
-                # Use cached margin if available, else conservative 40% of settings.ACCOUNT_SIZE
                 available = self.available_margin if self.available_margin else (settings.ACCOUNT_SIZE * 0.40)
-                logger.warning(f"Live funds fetch failed. Using available estimate: {available:,.0f}")
+                # Log warning only if we expected live data but failed
+                if settings.SAFETY_MODE == "live" and not (funds.get("code") == 423):
+                    logger.warning(f"Live funds fetch failed. Using est: {available:,.0f}")
 
             # 4. Validation
-            required_with_buffer = required_margin * 1.05 # 5% buffer
+            required_with_buffer = required_margin * 1.05 
             is_sufficient = available >= required_with_buffer
-
+            
             if not is_sufficient:
-                logger.warning(f"❌ Margin Shortfall: Req={required_with_buffer:,.0f}, Avail={available:,.0f}")
-
+                logger.warning(f"🚫 Margin Shortfall: Req={required_with_buffer:,.0f}, Avail={available:,.0f}")
+            
             return is_sufficient, required_margin
 
         except Exception as e:
@@ -70,61 +82,45 @@ class MarginGuard:
 
     async def _fallback_margin_check(self, trade: MultiLegTrade, current_vix: Optional[float] = None) -> Tuple[bool, float]:
         """
-        CRITICAL FIX: VIX-aware conservative fallback margin calculation.
+        Conservative estimation logic when API is down or sleeping.
         """
         try:
             vix = current_vix if current_vix is not None else self.default_vix_safety
             
-            if vix < 15:
-                margin_multiplier = 0.20
-            elif vix < 20:
-                margin_multiplier = 0.25
-            elif vix < 30:
-                margin_multiplier = 0.35
-            else:
-                margin_multiplier = 0.50
+            # VIX-based margin multiplier (Higher VIX = Higher Margin req)
+            if vix < 15: margin_multiplier = 0.20
+            elif vix < 20: margin_multiplier = 0.25
+            elif vix < 30: margin_multiplier = 0.35
+            else: margin_multiplier = 0.50
 
             estimated_margin = 0.0
-
             for leg in trade.legs:
                 quantity = abs(leg.quantity)
-                
-                if leg.quantity > 0: # BUY Leg: Risk limited to premium paid
+                if leg.quantity > 0: 
+                    # BUY: Full premium
                     estimated_margin += quantity * leg.entry_price
                 else:
-                    # SELL Leg: Use Strike Price * Qty (Contract Value) * Multiplier
+                    # SELL: Estimate based on strike
                     ref_price = getattr(leg, 'strike', 0)
-                    if ref_price <= 0:
-                        ref_price = 24000.0 # Safety reference for underlying
-                        logger.warning("Leg missing strike price for fallback. Using safety ref.")
-                    
-                    leg_margin = (quantity * ref_price) * margin_multiplier
-                    estimated_margin += leg_margin
+                    if ref_price <= 0: ref_price = 24000.0 
+                    estimated_margin += (quantity * ref_price) * margin_multiplier
 
-            estimated_margin += settings.ACCOUNT_SIZE * 0.05 # Add buffer
+            estimated_margin += settings.ACCOUNT_SIZE * 0.05 # Add 5% buffer
 
-            # Use cached margin if available, else conservative 40%
+            # Conservative Available Margin
             available = self.available_margin if self.available_margin else (settings.ACCOUNT_SIZE * 0.40)
-
+            
             is_sufficient = available >= estimated_margin
-
-            logger.warning(
-                f"⚠ API DOWN. Using FALLBACK Logic (VIX={vix:.1f}, Mult={margin_multiplier}): "
-                f"Est.Req={estimated_margin:,.0f}, Est.Avail={available:,.0f}"
-            )
-
             return is_sufficient, estimated_margin
 
         except Exception as e:
-            logger.critical(f"Fallback margin check crashed: {e}")
+            logger.critical(f"Fallback math crashed: {e}")
             return False, float('inf')
 
     async def refresh_available_margin(self):
-        """
-        Manually refresh available margin (call periodically)
-        """
+        """Update cached margin when API is awake"""
         funds = await self.api.get_funds()
-        self.available_margin = funds.get("available_margin")
-        
-        if self.available_margin is not None:
-            logger.debug(f"Available margin refreshed: ₹{self.available_margin:,.0f}")
+        if funds.get("status") == "success":
+            val = funds.get("data", {}).get("available_margin")
+            if val:
+                self.available_margin = val
