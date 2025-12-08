@@ -7,15 +7,17 @@ from typing import Dict, Optional, Set
 from datetime import datetime
 
 import upstox_client
+from upstox_client import MarketDataStreamerV3
 
 from core.config import settings
 
 logger = logging.getLogger("LiveFeed")
 
+
 class LiveDataFeed:
     """
-    Upstox V3 WebSocket Feed using MarketDataStreamerV3.
-    Fully compatible with your engine.
+    Upstox V3 MarketDataStreamer Feed (LTPC Mode)
+    Fully compatible with VolGuard 19 Engine
     """
 
     def __init__(self, rt_quotes: Dict[str, float], greeks_cache: Dict, sabr_model):
@@ -24,48 +26,82 @@ class LiveDataFeed:
         self.sabr_model = sabr_model
 
         self.token = settings.UPSTOX_ACCESS_TOKEN
+
+        # Default subscriptions (Index + VIX)
         self.sub_list: Set[str] = {
             settings.MARKET_KEY_INDEX,
             settings.MARKET_KEY_VIX
         }
 
-        self.streamer: Optional[upstox_client.MarketDataStreamerV3] = None
+        self.streamer: Optional[MarketDataStreamerV3] = None
         self.feed_thread: Optional[Thread] = None
         self.stop_event = Event()
         self.is_connected = False
 
         self.last_tick_time = time.time()
+
         self._restart_lock = asyncio.Lock()
         self._thread_starting = False
-        self._reconnect_attempts = 0
-        self._max_backoff = 300  # 5 mins max
 
-    # ------------------------------------------------------------
-    # TOKEN UPDATE
-    # ------------------------------------------------------------
+        # Exponential backoff
+        self._reconnect_attempts = 0
+        self._max_backoff = 300  # 5 minutes max
+
+    # ---------------------------------------------------------------------
+    # REQUIRED BY ENGINE — dynamic strike subscriptions
+    # ---------------------------------------------------------------------
+    def subscribe_instrument(self, key: str):
+        """
+        Dynamically subscribe to new strikes (ATM Call, ATM Put, Hedges)
+        """
+        if not key:
+            return
+
+        if key in self.sub_list:
+            return
+
+        self.sub_list.add(key)
+
+        # If connected, subscribe instantly
+        if self.is_connected and self.streamer:
+            try:
+                self.streamer.subscribe([key], "ltpc")
+                logger.info(f"📡 Subscribed new instrument: {key}")
+            except Exception as e:
+                logger.error(f"Subscription failed for {key}: {e}")
+
+    # ---------------------------------------------------------------------
+    # TOKEN ROTATION
+    # ---------------------------------------------------------------------
     def update_token(self, new_token: str):
         if new_token == self.token:
             return
-        logger.info("🔄 Rotating Access Token for WebSocket...")
+        logger.info("🔄 Rotating Access Token for WebSocket Feed…")
         self.token = new_token
         self.disconnect()
 
-    # ------------------------------------------------------------
-    # CALLBACKS (V3 requires correct signatures)
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # WEBSOCKET CALLBACKS (Correct Signature)
+    # ---------------------------------------------------------------------
     def _on_open(self):
-        logger.info("🔌 WS Open → Subscribing instruments...")
+        logger.info("🔌 WebSocket Open — subscribing instruments...")
         try:
             self.streamer.subscribe(list(self.sub_list), "ltpc")
         except Exception as e:
-            logger.error(f"Subscribe error: {e}")
+            logger.error(f"Subscribe error on open: {e}")
 
     def _on_message(self, message):
-        """Handles every incoming WebSocket tick."""
+        """
+        Expected message format:
+        {
+            "feeds": {
+                "NSE_INDEX|Nifty 50": { "ltpc": { "ltp": 22222.0 } },
+                ...
+            }
+        }
+        """
         self.is_connected = True
         self.last_tick_time = time.time()
-
-        # reset reconnect counter
         self._reconnect_attempts = 0
 
         try:
@@ -79,7 +115,7 @@ class LiveDataFeed:
                         self.rt_quotes[key] = float(ltp)
 
         except Exception as e:
-            logger.debug(f"Data parse error: {e}")
+            logger.debug(f"Tick parse error: {e}")
 
     def _on_error(self, ws, error):
         logger.error(f"WS Error: {error}")
@@ -89,25 +125,25 @@ class LiveDataFeed:
         logger.warning(f"WS Closed → code={code}, reason={reason}")
         self.is_connected = False
 
-    # ------------------------------------------------------------
-    # THREAD LAUNCHER
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # THREAD — CONNECT THE WEBSOCKET
+    # ---------------------------------------------------------------------
     def _run_feed_process(self):
         try:
-            configuration = upstox_client.Configuration()
-            configuration.access_token = self.token
+            config = upstox_client.Configuration()
+            config.access_token = self.token
 
-            self.streamer = upstox_client.MarketDataStreamerV3(
-                upstox_client.ApiClient(configuration)
+            self.streamer = MarketDataStreamerV3(
+                upstox_client.ApiClient(config)
             )
 
-            # correct event bindings
+            # Attach correct event handlers
             self.streamer.on("open", self._on_open)
             self.streamer.on("message", self._on_message)
             self.streamer.on("error", self._on_error)
             self.streamer.on("close", self._on_close)
 
-            logger.info("🔌 Connecting to Upstox V3 WebSocket...")
+            logger.info("🔌 Connecting to Upstox V3 WebSocket (LTPC Mode)…")
             self.streamer.connect()
 
         except Exception as e:
@@ -118,9 +154,9 @@ class LiveDataFeed:
             self.is_connected = False
             self._thread_starting = False
 
-    # ------------------------------------------------------------
-    # THREAD SUPERVISOR
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------------
+    # THREAD SUPERVISOR + BACKOFF
+    # ---------------------------------------------------------------------
     async def _ensure_thread_running(self):
 
         if self.feed_thread and self.feed_thread.is_alive() and not self._thread_starting:
@@ -136,17 +172,18 @@ class LiveDataFeed:
                     await asyncio.sleep(0.5)
                 return
 
+            # Backoff
             if self._reconnect_attempts > 0:
                 backoff = min(2 ** self._reconnect_attempts, self._max_backoff)
-                logger.info(f"🔄 Backoff {backoff}s (attempt={self._reconnect_attempts})")
+                logger.info(f"⏳ Backoff {backoff}s (attempt {self._reconnect_attempts})")
                 await asyncio.sleep(backoff)
 
             self._thread_starting = True
 
-            # kill old streamer
+            # Kill old WS
             self.disconnect()
 
-            logger.info("🚀 Starting websocket thread...")
+            logger.info("🚀 Launching WebSocket thread…")
             self.feed_thread = Thread(
                 target=self._run_feed_process,
                 daemon=True,
@@ -154,7 +191,7 @@ class LiveDataFeed:
             )
             self.feed_thread.start()
 
-            # wait for connection
+            # Wait for connection
             for _ in range(20):
                 await asyncio.sleep(0.5)
                 if self.is_connected:
@@ -164,26 +201,26 @@ class LiveDataFeed:
                 if not self.feed_thread.is_alive():
                     logger.error("❌ Thread died instantly")
                     self._reconnect_attempts += 1
-                    self._thread_starting = False
                     break
 
             self._thread_starting = False
 
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------------
     # PUBLIC API
-    # ------------------------------------------------------------
+    # ---------------------------------------------------------------------
     async def start(self):
-        """Main supervisor loop"""
-        self.stop_event.clear()
         logger.info("🚀 Live Data Feed Supervisor Started")
+
+        self.stop_event.clear()
+        self.last_tick_time = time.time()
 
         while not self.stop_event.is_set():
             try:
                 await self._ensure_thread_running()
 
-                # watchdog: if no tick for 60 seconds
+                # Watchdog — if stalled for 60s
                 if time.time() - self.last_tick_time > 60 and self.is_connected:
-                    logger.warning("⚠️ WebSocket stalled → Restarting...")
+                    logger.warning("⚠️ Feed stalled — restarting WebSocket…")
                     self.disconnect()
                     self._reconnect_attempts += 1
 
@@ -194,6 +231,7 @@ class LiveDataFeed:
             await asyncio.sleep(5)
 
     async def stop(self):
+        logger.info("🛑 Stopping WebSocket Feed…")
         self.stop_event.set()
         self.disconnect()
         await asyncio.sleep(1)
