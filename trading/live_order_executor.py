@@ -9,8 +9,8 @@ logger = logging.getLogger("OrderExec")
 
 class LiveOrderExecutor:
     """
-    PRODUCTION FIXED v2.0:
-    - Complete GTT payload with all required fields per Upstox schema
+    PRODUCTION FIXED v2.1:
+    - Schema-Compliant GTT payload (removed invalid top-level fields)
     - Uses metadata.summary for more reliable atomic validation
     - Enhanced error messages
     - Proper freeze quantity validation
@@ -158,23 +158,17 @@ class LiveOrderExecutor:
     async def place_gtt_order(self, leg: Position, trigger_price: float, 
                              trigger_type: str = "ABOVE") -> Optional[str]:
         """
-        PRODUCTION FIX v2.0: Complete GTT order payload per Upstox OpenAPI schema.
-        Schema: /v3/order/gtt/place
-        
-        FIXED: Added all required fields that were previously missing:
-        - order_type (LIMIT)
-        - price (trigger price)
-        - validity (DAY)
-        - disclosed_quantity (0)
+        PRODUCTION FIX v2.1: Schema-Compliant GTT Payload
+        Removes invalid top-level fields. Relies on 'rules' for execution logic.
         """
         if settings.SAFETY_MODE != "live":
             return f"SIM-GTT-{int(asyncio.get_event_loop().time())}"
         
-        # CRITICAL FIX: Complete payload per Upstox schema
+        # CORRECTED PAYLOAD based on Schema
         payload = {
             "type": "SINGLE",
             "quantity": abs(leg.quantity),
-            "product": "D",  # Delivery for GTT (can hold overnight)
+            "product": "D",  # GTT is usually Delivery
             "rules": [{
                 "strategy": "ENTRY",
                 "trigger_type": trigger_type,
@@ -182,13 +176,8 @@ class LiveOrderExecutor:
                 "trailing_gap": 0.0
             }],
             "instrument_token": leg.instrument_key,
-            "transaction_type": "BUY" if leg.quantity > 0 else "SELL",
-            
-            # CRITICAL FIX: Add missing required fields
-            "order_type": "LIMIT",  # ← Was missing
-            "price": float(trigger_price),  # ← Was missing
-            "validity": "DAY",  # ← Was missing
-            "disclosed_quantity": 0  # ← Was missing
+            "transaction_type": "BUY" if leg.quantity > 0 else "SELL"
+            # REMOVED: order_type, price, validity, disclosed_quantity (Not in Schema)
         }
         
         try:
