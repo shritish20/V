@@ -18,8 +18,11 @@ CACHE_FILE = DATA_DIR / "instruments_lite.csv"
 
 class InstrumentMaster:
     """
-    FIXED: Implemented Stale Cache Recovery mechanism.
-    FIXED: Properly deletes stale cache files to prevent infinite loops.
+    PRODUCTION FIXED v2.0:
+    - Prevents infinite loop when cache is stale
+    - Properly deletes expired cache files
+    - Better validation logic
+    - Cleaner error handling
     """
     def __init__(self):
         self.df: Optional[pd.DataFrame] = None
@@ -36,14 +39,20 @@ class InstrumentMaster:
 
     async def download_and_load(self):
         """
-        Tries to load fresh data. Fallbacks to stale data if download fails.
+        PRODUCTION FIX v2.0: Prevents infinite loop and handles stale cache properly.
         """
         # 1. Try loading local cache
-        if self._load_from_cache():
+        cache_result = self._load_from_cache()
+        
+        if cache_result == "FRESH":
             logger.info("🚀 Instrument Master loaded from local cache (Fresh)")
             return
+        elif cache_result == "STALE":
+            logger.info("📦 Cache exists but stale. Keeping memory backup before download.")
+            # Stale cache is now in self._stale_cache as backup
+        # elif cache_result == "MISSING": pass through to download
 
-        # 2. If we are here, cache is missing or stale. Attempt download.
+        # 2. Attempt download
         logger.info("🌐 Downloading Instrument Master from Upstox...")
         try:
             await self._download_and_process()
@@ -59,7 +68,7 @@ class InstrumentMaster:
                 self._post_load_processing()
                 return
 
-            # 4. Last Resort: Try reading file again if logic skipped _stale_cache population
+            # 4. Last Resort: Check if file exists on disk (might have been created between steps)
             if CACHE_FILE.exists():
                 logger.warning("⚠️ Using STALE local file due to download failure.")
                 try:
@@ -71,13 +80,17 @@ class InstrumentMaster:
             else:
                 raise RuntimeError("Critical: No instruments available (No Cache + Download Failed).") from e
 
-    def _load_from_cache(self) -> bool:
+    def _load_from_cache(self) -> str:
         """
-        FIXED: Checks cache validity. If stale, loads it into memory backup before returning False.
-        Now properly deletes expired cache files to prevent infinite loops.
+        PRODUCTION FIX v2.0: Returns status string to prevent infinite loops.
+        
+        Returns:
+            "FRESH": Cache is valid and loaded
+            "STALE": Cache exists but old (saved to memory backup)
+            "MISSING": No cache exists
         """
         if not CACHE_FILE.exists():
-            return False
+            return "MISSING"
 
         try:
             mtime = datetime.fromtimestamp(CACHE_FILE.stat().st_mtime).date()
@@ -87,18 +100,18 @@ class InstrumentMaster:
             required_cols = {'instrument_key', 'name', 'strike', 'option_type', 'expiry', 'instrument_type'}
             if not required_cols.issubset(df.columns):
                 logger.error("❌ Cache corrupted: Missing columns")
-                CACHE_FILE.unlink()
-                return False
+                self._safe_delete_cache()
+                return "MISSING"
                 
             if len(df) < 100:
                 logger.error("❌ Cache corrupted: File too small")
-                CACHE_FILE.unlink()
-                return False
+                self._safe_delete_cache()
+                return "MISSING"
 
             if df['strike'].min() < 100 or df['strike'].max() > 200000:
                 logger.error("❌ Cache corrupted: Strike prices out of bounds")
-                CACHE_FILE.unlink()
-                return False
+                self._safe_delete_cache()
+                return "MISSING"
 
             # CRITICAL FIX: Check for Future Expiries (validity check)
             temp_expiry = pd.to_datetime(df['expiry'], errors='coerce').dt.date
@@ -106,32 +119,34 @@ class InstrumentMaster:
             
             if not temp_expiry[temp_expiry >= today].any():
                 logger.error("❌ Cache Useless: All instruments expired. Forcing re-download.")
-                try:
-                    CACHE_FILE.unlink()  # Delete stale file to prevent infinite loops
-                except Exception as unlink_err:
-                    logger.warning(f"Could not delete stale cache: {unlink_err}")
-                return False
+                self._safe_delete_cache()
+                return "MISSING"
 
-            # Cache is valid structure-wise.
-            # If it is old (not today), keep a copy in memory before forcing download.
-            if mtime < date.today():
-                logger.info(f"📦 Cache exists but dated ({mtime}). Keeping memory backup.")
+            # Cache is structurally valid
+            # Check if it's fresh (today) or stale (older)
+            if mtime < today:
+                logger.info(f"📦 Cache dated ({mtime}). Saving to memory backup before refresh.")
                 self._stale_cache = df.copy()  # Save for emergency
-                return False  # Return False to trigger download
+                return "STALE"  # ← CRITICAL FIX: Return string instead of False
 
-            # If fresh (today), use it
+            # Cache is fresh (today)
             self.df = df
             self._post_load_processing()
-            return True
+            return "FRESH"
             
         except Exception as e:
             logger.warning(f"Cache load failed: {e}")
+            self._safe_delete_cache()
+            return "MISSING"
+
+    def _safe_delete_cache(self):
+        """Helper to safely delete cache file"""
+        try:
             if CACHE_FILE.exists():
-                try: 
-                    CACHE_FILE.unlink()
-                except: 
-                    pass
-            return False
+                CACHE_FILE.unlink()
+                logger.debug("🗑️ Deleted stale/corrupt cache file")
+        except Exception as e:
+            logger.warning(f"Could not delete cache: {e}")
 
     async def _download_and_process(self):
         async with aiohttp.ClientSession() as session:
@@ -174,6 +189,8 @@ class InstrumentMaster:
         self._cache_index_fut.clear()
         self._cache_options.clear()
         self.last_updated = datetime.now()
+        
+        logger.debug(f"📊 Loaded {len(self.df)} NIFTY/BANKNIFTY/FINNIFTY contracts")
 
     def get_current_future(self, symbol: str = "NIFTY") -> Optional[str]:
         if self.df is None or self.df.empty: 
