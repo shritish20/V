@@ -122,7 +122,8 @@ class Settings(BaseSettings):
     GREEK_TOLERANCE_PCT: float = 15.0
 
     MARKET_KEY_INDEX: str = "NSE_INDEX|Nifty 50"
-    MARKET_KEY_VIX: str = "INDICES|INDIA VIX"
+    MARKET_KEY_VIX: str = "NSE_INDEX|India VIX"
+
 
     MARKET_OPEN_TIME: dtime = dtime(9, 15)
     MARKET_CLOSE_TIME: dtime = dtime(15, 30)
