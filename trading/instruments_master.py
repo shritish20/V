@@ -113,14 +113,15 @@ class InstrumentMaster:
         df = pd.DataFrame(data)
 
         # --- FILTERING LOGIC ---
-        # 1. Filter for NSE Futures & Options
+        # 1. Filter for NSE Futures & Options OR NSE Indices
+        # VIX is often in "NSE_INDEX" segment or just "NSE_FO" depending on the file
         if 'segment' in df.columns:
-            df = df[df["segment"] == "NSE_FO"]
+            df = df[df["segment"].isin(["NSE_FO", "NSE_INDEX"])]
         elif 'exchange' in df.columns:
-             df = df[df["exchange"] == "NSE_FO"]
+             df = df[df["exchange"].isin(["NSE_FO", "NSE_INDEX"])]
 
         # 2. Filter strictly for NIFTY Index AND INDIA VIX
-        # FIX: Added "INDIA VIX" and "Nifty 50" to the filter mask
+        # CRITICAL FIX: Explicitly include "INDIA VIX"
         mask = (
             (df["underlying_symbol"] == "NIFTY") | 
             (df["name"] == "NIFTY") |
