@@ -28,7 +28,7 @@ class LiveDataFeed:
         self.token = settings.UPSTOX_ACCESS_TOKEN
 
         # Default subscriptions (Index + VIX)
-        # Ensure your config.py has MARKET_KEY_VIX = "NSE_INDEX|India VIX" (or similar)
+        # Assuming MARKET_KEY_VIX is "NSE_INDEX|India VIX" in config.py
         self.sub_list: Set[str] = {
             settings.MARKET_KEY_INDEX,
             settings.MARKET_KEY_VIX
