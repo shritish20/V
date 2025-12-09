@@ -28,7 +28,7 @@ class InstrumentMaster:
     """
     Robust Instrument Master for Render Deployment.
     - Auto-downloads from Upstox (tries multiple mirrors).
-    - Filters strictly for NIFTY 50 (Indices).
+    - Filters for NIFTY 50 and INDIA VIX.
     - Fixes Timezone issues (UTC -> IST).
     """
 
@@ -72,7 +72,12 @@ class InstrumentMaster:
         """Try downloading from multiple URLs until one succeeds."""
         success = False
         
-        async with aiohttp.ClientSession() as session:
+        # FIX: Add User-Agent to prevent 403 Forbidden errors
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
             for url in DOWNLOAD_URLS:
                 try:
                     logger.info(f"🌐 Attempting download from: {url}")
@@ -96,7 +101,7 @@ class InstrumentMaster:
         self._process_json_to_csv()
 
     def _process_json_to_csv(self):
-        """Reads JSON, filters NIFTY, Fixes Timezones, Saves CSV."""
+        """Reads JSON, filters NIFTY/VIX, Fixes Timezones, Saves CSV."""
         logger.info("⚙️ Processing instrument file...")
         
         try:
@@ -109,24 +114,25 @@ class InstrumentMaster:
 
         # --- FILTERING LOGIC ---
         # 1. Filter for NSE Futures & Options
-        # Note: Upstox JSON sometimes uses 'segment' or 'exchange'
         if 'segment' in df.columns:
             df = df[df["segment"] == "NSE_FO"]
         elif 'exchange' in df.columns:
              df = df[df["exchange"] == "NSE_FO"]
 
-        # 2. Filter strictly for NIFTY Index
-        # Usually found in 'underlying_symbol' or 'name'
-        # We check both to be safe
-        mask = (df["underlying_symbol"] == "NIFTY") | (df["name"] == "NIFTY")
+        # 2. Filter strictly for NIFTY Index AND INDIA VIX
+        # FIX: Added "INDIA VIX" and "Nifty 50" to the filter mask
+        mask = (
+            (df["underlying_symbol"] == "NIFTY") | 
+            (df["name"] == "NIFTY") |
+            (df["name"] == "INDIA VIX") | 
+            (df["name"] == "Nifty 50")
+        )
         df = df[mask]
 
         if df.empty:
-            raise RuntimeError("⚠️ Filtered NIFTY instruments are empty! structure changed?")
+            raise RuntimeError("⚠️ Filtered NIFTY/VIX instruments are empty! structure changed?")
 
         # --- TIMEZONE FIX (Critical for Render/Server) ---
-        # Upstox sends expiry in Unix Milliseconds (UTC)
-        # We must convert: UTC timestamp -> Asia/Kolkata Time -> Date
         try:
             # Convert milliseconds to datetime (UTC)
             df["expiry"] = pd.to_datetime(df["expiry"], unit="ms", utc=True)
@@ -135,17 +141,13 @@ class InstrumentMaster:
             ist = pytz.timezone("Asia/Kolkata")
             df["expiry"] = df["expiry"].dt.tz_convert(ist).dt.date
         except Exception as e:
-            logger.error(f"Timezone conversion failed: {e}")
-            # Fallback for simple date strings if format changes
+            # Fallback for simple date strings
             df["expiry"] = pd.to_datetime(df["expiry"]).dt.date
 
-        # Drop invalid rows
-        df = df.dropna(subset=["expiry"])
-        
         # Keep only useful columns to save RAM
         cols_to_keep = [
             "instrument_key", "trading_symbol", "expiry", 
-            "strike_price", "instrument_type", "lot_size", "exchange_token"
+            "strike_price", "instrument_type", "lot_size", "exchange_token", "name"
         ]
         existing_cols = [c for c in cols_to_keep if c in df.columns]
         df = df[existing_cols]
@@ -154,15 +156,15 @@ class InstrumentMaster:
         df.to_csv(CACHE_FILE, index=False)
         self.df = df
         self._post_load_processing()
-        logger.info(f"💾 Saved {len(df)} NIFTY instruments to cache.")
+        logger.info(f"💾 Saved {len(df)} instruments to cache.")
 
     def _post_load_processing(self):
         """Final cleanup after loading data."""
         if self.df is None or self.df.empty:
             raise ValueError("InstrumentMaster loaded empty dataset.")
 
-        # Ensure expiry is valid date object
-        if not isinstance(self.df["expiry"].iloc[0], date):
+        # Ensure expiry is valid date object where applicable
+        if "expiry" in self.df.columns and not self.df["expiry"].isnull().all():
              self.df["expiry"] = pd.to_datetime(self.df["expiry"]).dt.date
 
         self.last_updated = datetime.now()
@@ -184,9 +186,10 @@ class InstrumentMaster:
         if cache_key in self._cache_index_fut:
             return self._cache_index_fut[cache_key]
 
-        # Filter for Futures (instrument_type is 'FUT' or 'FUTIDX')
+        # Filter for Futures
         futs = self.df[
             (self.df["instrument_type"].isin(["FUT", "FUTIDX"])) & 
+            (self.df["name"] == "NIFTY") &
             (self.df["expiry"] >= today)
         ].sort_values("expiry")
 
