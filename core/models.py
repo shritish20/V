@@ -6,34 +6,7 @@ from enum import Enum
 from core.config import settings, IST
 from core.enums import *
 
-# --- MISSING ENUMS & MODELS ---
-
-class OrderStatus(Enum):
-    PENDING = "PENDING"
-    FILLED = "FILLED"
-    REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
-    PARTIAL = "PARTIAL"
-
-class Order(BaseModel):
-    instrument_key: str
-    transaction_type: str  # "BUY" or "SELL"
-    quantity: int = Field(gt=0)
-    order_type: str  # "MARKET", "LIMIT", "SL", "SL-M"
-    product: str  # "I", "D", "CO", "OCO", "MTF"
-    price: float = 0.0
-    trigger_price: float = 0.0
-    validity: str = "DAY"
-    is_amo: bool = False
-    tag: Optional[str] = None
-    
-    # Response fields
-    order_id: Optional[str] = None
-    status: Optional[OrderStatus] = None
-    average_price: Optional[float] = None
-    filled_quantity: Optional[int] = None
-
-# -----------------------------------------
+# ==================== TRADING MODELS ====================
 
 @dataclass
 class GreeksSnapshot:
@@ -49,7 +22,7 @@ class GreeksSnapshot:
 
     def is_stale(self, max_age: float = 30.0) -> bool:
         return (datetime.now(IST) - self.timestamp).total_seconds() > max_age
-    
+
     def to_dict(self) -> Dict[str, float]:
         return {
             'delta': self.delta, 'gamma': self.gamma, 'theta': self.theta,
@@ -61,7 +34,7 @@ class Position(BaseModel):
     symbol: str
     instrument_key: str
     strike: float
-    option_type: str # CE or PE
+    option_type: str  # CE or PE
     quantity: int
     entry_price: float
     entry_time: datetime
@@ -94,22 +67,25 @@ class MultiLegTrade(BaseModel):
     expiry_date: str
     expiry_type: ExpiryType
     capital_bucket: CapitalBucket
+    
+    # Risk Limits
     max_loss_per_lot: float = 0.0
     max_profit_per_lot: float = 0.0
     breakeven_lower: float = 0.0
     breakeven_upper: float = 0.0
     transaction_costs: float = 0.0
+    
+    # Execution Details
     basket_order_id: Optional[str] = None
     gtt_order_ids: List[str] = Field(default_factory=list)
-    
+    id: Optional[str] = None
+    exit_reason: Optional[ExitReason] = None
+
     # Portfolio Greeks
     trade_vega: float = 0.0
     trade_delta: float = 0.0
     trade_theta: float = 0.0
     trade_gamma: float = 0.0
-    
-    id: Optional[str] = None
-    exit_reason: Optional[ExitReason] = None
 
     def total_unrealized_pnl(self) -> float:
         return sum(leg.unrealized_pnl() for leg in self.legs) - self.transaction_costs
@@ -119,18 +95,35 @@ class MultiLegTrade(BaseModel):
         self.trade_gamma = sum((leg.current_greeks.gamma or 0) * leg.quantity for leg in self.legs)
         self.trade_theta = sum((leg.current_greeks.theta or 0) * leg.quantity for leg in self.legs)
         self.trade_vega = sum((leg.current_greeks.vega or 0) * leg.quantity for leg in self.legs)
-        
+
     def calculate_max_loss(self):
         # Placeholder for complex spread calculations
-        self.max_loss_per_lot = self.net_premium_per_share # Simple default
+        self.max_loss_per_lot = self.net_premium_per_share 
 
     def calculate_max_profit(self):
         self.max_profit_per_lot = self.net_premium_per_share
 
     def calculate_breakevens(self):
-        # Simplified default
         self.breakeven_lower = 0.0
         self.breakeven_upper = 0.0
+
+# ==================== TERMINAL / MANUAL REQUEST MODELS ====================
+
+class ManualLegRequest(BaseModel):
+    symbol: str = "NIFTY"
+    strike: float = Field(..., gt=0, description="Strike Price")
+    option_type: str = Field(..., pattern="^(CE|PE)$", description="CE or PE")
+    side: str = Field(..., pattern="^(BUY|SELL)$", description="BUY or SELL")
+    expiry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD")
+    quantity: int = Field(..., gt=0, le=1800, description="Qty per leg (Max 1800 freeze limit)")
+
+class ManualTradeRequest(BaseModel):
+    strategy_name: str = "MANUAL"
+    legs: List[ManualLegRequest]
+    capital_bucket: CapitalBucket = CapitalBucket.INTRADAY # Default to Intraday bucket
+    tag: str = "Discretionary"
+
+# ==================== DATA & STATUS MODELS ====================
 
 @dataclass
 class AdvancedMetrics:
@@ -151,13 +144,12 @@ class AdvancedMetrics:
     sabr_beta: float
     sabr_rho: float
     sabr_nu: float
-    
+
     def dict(self):
         return {k: str(v) if isinstance(v, datetime) else v for k, v in self.__dict__.items()}
 
 @dataclass
 class DashboardData:
-    """Data model for dashboard visualizations"""
     spot_price: float
     vix: float
     pnl: float
@@ -175,7 +167,7 @@ class EngineStatus:
     max_equity: float
     last_metrics: Optional[AdvancedMetrics]
     dashboard_ready: bool
-    
+
     def to_dict(self):
         return {
             "running": self.running,
