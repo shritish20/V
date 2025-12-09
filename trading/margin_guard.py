@@ -24,6 +24,23 @@ class MarginGuard:
         """
         Check if sufficient margin is available using Upstox API with VIX-aware fallback.
         """
+        
+        # --- CRITICAL FIX FOR PAPER TRADING ---
+        # If we are in Paper/Sim mode, do NOT rely on real broker funds.
+        if settings.SAFETY_MODE != "live":
+            # 1. Calculate theoretical margin requirement using fallback logic
+            _, req_margin = await self._fallback_margin_check(trade, current_vix)
+            
+            # 2. Check against VIRTUAL account size
+            available = settings.ACCOUNT_SIZE
+            
+            if available >= req_margin:
+                return True, req_margin
+            else:
+                logger.warning(f"🚫 [PAPER] Margin Shortfall: Req={req_margin:,.0f}, Virtual Avail={available:,.0f}")
+                return False, req_margin
+
+        # --- LIVE MODE LOGIC ---
         try:
             # 1. Build Schema-Compliant Payload (MarginRequest)
             instruments_payload = []
