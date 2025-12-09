@@ -6,7 +6,34 @@ from enum import Enum
 from core.config import settings, IST
 from core.enums import *
 
-# ==================== TRADING MODELS ====================
+# ==================== ORDER MODELS (RESTORED) ====================
+
+class OrderStatus(Enum):
+    PENDING = "PENDING"
+    FILLED = "FILLED"
+    REJECTED = "REJECTED"
+    CANCELLED = "CANCELLED"
+    PARTIAL = "PARTIAL"
+
+class Order(BaseModel):
+    instrument_key: str
+    transaction_type: str # "BUY" or "SELL"
+    quantity: int = Field(gt=0)
+    order_type: str # "MARKET", "LIMIT", "SL", "SL-M"
+    product: str # "I", "D", "CO", "OCO", "MTF"
+    price: float = 0.0
+    trigger_price: float = 0.0
+    validity: str = "DAY"
+    is_amo: bool = False
+    tag: Optional[str] = None
+    
+    # Response fields
+    order_id: Optional[str] = None
+    status: Optional[OrderStatus] = None
+    average_price: Optional[float] = None
+    filled_quantity: Optional[int] = None
+
+# ==================== TRADING DATA MODELS ====================
 
 @dataclass
 class GreeksSnapshot:
