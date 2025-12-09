@@ -76,14 +76,16 @@ class LiveDataFeed:
     # ---------------------------------------------------------------------
     # WEBSOCKET CALLBACKS
     # ---------------------------------------------------------------------
-    def _on_open(self):
+    def _on_open(self, *args):
+        """Called when connection is opened."""
         logger.info("🔌 WebSocket Open — subscribing instruments...")
         try:
             self.streamer.subscribe(list(self.sub_list), "ltpc")
         except Exception as e:
             logger.error(f"Subscribe error on open: {e}")
 
-    def _on_message(self, message):
+    def _on_message(self, message, *args):
+        """Called when a message is received."""
         self.is_connected = True
         self.last_tick_time = time.time()
         self._reconnect_attempts = 0
@@ -99,11 +101,13 @@ class LiveDataFeed:
         except Exception as e:
             logger.debug(f"Tick parse error: {e}")
 
-    def _on_error(self, ws, error):
+    def _on_error(self, error, *args):
+        """Called on error. Accepts extra args to prevent TypeError."""
         logger.debug(f"WS Error: {error}") # Debug level to reduce noise
         self.is_connected = False
 
-    def _on_close(self, ws, code, reason):
+    def _on_close(self, code, reason, *args):
+        """Called on close. Accepts extra args to prevent TypeError."""
         logger.warning(f"WS Closed → code={code}, reason={reason}")
         self.is_connected = False
 
@@ -119,6 +123,7 @@ class LiveDataFeed:
                 upstox_client.ApiClient(config)
             )
 
+            # Updated callbacks with resilient signatures
             self.streamer.on("open", self._on_open)
             self.streamer.on("message", self._on_message)
             self.streamer.on("error", self._on_error)
