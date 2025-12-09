@@ -28,6 +28,7 @@ class LiveDataFeed:
         self.token = settings.UPSTOX_ACCESS_TOKEN
 
         # Default subscriptions (Index + VIX)
+        # Ensure your config.py has MARKET_KEY_VIX = "NSE_INDEX|India VIX" (or similar)
         self.sub_list: Set[str] = {
             settings.MARKET_KEY_INDEX,
             settings.MARKET_KEY_VIX
@@ -81,6 +82,7 @@ class LiveDataFeed:
         logger.info("🔌 WebSocket Open — subscribing instruments...")
         try:
             self.streamer.subscribe(list(self.sub_list), "ltpc")
+            logger.info(f"📡 Subscribed to {len(self.sub_list)} instruments (including VIX)")
         except Exception as e:
             logger.error(f"Subscribe error on open: {e}")
 
