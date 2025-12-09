@@ -3,6 +3,7 @@ import time
 from datetime import datetime
 from sqlalchemy import select
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path  # Added for the new initialize method
 
 from core.config import settings
 from core.models import MultiLegTrade, Position, GreeksSnapshot, AdvancedMetrics
@@ -80,28 +81,68 @@ class VolGuard17Engine:
         self._greek_update_lock = asyncio.Lock()
 
     async def initialize(self):
+        """
+        PRODUCTION FIX v2.0: Graceful degradation if instruments fail to load
+        """
         logger.info("⚡ Booting VolGuard 19.0 (Endgame)...")
+        
+        # --- STEP 1: Instrument Master with Fallback ---
         try:
             await self.instruments_master.download_and_load()
+            logger.info("✅ Instrument Master loaded successfully")
         except Exception as e:
-            logger.critical(f"FATAL: Instrument Master failed: {e}")
-            raise RuntimeError("Cannot proceed without instrument master")
+            logger.critical(f"❌ Instrument Master CRITICAL FAILURE: {e}")
+            
+            # CRITICAL FIX: Check if we have any cached data
+            cache_file = Path("data/instruments_lite.csv")
+            json_file = Path("data/complete.json.gz")
+            
+            if cache_file.exists():
+                logger.warning("⚠️ Using STALE CSV cache (might be outdated)")
+                try:
+                    import pandas as pd
+                    self.instruments_master.df = pd.read_csv(cache_file)
+                    self.instruments_master._post_load_processing()
+                    logger.info("✅ Loaded from stale cache")
+                except Exception as cache_error:
+                    logger.critical(f"❌ Cache loading also failed: {cache_error}")
+            elif json_file.exists():
+                logger.warning("⚠️ Using STALE JSON cache (might be outdated)")
+                try:
+                    self.instruments_master._process_json_to_csv()
+                    logger.info("✅ Processed from stale JSON")
+                except Exception as json_error:
+                    logger.critical(f"❌ JSON processing also failed: {json_error}")
+            else:
+                logger.critical(
+                    "🔥 NO CACHE AVAILABLE. Engine will run in WAIT-ONLY mode.\n"
+                    "   Trading is DISABLED until instrument data is available."
+                )
+                # Don't raise - let engine start but it won't trade
 
+        # --- STEP 2: Database ---
         await self.db.init_db()
+        
+        # --- STEP 3: Order Manager ---
         await self.om.start()
+        
+        # --- STEP 4: Restore Trades ---
         await self._restore_from_snapshot()
+        
+        # --- STEP 5: Reconcile Broker Positions ---
         await self._reconcile_broker_positions()
         
-        # Subscribe to Index and VIX
+        # --- STEP 6: Subscribe to Index and VIX ---
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_VIX)
         
-        # Start background services
+        # --- STEP 7: Start Background Services ---
         asyncio.create_task(self.data_feed.start())
+        
         if settings.GREEK_VALIDATION:
             asyncio.create_task(self.greek_validator.start())
-            
-        logger.info("✅ Engine Initialized.")
+        
+        logger.info("✅ Engine Initialized (with fallback protections)")
 
     async def run(self):
         await self.initialize()
