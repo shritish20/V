@@ -3,321 +3,313 @@ import time
 from datetime import datetime, timedelta, time as dtime
 from typing import List, Dict, Tuple, Optional
 from core.config import settings, IST
-from core.models import AdvancedMetrics, MultiLegTrade
-from core.enums import MarketRegime, StrategyType, ExpiryType, CapitalBucket
-from analytics.pricing import HybridPricingEngine
+from core.models import AdvancedMetrics
+from core.enums import StrategyType, ExpiryType, CapitalBucket
 
 logger = logging.getLogger("StrategyEngine")
 
 class IntelligentStrategyEngine:
     """
-    PRODUCTION FIXED v2.0:
-    - Uses SAFE_TRADE_END (3:15 PM) to prevent 0DTE trades near close
-    - Proper expiry date logic with holiday handling
-    - Per-leg freeze quantity validation
-    - Strike selection timeout guards
-    - Real instrument expiry integration
+    VolGuard 2.0 Strategy Engine (Institutional Grade)
+    Features:
+    - Multi-Factor Consensus (GARCH vs IV, Skew, PCR)
+    - Dynamic DTE Aggression (Theta Eater vs Gamma Guard)
+    - "No Fly Zone" Strike Safety (Straddle Price)
     """
-    def __init__(self, vol_analytics, event_intel, capital_allocator, pricing_engine: HybridPricingEngine):
+    def __init__(self, vol_analytics, event_intel, capital_allocator, pricing_engine):
         self.vol_analytics = vol_analytics
         self.event_intel = event_intel
         self.capital_allocator = capital_allocator
         self.pricing = pricing_engine
-        self.last_trade_time = None
         self.instruments_master = None
+        self.last_trade_time = None
 
     def set_instruments_master(self, master):
-        """Inject InstrumentMaster for real expiry lookups"""
         self.instruments_master = master
 
     def select_strategy_with_capital(self, metrics: AdvancedMetrics, spot: float,
                                    capital_status: Dict) -> Tuple[str, List[Dict], ExpiryType, CapitalBucket]:
         
         now = datetime.now(IST)
+        bucket = CapitalBucket.WEEKLY
         
-        # Cooldown check (5 minutes)
+        # 1. Cooldown (5 mins)
         if self.last_trade_time and (now - self.last_trade_time).total_seconds() < 300:
-            return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, CapitalBucket.WEEKLY
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
 
-        bucket = CapitalBucket.WEEKLY 
+        # 2. Capital Check (Min 2% or 1.5L)
         available = capital_status.get("available", {}).get(bucket.value, 0)
-        
-        # Require at least 2% of account size or enough for 1 lot (~1.5L)
-        min_required = max(settings.ACCOUNT_SIZE * 0.02, 150000)
-        if available < min_required:
-            return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, CapitalBucket.WEEKLY
+        min_req = max(settings.ACCOUNT_SIZE * 0.02, 150000)
+        if available < min_req:
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
 
-        # PRODUCTION FIX: Get real expiry with proper edge case handling
+        # 3. Get Valid Expiry
         expiry_date = self._get_expiry_date(ExpiryType.WEEKLY)
         if not expiry_date:
-            logger.warning("⚠️ No valid expiry found. Waiting...")
-            return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, CapitalBucket.WEEKLY
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
 
-        strategy_name = StrategyType.WAIT.value
+        # =========================================================
+        # PHASE 1: THE QUANT FILTER (Value & Safety)
+        # =========================================================
+        
+        # Safety Hard Stops
+        dangerous_regimes = ["PANIC", "FEAR_BACKWARDATION"]
+        if metrics.regime in dangerous_regimes:
+            logger.warning(f"⛔ Strategy Hold: Market Regime is {metrics.regime}")
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
+            
+        if metrics.event_risk_score >= 3.0:
+            logger.warning(f"⛔ Strategy Hold: High Event Risk ({metrics.event_risk_score})")
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
+            
+        if metrics.vix > 28.0:
+             logger.warning(f"⛔ Strategy Hold: VIX {metrics.vix} too high")
+             return "WAIT", [], ExpiryType.WEEKLY, bucket
+
+        # Value Check: Is Volatility Cheap or Expensive? (IV vs GARCH)
+        # Positive = Expensive (Sell). Negative = Cheap (Trap).
+        # We look for a spread where Implied Vol is irrationally higher than Forecast
+        vol_premium = metrics.vix - metrics.garch_vol_7d
+        
+        # Thresholds
+        is_vol_expensive = vol_premium > 0.5   # Edge found
+        is_vol_cheap = vol_premium < -1.5      # Trap found
+
+        # =========================================================
+        # PHASE 2: THE COMPASS (Directional Bias)
+        # =========================================================
+        bias = "NEUTRAL"
+        
+        # Put-Call Ratio Logic
+        if metrics.pcr > 1.25: 
+            bias = "BULLISH" # Strong Support
+        elif metrics.pcr < 0.70: 
+            bias = "BEARISH" # Strong Resistance
+
+        # Optional: Gravity Check (Price vs Max Pain)
+        # If Price is significantly far from Max Pain, it might snap back
+        dist_pain = (spot - metrics.max_pain) / spot
+        if abs(dist_pain) > 0.015 and bias == "NEUTRAL":
+            if dist_pain > 0: bias = "BEARISH_LEAN" # Price too high
+            else: bias = "BULLISH_LEAN" # Price too low
+
+        # =========================================================
+        # PHASE 3: THE MATRIX (Strategy Selection)
+        # =========================================================
+        strategy_name = "WAIT"
+
+        # A. DIRECTIONAL (Trend is King)
+        if bias in ["BULLISH", "BULLISH_LEAN"]:
+            strategy_name = "BULL_PUT_SPREAD"
+        
+        elif bias in ["BEARISH", "BEARISH_LEAN"]:
+            strategy_name = "BEAR_CALL_SPREAD"
+        
+        # B. NEUTRAL (Vol is King)
+        else:
+            # 1. Skew Exploit: Puts are insanely expensive? Sell Jade Lizard.
+            # (Jade Lizard = Short Put + Bear Call Spread)
+            # Only do this if Puts are expensive (High Skew) AND Vol is decent
+            if metrics.volatility_skew > 4.0 and is_vol_expensive:
+                strategy_name = "JADE_LIZARD"
+            
+            # 2. Income Harvest: Vol is expensive? Sell Strangle (Naked).
+            elif is_vol_expensive:
+                strategy_name = "SHORT_STRANGLE"
+                
+            # 3. Defensive: Vol is cheap (Trap) or Normal? Buy Iron Condor (Wings).
+            else:
+                strategy_name = "IRON_CONDOR"
+
+        # =========================================================
+        # PHASE 4: EXECUTION MAP (Strikes & DTE)
+        # =========================================================
+        
+        # Calculate Days to Expiry (DTE)
+        today_date = datetime.now(IST).date()
+        exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+        dte = (exp_dt - today_date).days
+
+        # Generate Legs with Safety Zones
+        legs = self._generate_smart_legs(strategy_name, spot, expiry_date, dte, metrics)
+        
+        if not legs:
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
+
+        # Final Sizing (Freeze Limits)
+        lots = self._calculate_dynamic_lots(available, 150000.0)
+        
+        # Final Freeze Check
+        if self._validate_freeze_limits(legs, lots):
+             self.last_trade_time = now
+             return strategy_name, legs, ExpiryType.WEEKLY, bucket
+        else:
+             # Try reducing lots if we hit freeze limit? 
+             # For safety, we just WAIT and log error in validate function
+             return "WAIT", [], ExpiryType.WEEKLY, bucket
+
+    def _generate_smart_legs(self, strategy_name: str, spot: float, expiry: str, dte: int, metrics: AdvancedMetrics) -> List[Dict]:
+        """
+        Generates legs using 'Theta Eater' logic (DTE) and 'Safety Zones' (Straddle Price).
+        """
         legs = []
+        
+        # 1. The Gamma Guard (DTE Logic)
+        # Mon/Tue (DTE > 2): Aggressive 30 Delta (Eat Theta)
+        # Wed/Thu (DTE <= 2): Defensive 20 Delta (Avoid Gamma)
+        target_delta = 0.30 if dte > 2 else 0.20
+        
+        # 2. The Safety Map (No Fly Zone)
+        # Never sell inside the expected move
+        expected_move = metrics.straddle_price if metrics.straddle_price > 0 else (spot * 0.01)
+        safe_floor = spot - (expected_move * 1.05) # 5% Buffer
+        safe_ceiling = spot + (expected_move * 1.05)
+        
+        width = 200.0 # Wing Width for spreads
 
         try:
-            # DYNAMIC POSITION SIZING with Freeze Quantity Check
-            lots = self._calculate_dynamic_lots(available, 150000.0)
-            if lots < 1: 
-                return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, CapitalBucket.WEEKLY
-
-            # STRATEGY LOGIC
-            if metrics.ivp < 50:
-                strategy_name = StrategyType.SHORT_STRANGLE.value
-                target_delta = 0.16 
+            # --- NEUTRAL: SHORT STRANGLE (Naked) ---
+            if strategy_name == "SHORT_STRANGLE":
+                # For naked, we are always a bit safer unless GARCH screams "FREE MONEY"
+                delta = 0.16 
+                ce = self._find_strike_by_delta(spot, "CE", expiry, delta)
+                pe = self._find_strike_by_delta(spot, "PE", expiry, delta)
                 
-                ce_strike = self._find_strike_by_delta(spot, "CE", expiry_date, target_delta)
-                pe_strike = self._find_strike_by_delta(spot, "PE", expiry_date, target_delta)
+                # Push out if inside safety zone
+                final_ce = max(ce, safe_ceiling)
+                final_pe = min(pe, safe_floor)
                 
                 legs = [
-                    {"strike": ce_strike, "type": "CE", "side": "SELL", "expiry": expiry_date},
-                    {"strike": pe_strike, "type": "PE", "side": "SELL", "expiry": expiry_date}
+                    {"strike": final_ce, "type": "CE", "side": "SELL", "expiry": expiry},
+                    {"strike": final_pe, "type": "PE", "side": "SELL", "expiry": expiry}
                 ]
-            else:
-                strategy_name = StrategyType.IRON_CONDOR.value
-                short_delta = 0.20
-                long_delta = 0.05
+
+            # --- NEUTRAL: IRON CONDOR (Defined Risk) ---
+            elif strategy_name == "IRON_CONDOR":
+                # Sell at Target Delta (20 or 30)
+                raw_ce = self._find_strike_by_delta(spot, "CE", expiry, target_delta)
+                raw_pe = self._find_strike_by_delta(spot, "PE", expiry, target_delta)
                 
-                ce_short = self._find_strike_by_delta(spot, "CE", expiry_date, short_delta)
-                pe_short = self._find_strike_by_delta(spot, "PE", expiry_date, short_delta)
-                ce_long = self._find_strike_by_delta(spot, "CE", expiry_date, long_delta)
-                pe_long = self._find_strike_by_delta(spot, "PE", expiry_date, long_delta)
+                # Enforce Safety Zone
+                ce_sell = max(raw_ce, safe_ceiling)
+                pe_sell = min(raw_pe, safe_floor)
                 
                 legs = [
-                    {"strike": ce_short, "type": "CE", "side": "SELL", "expiry": expiry_date},
-                    {"strike": ce_long,  "type": "CE", "side": "BUY",  "expiry": expiry_date},
-                    {"strike": pe_short, "type": "PE", "side": "SELL", "expiry": expiry_date},
-                    {"strike": pe_long,  "type": "PE", "side": "BUY",  "expiry": expiry_date}
+                    {"strike": ce_sell, "type": "CE", "side": "SELL", "expiry": expiry},
+                    {"strike": ce_sell + width, "type": "CE", "side": "BUY", "expiry": expiry},
+                    {"strike": pe_sell, "type": "PE", "side": "SELL", "expiry": expiry},
+                    {"strike": pe_sell - width, "type": "PE", "side": "BUY", "expiry": expiry}
                 ]
 
-            # PRODUCTION FIX: Validate freeze quantities per-leg
-            if not self._validate_freeze_limits(legs, lots):
-                logger.error("🚫 Freeze limit validation failed. Reducing lots...")
-                # Try with fewer lots
-                safe_lots = self._calculate_safe_lots_for_freeze()
-                if safe_lots < 1:
-                    return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, bucket
-                lots = safe_lots
+            # --- BULLISH: BULL PUT SPREAD ---
+            elif strategy_name == "BULL_PUT_SPREAD":
+                # Sell Put (Bullish). We can be aggressive on Delta (target_delta)
+                raw_pe = self._find_strike_by_delta(spot, "PE", expiry, target_delta)
+                
+                # Safety: Don't sell above floor (too close to money)
+                pe_sell = min(raw_pe, safe_floor) 
+                
+                legs = [
+                    {"strike": pe_sell, "type": "PE", "side": "SELL", "expiry": expiry},
+                    {"strike": pe_sell - width, "type": "PE", "side": "BUY", "expiry": expiry}
+                ]
 
-            self.last_trade_time = now
-            return strategy_name, legs, ExpiryType.WEEKLY, bucket
+            # --- BEARISH: BEAR CALL SPREAD ---
+            elif strategy_name == "BEAR_CALL_SPREAD":
+                # Sell Call (Bearish)
+                raw_ce = self._find_strike_by_delta(spot, "CE", expiry, target_delta)
+                
+                # Safety: Don't sell below ceiling
+                ce_sell = max(raw_ce, safe_ceiling)
+                
+                legs = [
+                    {"strike": ce_sell, "type": "CE", "side": "SELL", "expiry": expiry},
+                    {"strike": ce_sell + width, "type": "CE", "side": "BUY", "expiry": expiry}
+                ]
 
-        except RuntimeError as e:
-            logger.warning(f"Strategy Selection Failed: {e}")
-            return StrategyType.WAIT.value, [], ExpiryType.WEEKLY, bucket
+            # --- SPECIAL: JADE LIZARD ---
+            elif strategy_name == "JADE_LIZARD":
+                # 1. Sell Big Put (Aggressive 30 Delta) - The Income Engine
+                # Jade Lizard relies on Put Credit to offset Call risk.
+                raw_pe = self._find_strike_by_delta(spot, "PE", expiry, 0.30)
+                pe_sell = min(raw_pe, safe_floor)
+                
+                # 2. Sell Bear Call Spread (Conservative 15 Delta)
+                ce_sell = max(self._find_strike_by_delta(spot, "CE", expiry, 0.15), safe_ceiling)
+                
+                legs = [
+                    {"strike": pe_sell, "type": "PE", "side": "SELL", "expiry": expiry},
+                    {"strike": ce_sell, "type": "CE", "side": "SELL", "expiry": expiry},
+                    {"strike": ce_sell + width, "type": "CE", "side": "BUY", "expiry": expiry}
+                ]
 
-    def _calculate_dynamic_lots(self, available_capital: float, margin_per_lot: float) -> int:
-        """
-        PRODUCTION FIX: Scales position size based on available capital.
-        Respects MAX_LOTS and exchange freeze quantity limits.
-        """
-        raw_lots = int(available_capital / margin_per_lot)
-        
-        # Cap by MAX_LOTS configuration
+        except Exception as e:
+            logger.error(f"Leg Generation Error: {e}")
+            return []
+
+        return legs
+
+    # --- HELPER METHODS ---
+    
+    def _calculate_dynamic_lots(self, available, margin_per_lot):
+        raw_lots = int(available / margin_per_lot)
+        # 1. Cap by Config Max
         capped_lots = min(raw_lots, settings.MAX_LOTS)
-        
-        # CRITICAL FIX: Cap by Exchange Freeze Quantity
-        # NIFTY Lot Size = 75, Freeze Qty = 1800
-        max_lots_per_freeze = settings.NIFTY_FREEZE_QTY // settings.LOT_SIZE  # = 24 lots
-        
-        final_lots = min(capped_lots, max_lots_per_freeze)
-        
-        if final_lots != raw_lots:
-            logger.debug(
-                f"Position Size Adjusted: Raw={raw_lots}, "
-                f"Config Cap={settings.MAX_LOTS}, "
-                f"Freeze Cap={max_lots_per_freeze}, "
-                f"Final={final_lots}"
-            )
-        
-        return final_lots
+        # 2. Cap by Exchange Freeze (1800 qty / 75 lot = 24 lots)
+        freeze_cap = settings.NIFTY_FREEZE_QTY // settings.LOT_SIZE
+        return min(capped_lots, freeze_cap)
 
-    def _validate_freeze_limits(self, legs: List[Dict], lots: int) -> bool:
-        """
-        PRODUCTION FIX: Validates each leg against exchange freeze quantity limits.
-        """
-        for leg in legs:
-            total_qty = lots * settings.LOT_SIZE
-            
-            if total_qty > settings.NIFTY_FREEZE_QTY:
-                logger.error(
-                    f"🚫 Freeze Limit Breach: {leg['side']} {leg['strike']} {leg['type']} "
-                    f"has {total_qty} qty > {settings.NIFTY_FREEZE_QTY} limit"
-                )
-                return False
-        
+    def _validate_freeze_limits(self, legs, lots):
+        total_qty = lots * settings.LOT_SIZE
+        if total_qty > settings.NIFTY_FREEZE_QTY:
+            logger.error(f"🚫 Freeze Limit Breach: {total_qty} > {settings.NIFTY_FREEZE_QTY}")
+            return False
         return True
 
-    def _calculate_safe_lots_for_freeze(self) -> int:
+    def _find_strike_by_delta(self, spot: float, option_type: str, expiry: str, target_delta: float) -> float:
         """
-        Calculate maximum safe lots that won't violate freeze limits.
+        Binary Search for strike matching target Delta.
         """
-        return settings.NIFTY_FREEZE_QTY // settings.LOT_SIZE
-
-    def _find_strike_by_delta(self, spot: float, option_type: str, expiry: str, 
-                              target_delta: float, max_iterations: int = 30) -> float:
-        """
-        PRODUCTION FIX: Binary Search for strike matching target Delta.
-        Includes Timeouts and Oscillation Detection.
-        """
-        start_time = time.time()
-        
-        # Search bounds: +/- 40% from spot
-        lower_strike = spot * 0.6
-        upper_strike = spot * 1.4
-        
-        best_strike = spot
+        step = 50.0
+        # Initial guess based on spot
+        best_strike = round(spot / step) * step
         best_error = float('inf')
         
-        # Nifty strike step
-        step = 50.0
-
-        for i in range(max_iterations):
-            # 1. Timeout Guard (2 seconds max)
-            if time.time() - start_time > 2.0:
-                logger.warning(
-                    f"⏱️ Delta Search Timeout ({option_type}, target={target_delta:.2f}). "
-                    f"Returning best match: {best_strike}"
-                )
-                return best_strike
-
-            mid_strike = (lower_strike + upper_strike) / 2
-            mid_strike = round(mid_strike / step) * step
+        # Define a search window (+/- 20% from spot)
+        lower_bound = int(spot * 0.8)
+        upper_bound = int(spot * 1.2)
+        
+        # Iterate through strikes
+        # Note: In production, you might optimize this to not loop every 50pts, 
+        # but for Nifty, looping 100 strikes is very fast.
+        for strike in range(lower_bound, upper_bound, int(step)):
+            greeks = self.pricing.calculate_greeks(spot, strike, option_type, expiry)
             
-            # 2. Oscillation Guard
-            if (upper_strike - lower_strike) < step:
-                return best_strike
-
-            greeks = self.pricing.calculate_greeks(spot, mid_strike, option_type, expiry)
-            current_delta = abs(greeks.delta)
+            current_delta = abs(greeks.delta) if greeks.delta is not None else 0.0
             error = abs(current_delta - target_delta)
             
             if error < best_error:
                 best_error = error
-                best_strike = mid_strike
+                best_strike = strike
+        
+        return float(best_strike)
 
-            # Success tolerance
-            if error < 0.02: 
-                return mid_strike
-            
-            # Adjust Bounds
-            if option_type == "CE":
-                if current_delta > target_delta: 
-                    lower_strike = mid_strike 
-                else: 
-                    upper_strike = mid_strike 
-            else:
-                if current_delta > target_delta: 
-                    upper_strike = mid_strike 
-                else: 
-                    lower_strike = mid_strike
-
-        if best_error > 0.10:
-            logger.warning(
-                f"⚠️ Poor Delta Match: Target={target_delta:.2f}, "
-                f"Best Error={best_error:.3f}, Strike={best_strike}"
-            )
-            
-        return best_strike
-
-    def _get_expiry_date(self, expiry_type: ExpiryType = ExpiryType.WEEKLY) -> Optional[str]:
-        """
-        PRODUCTION FIX v2.0: 
-        - Uses SAFE_TRADE_END (3:15 PM) instead of market close (3:30 PM)
-        - Handles monthly expiries, holidays, and 0DTE correctly
-        - Prevents trades in last 15 minutes of trading day
-        """
+    def _get_expiry_date(self, expiry_type: ExpiryType) -> Optional[str]:
+        # Rely on Instrument Master
         if self.instruments_master:
             try:
-                available_expiries = self.instruments_master.get_all_expiries("NIFTY")
-                
-                if not available_expiries:
-                    logger.error("❌ No NIFTY expiries available in Instrument Master")
+                # Get all NIFTY expiries sorted
+                expiries = self.instruments_master.get_all_expiries("NIFTY")
+                if not expiries:
                     return None
                 
-                today = datetime.now(IST)
-                current_time = today.time()
-                today_date = today.date()
+                # Logic for Weekly: Just return the nearest one
+                # Logic for Monthly: Return last Thursday of month
+                # For simplicity in this engine, we default to nearest available (Weekly logic)
+                # You can expand this if you specifically want Monthly buckets.
                 
-                # CRITICAL FIX: Use SAFE_TRADE_END (3:15 PM) instead of market close (3:30 PM)
-                # This prevents 0DTE trades in the last 15 minutes when gamma risk is extreme
-                if current_time < settings.SAFE_TRADE_END:
-                    # Market still open AND before safe cutoff, today's expiry is valid
-                    future_expiries = [e for e in available_expiries if e >= today_date]
-                else:
-                    # After 3:15 PM or market closed, exclude today
-                    future_expiries = [e for e in available_expiries if e > today_date]
-                    logger.debug(f"⏰ After {settings.SAFE_TRADE_END.strftime('%H:%M')} - excluding today's expiry")
-                
-                if not future_expiries:
-                    logger.error("❌ No future expiries available")
-                    return None
-                
-                if expiry_type == ExpiryType.WEEKLY:
-                    # Return nearest expiry (weekly contract)
-                    nearest_expiry = future_expiries[0]
-                    logger.debug(f"📅 Next Weekly Expiry: {nearest_expiry}")
-                    return nearest_expiry.strftime("%Y-%m-%d")
-                
-                elif expiry_type == ExpiryType.MONTHLY:
-                    # Find last Thursday of current month
-                    current_month_expiries = [
-                        e for e in future_expiries 
-                        if e.month == today.month and e.year == today.year
-                    ]
-                    
-                    if not current_month_expiries:
-                        # No expiries left this month, get first expiry of next month
-                        next_month_expiries = [
-                            e for e in future_expiries 
-                            if e.month == (today.month % 12) + 1
-                        ]
-                        if next_month_expiries:
-                            monthly_expiry = next_month_expiries[-1]
-                        else:
-                            monthly_expiry = future_expiries[-1]
-                    else:
-                        # Get last expiry of current month
-                        monthly_expiry = current_month_expiries[-1]
-                    
-                    logger.debug(f"📅 Next Monthly Expiry: {monthly_expiry}")
-                    return monthly_expiry.strftime("%Y-%m-%d")
-                
-                elif expiry_type == ExpiryType.INTRADAY:
-                    # For intraday, use nearest expiry
-                    return future_expiries[0].strftime("%Y-%m-%d")
-                    
+                return expiries[0].strftime("%Y-%m-%d")
             except Exception as e:
-                logger.error(f"Expiry lookup failed: {e}")
-                # Fall through to fallback
-        
-        # FALLBACK: Simple Thursday logic
-        logger.warning("⚠️ Using fallback expiry logic (InstrumentMaster unavailable)")
-        today = datetime.now(IST)
-        
-        # Calculate days to Thursday (weekday 3)
-        days_ahead = (3 - today.weekday()) % 7
-        
-        # CRITICAL FIX: Use SAFE_TRADE_END instead of market close
-        if days_ahead == 0:
-            if today.time() >= settings.SAFE_TRADE_END:
-                # After safe cutoff, move to next Thursday
-                days_ahead = 7
-            # else: keep days_ahead = 0 (today is valid and before cutoff)
-        
-        target_date = today + timedelta(days=days_ahead)
-        
-        # For monthly expiry, get last Thursday of month
-        if expiry_type == ExpiryType.MONTHLY:
-            # Move to end of month
-            next_month = target_date.replace(day=28) + timedelta(days=4)
-            last_day = next_month - timedelta(days=next_month.day)
-            
-            # Find last Thursday
-            while last_day.weekday() != 3:  # 3 = Thursday
-                last_day -= timedelta(days=1)
-            
-            target_date = last_day
-        
-        return target_date.strftime("%Y-%m-%d")
+                logger.error(f"Expiry Lookup Failed: {e}")
+                return None
+        return None
