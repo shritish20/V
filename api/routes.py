@@ -20,7 +20,7 @@ from starlette.responses import Response
 
 logger = logging.getLogger("VolGuardAPI")
 
-# ==================== FASTAPI APP ====================
+# ================= FASTAPI APP ====================
 app = FastAPI(
     title="VolGuard 19.0 API",
     description="Institutional-Grade Algorithmic Trading System (Terminal Edition)",
@@ -30,21 +30,26 @@ app = FastAPI(
     openapi_url="/api/openapi.json"
 )
 
-# ==================== CORS ====================
+# ======= CORS MIDDLEWARE (LOVABLE COMPATIBLE) =======
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:3000",             # Local development
+        "https://volguard.onrender.com",     # Self
+        "https://*.lovable.app",             # Allow Lovable previews
+        "https://lovable.dev"                # Allow Lovable editor
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ==================== STATIC ASSETS ====================
+# ======= STATIC ASSETS =======
 static_path = Path("./static_dashboard")
 static_path.mkdir(exist_ok=True)
 app.mount("/dashboard/static", StaticFiles(directory=static_path), name="dashboard_static")
 
-# ==================== DEPENDENCY INJECTION ====================
+# =========== DEPENDENCY INJECTION ===========
 def get_engine(request: Request) -> VolGuard17Engine:
     engine = getattr(request.app.state, "engine", None)
     if not engine:
@@ -54,7 +59,7 @@ def get_engine(request: Request) -> VolGuard17Engine:
         )
     return engine
 
-# ==================== REQUEST MODELS ====================
+# =========== REQUEST MODELS ===========
 class EngineStartRequest(BaseModel):
     continuous: bool = Field(default=True)
     initialize_dashboard: bool = Field(default=True)
@@ -67,13 +72,13 @@ class CapitalAdjustmentRequest(BaseModel):
     monthly_pct: float = Field(0.50, ge=0.0, le=1.0)
     intraday_pct: float = Field(0.10, ge=0.0, le=1.0)
 
-# ==================== PUBLIC ENDPOINTS (READ-ONLY) ====================
+# ======= PUBLIC ENDPOINTS (READ-ONLY) ==========
 @app.get("/", response_class=HTMLResponse)
 async def root():
     return HTMLResponse("""
     <html>
-        <body style="text-align:center; font-family: sans-serif; padding:50px; background-color: #111; color:#eee;">
-            <h1>🚀 VolGuard 19.0 Active</h1>
+        <body style="text-align:center; font-family: sans-serif; padding: 50px; background-color: #111; color:#eee;">
+            <h1>VolGuard 19.0 Active</h1>
             <p>Status: <span style="color:#0f0">OPERATIONAL</span></p>
             <p><a href="/api/docs" style="color:#4af">API Documentation</a></p>
         </body>
@@ -85,7 +90,6 @@ async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
     try:
         health = engine.get_system_health()
         ok = health["engine"]["running"] is not False
-        
         return JSONResponse(
             status_code=200 if ok else 503,
             content={
@@ -102,14 +106,11 @@ async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
 @app.get("/api/dashboard/data")
 async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        # CRITICAL FIX: Added 'await' here because engine.get_dashboard_data is now async
         data = await engine.get_dashboard_data()
-        
         if not data:
             return {"status": "initializing", "timestamp": datetime.now().isoformat()}
         
         status_info = engine.get_status()
-        
         return {
             **data,
             "engine_status": {
@@ -123,6 +124,12 @@ async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
         logger.error(f"Dashboard error: {e}")
         raise HTTPException(500, str(e))
 
+# === NEW: AI CIO MESSAGES ENDPOINT ===
+@app.get("/api/cio/messages")
+async def get_cio_messages(engine: VolGuard17Engine = Depends(get_engine)):
+    """Returns the chat history of the AI CIO for the UI sidebar."""
+    return {"messages": engine.cio_messages}
+
 @app.get("/api/status")
 async def get_status(engine: VolGuard17Engine = Depends(get_engine)):
     return engine.get_status().to_dict()
@@ -131,7 +138,7 @@ async def get_status(engine: VolGuard17Engine = Depends(get_engine)):
 async def metrics():
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-# ==================== PROTECTED ENDPOINTS (ADMIN KEY REQUIRED) ====================
+# ======= PROTECTED ENDPOINTS (ADMIN KEY REQUIRED) =======
 @app.post("/api/start", dependencies=[Depends(get_admin_key)])
 async def start_engine(
     background_tasks: BackgroundTasks,
@@ -140,7 +147,6 @@ async def start_engine(
 ):
     if engine.running:
         raise HTTPException(400, "Engine already running")
-    
     background_tasks.add_task(engine.run)
     return {"status": "starting", "timestamp": datetime.now().isoformat()}
 
@@ -148,7 +154,6 @@ async def start_engine(
 async def stop_engine(engine: VolGuard17Engine = Depends(get_engine)):
     if not engine.running:
         raise HTTPException(400, "Engine not running")
-    
     await engine.shutdown()
     return {"status": "stopping", "timestamp": datetime.now().isoformat()}
 
@@ -158,14 +163,13 @@ async def refresh_token(req: TokenUpdateRequest, engine: VolGuard17Engine = Depe
     logger.info("🔐 Token Refresh Initiated via API")
     try:
         settings.UPSTOX_ACCESS_TOKEN = new_token
-        
         if hasattr(engine, "data_feed"):
             engine.data_feed.update_token(new_token)
         if hasattr(engine, "api"):
             await engine.api.update_token(new_token)
         if hasattr(engine, "greek_validator"):
             await engine.greek_validator.update_token(new_token)
-            
+        
         return {"status": "success", "message": "Token refreshed", "timestamp": datetime.now().isoformat()}
     except Exception as e:
         logger.error(f"Token refresh failed: {e}")
@@ -183,37 +187,29 @@ async def adjust_capital(
             "monthly_expiries": req.monthly_pct,
             "intraday_adjustments": req.intraday_pct
         }
-        
         total = sum(new_alloc.values())
         if abs(total - 1.0) > 0.01:
             raise HTTPException(400, f"Allocation must sum to 100%. Got {total*100:.1f}%")
-
-        # Async status check
+        
         status_info = await engine.capital_allocator.get_status()
         violations = []
-
         for bucket, pct in new_alloc.items():
             new_limit = settings.ACCOUNT_SIZE * pct
             used = status_info["used"].get(bucket, 0)
-            
             if used > new_limit:
                 violations.append({
-                    "bucket": bucket,
-                    "used": used,
-                    "new_limit": new_limit,
-                    "shortfall": used - new_limit
+                    "bucket": bucket, "used": used, "new_limit": new_limit, "shortfall": used - new_limit
                 })
-
+        
         if violations:
             msg = "New limits below current usage. Close positions first."
             if not dry_run:
                 raise HTTPException(400, {"error": msg, "violations": violations})
             return {"status": "blocked", "violations": violations}
-
+        
         if dry_run:
             return {"status": "safe", "allocation": new_alloc}
-
-        # Apply changes
+        
         engine.capital_allocator.bucket_config = new_alloc
         settings.CAPITAL_ALLOCATION = new_alloc
         
@@ -222,7 +218,6 @@ async def adjust_capital(
             "new_allocation": new_alloc,
             "timestamp": datetime.now().isoformat()
         }
-
     except HTTPException as he:
         raise he
     except Exception as e:
@@ -235,7 +230,7 @@ async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
     await engine._emergency_flatten()
     return {"status": "flatten_triggered", "timestamp": datetime.now().isoformat()}
 
-# ==================== TERMINAL / MANUAL TRADING ====================
+# ======= TERMINAL / MANUAL TRADING ============
 @app.post("/api/trades/manual", dependencies=[Depends(get_admin_key)])
 async def place_manual_trade(
     req: ManualTradeRequest,
@@ -248,37 +243,28 @@ async def place_manual_trade(
             token = engine.instruments_master.get_option_token(
                 l.symbol, l.strike, l.option_type, expiry_dt
             )
-            
             if not token:
                 raise HTTPException(400, f"Instrument Not Found: {l.symbol} {l.strike} {l.option_type}")
-
+            
             real_legs.append(Position(
-                symbol=l.symbol,
-                instrument_key=token,
-                strike=l.strike,
-                option_type=l.option_type,
+                symbol=l.symbol, instrument_key=token,
+                strike=l.strike, option_type=l.option_type,
                 quantity=l.quantity if l.side == "BUY" else -l.quantity,
-                entry_price=0.0,
-                entry_time=datetime.now(settings.IST),
+                entry_price=0.0, entry_time=datetime.now(settings.IST),
                 current_price=0.0,
                 current_greeks=GreeksSnapshot(timestamp=datetime.now(settings.IST)),
-                capital_bucket=req.capital_bucket,
-                expiry_type=ExpiryType.INTRADAY
+                capital_bucket=req.capital_bucket, expiry_type=ExpiryType.INTRADAY
             ))
-
+        
         new_trade = MultiLegTrade(
-            legs=real_legs,
-            strategy_type=StrategyType.WAIT,
-            net_premium_per_share=0.0,
-            entry_time=datetime.now(settings.IST),
-            expiry_date=req.legs[0].expiry_date,
-            expiry_type=ExpiryType.INTRADAY,
-            capital_bucket=req.capital_bucket,
-            status=TradeStatus.PENDING,
+            legs=real_legs, strategy_type=StrategyType.WAIT,
+            net_premium_per_share=0.0, entry_time=datetime.now(settings.IST),
+            expiry_date=req.legs[0].expiry_date, expiry_type=ExpiryType.INTRADAY,
+            capital_bucket=req.capital_bucket, status=TradeStatus.PENDING,
             id=f"MANUAL-{int(time.time())}"
         )
-
-        logger.info(f"👨‍💻 Manual Trade Request Received: {len(real_legs)} legs")
+        
+        logger.info(f"🕹️ Manual Trade Request Received: {len(real_legs)} legs")
         success = await engine.trade_mgr.execute_strategy(new_trade)
         
         if success:
@@ -286,7 +272,7 @@ async def place_manual_trade(
             return {"status": "success", "trade_id": new_trade.id, "message": "Trade Executed"}
         else:
             raise HTTPException(400, "Execution Failed: Check Logs for Margin/Risk reasons")
-
+            
     except HTTPException as he:
         raise he
     except Exception as e:
@@ -304,10 +290,9 @@ async def close_specific_trade(
     
     if trade.status != TradeStatus.OPEN:
         raise HTTPException(400, f"Cannot close trade in {trade.status.value} state")
-
-    logger.info(f"🔪 Manual Exit Triggered for {trade_id}")
+        
+    logger.info(f"🕹️ Manual Exit Triggered for {trade_id}")
     await engine.trade_mgr.close_trade(trade, ExitReason.MANUAL)
-    
     return {"status": "closed", "trade_id": trade_id}
 
 @app.get("/api/system/logs", dependencies=[Depends(get_admin_key)])
@@ -319,6 +304,6 @@ async def get_live_logs(lines: int = 50):
     try:
         with open(log_file, "r") as f:
             all_lines = f.readlines()
-            return {"logs": [line.strip() for line in all_lines[-lines:]]}
+        return {"logs": [line.strip() for line in all_lines[-lines:]]}
     except Exception as e:
         return {"error": str(e)}
