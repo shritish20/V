@@ -6,8 +6,9 @@ from enum import Enum
 from core.config import settings, IST
 from core.enums import *
 
-# ==================== ORDER MODELS (RESTORED) ====================
-
+# ==========================================
+# ORDER MODELS
+# ==========================================
 class OrderStatus(Enum):
     PENDING = "PENDING"
     FILLED = "FILLED"
@@ -17,24 +18,25 @@ class OrderStatus(Enum):
 
 class Order(BaseModel):
     instrument_key: str
-    transaction_type: str # "BUY" or "SELL"
+    transaction_type: str  # "BUY" or "SELL"
     quantity: int = Field(gt=0)
-    order_type: str # "MARKET", "LIMIT", "SL", "SL-M"
-    product: str # "I", "D", "CO", "OCO", "MTF"
+    order_type: str  # "MARKET", "LIMIT", "SL", "SL-M"
+    product: str  # "I", "D", "CO", "OCO", "MTF"
     price: float = 0.0
     trigger_price: float = 0.0
     validity: str = "DAY"
     is_amo: bool = False
     tag: Optional[str] = None
     
-    # Response fields
+    # Response fields from Broker
     order_id: Optional[str] = None
     status: Optional[OrderStatus] = None
     average_price: Optional[float] = None
     filled_quantity: Optional[int] = None
 
-# ==================== TRADING DATA MODELS ====================
-
+# ==========================================
+# TRADING DATA MODELS
+# ==========================================
 @dataclass
 class GreeksSnapshot:
     timestamp: datetime
@@ -43,7 +45,7 @@ class GreeksSnapshot:
     theta: float = 0.0
     vega: float = 0.0
     iv: float = 0.0
-    pop: float = 0.0
+    pop: float = 0.5
     charm: float = 0.0
     vanna: float = 0.0
 
@@ -107,7 +109,7 @@ class MultiLegTrade(BaseModel):
     gtt_order_ids: List[str] = Field(default_factory=list)
     id: Optional[str] = None
     exit_reason: Optional[ExitReason] = None
-
+    
     # Portfolio Greeks
     trade_vega: float = 0.0
     trade_delta: float = 0.0
@@ -118,55 +120,53 @@ class MultiLegTrade(BaseModel):
         return sum(leg.unrealized_pnl() for leg in self.legs) - self.transaction_costs
 
     def calculate_trade_greeks(self):
-        self.trade_delta = sum((leg.current_greeks.delta or 0) * leg.quantity for leg in self.legs)
-        self.trade_gamma = sum((leg.current_greeks.gamma or 0) * leg.quantity for leg in self.legs)
-        self.trade_theta = sum((leg.current_greeks.theta or 0) * leg.quantity for leg in self.legs)
-        self.trade_vega = sum((leg.current_greeks.vega or 0) * leg.quantity for leg in self.legs)
+        self.trade_delta = sum((leg.current_greeks.delta or 0.0) * leg.quantity for leg in self.legs)
+        self.trade_gamma = sum((leg.current_greeks.gamma or 0.0) * leg.quantity for leg in self.legs)
+        self.trade_theta = sum((leg.current_greeks.theta or 0.0) * leg.quantity for leg in self.legs)
+        self.trade_vega = sum((leg.current_greeks.vega or 0.0) * leg.quantity for leg in self.legs)
 
-    def calculate_max_loss(self):
-        # Placeholder for complex spread calculations
-        self.max_loss_per_lot = self.net_premium_per_share 
-
-    def calculate_max_profit(self):
-        self.max_profit_per_lot = self.net_premium_per_share
-
-    def calculate_breakevens(self):
-        self.breakeven_lower = 0.0
-        self.breakeven_upper = 0.0
-
-# ==================== TERMINAL / MANUAL REQUEST MODELS ====================
-
+# ==========================================
+# MANUAL REQUEST MODELS (For Terminal)
+# ==========================================
 class ManualLegRequest(BaseModel):
     symbol: str = "NIFTY"
-    strike: float = Field(..., gt=0, description="Strike Price")
-    option_type: str = Field(..., pattern="^(CE|PE)$", description="CE or PE")
-    side: str = Field(..., pattern="^(BUY|SELL)$", description="BUY or SELL")
-    expiry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$", description="YYYY-MM-DD")
-    quantity: int = Field(..., gt=0, le=1800, description="Qty per leg (Max 1800 freeze limit)")
+    strike: float = Field(..., gt=0)
+    option_type: str = Field(..., pattern="^(CE|PE)$")
+    side: str = Field(..., pattern="^(BUY|SELL)$")
+    expiry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    quantity: int = Field(..., gt=0, le=1800)
 
 class ManualTradeRequest(BaseModel):
     strategy_name: str = "MANUAL"
     legs: List[ManualLegRequest]
-    capital_bucket: CapitalBucket = CapitalBucket.INTRADAY # Default to Intraday bucket
+    capital_bucket: CapitalBucket = CapitalBucket.INTRADAY
     tag: str = "Discretionary"
 
-# ==================== DATA & STATUS MODELS ====================
-
+# ==========================================
+# QUANT & METRICS MODELS (THE UPGRADE)
+# ==========================================
 @dataclass
 class AdvancedMetrics:
     timestamp: datetime
     spot_price: float
     vix: float
     ivp: float
+    
+    # --- NEW QUANT FIELDS ---
     realized_vol_7d: float
     garch_vol_7d: float
-    iv_rv_spread: float
+    iv_rv_spread: float      # VIX - RV (Positive = Expensive)
+    volatility_skew: float   # Put IV - Call IV (Positive = Fear)
+    straddle_price: float    # Market Expected Move
+    # ------------------------
+    
     event_risk_score: float
     regime: str
     pcr: float
     max_pain: float
     term_structure_slope: float
-    volatility_skew: float
+    
+    # SABR Params
     sabr_alpha: float
     sabr_beta: float
     sabr_rho: float
