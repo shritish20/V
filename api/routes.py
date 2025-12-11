@@ -3,16 +3,18 @@ from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from pathlib import Path
 import logging
+import asyncio
 import time
 
 # Core Imports
 from core.engine import VolGuard17Engine
 from core.config import settings
 from core.enums import CapitalBucket, StrategyType, TradeStatus, ExpiryType, ExitReason
+# Importing models directly to match your existing structure
 from core.models import ManualTradeRequest, Position, GreeksSnapshot, MultiLegTrade
 from api.security import get_admin_key
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -26,7 +28,7 @@ logger = logging.getLogger("VolGuardAPI")
 
 app = FastAPI(
     title="VolGuard 19.0 API",
-    description="Institutional-Grade Algorithmic Trading System (Terminal Edition)",
+    description="Institutional-Grade Algorithmic Trading System (Architect Edition)",
     version="19.0.0",
     docs_url="/api/docs",
     redoc_url="/api/redoc",
@@ -34,14 +36,11 @@ app = FastAPI(
 )
 
 # ==========================================
-# CORS CONFIGURATION (CRITICAL FIX)
+# CORS CONFIGURATION
 # ==========================================
 app.add_middleware(
     CORSMiddleware,
-    # Allow all origins (Frontend, Mobile, Curl)
     allow_origins=["*"],
-    # CRITICAL FIX: Must be False when using allow_origins=["*"]
-    # We use API Keys in Headers, so we don't need cookie credentials.
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -92,6 +91,7 @@ async def root():
         <body style="text-align:center; font-family: sans-serif; padding: 50px; background-color: #111; color:#eee;">
             <h1>VolGuard 19.0 Active</h1>
             <p>Status: <span style="color:#0f0">OPERATIONAL</span></p>
+            <p>AI Architect: <span style="color:#4af">ONLINE</span></p>
             <p><a href="/api/docs" style="color:#4af">API Documentation</a></p>
         </body>
     </html>
@@ -118,10 +118,15 @@ async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
 @app.get("/api/dashboard/data")
 async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        data = await engine.get_dashboard_data()
+        # Compatibility check for async vs sync engine method
+        if asyncio.iscoroutinefunction(engine.get_dashboard_data):
+            data = await engine.get_dashboard_data()
+        else:
+            data = engine.get_dashboard_data()
+            
         if not data:
             return {"status": "initializing", "timestamp": datetime.now().isoformat()}
-        
+            
         status_info = engine.get_status()
         return {
             **data,
@@ -136,19 +141,21 @@ async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
         logger.error(f"Dashboard error: {e}")
         raise HTTPException(500, str(e))
 
-@app.get("/api/cio/messages")
-async def get_cio_messages(engine: VolGuard17Engine = Depends(get_engine)):
-    """Returns the chat history of the AI CIO for the UI sidebar."""
-    # Mock data if engine doesn't have history yet
+# --- NEW AI ENDPOINT ---
+@app.get("/api/cio/commentary")
+async def get_cio_commentary(engine: VolGuard17Engine = Depends(get_engine)):
+    """
+    Dedicated endpoint for the frontend 'Risk Advisor' widget.
+    Connects to the REAL AI Architect in the engine.
+    """
+    # Safety check if architect isn't ready
+    trade_analysis = getattr(engine.architect, 'last_trade_analysis', {})
+    portfolio_review = getattr(engine.architect, 'last_portfolio_review', {})
+    
     return {
-        "messages": [
-            {
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "sender": "VolGuard CIO",
-                "message": f"Market Regime is currently {engine.last_metrics.regime if engine.last_metrics else 'CALCULATING'}. Volatility spread suggests neutral positioning.",
-                "type": "analysis"
-            }
-        ]
+        "trade_analysis": trade_analysis,
+        "portfolio_review": portfolio_review,
+        "timestamp": datetime.now().isoformat()
     }
 
 @app.get("/api/status")
@@ -165,13 +172,12 @@ async def metrics():
 
 @app.post("/api/start", dependencies=[Depends(get_admin_key)])
 async def start_engine(
-    background_tasks: BackgroundTasks,
-    req: EngineStartRequest = EngineStartRequest(),
+    background_tasks: BackgroundTasks, 
+    req: EngineStartRequest = EngineStartRequest(), 
     engine: VolGuard17Engine = Depends(get_engine)
 ):
     if engine.running:
         raise HTTPException(400, "Engine already running")
-    
     background_tasks.add_task(engine.run)
     return {"status": "starting", "timestamp": datetime.now().isoformat()}
 
@@ -179,22 +185,21 @@ async def start_engine(
 async def stop_engine(engine: VolGuard17Engine = Depends(get_engine)):
     if not engine.running:
         raise HTTPException(400, "Engine not running")
-    
     await engine.shutdown()
     return {"status": "stopping", "timestamp": datetime.now().isoformat()}
 
 @app.post("/api/token/refresh", dependencies=[Depends(get_admin_key)])
 async def refresh_token(req: TokenUpdateRequest, engine: VolGuard17Engine = Depends(get_engine)):
-    new_token = req.access_token
-    logger.info("Token Refresh Initiated via API")
     try:
-        settings.UPSTOX_ACCESS_TOKEN = new_token
+        logger.info("Token Refresh Initiated via API")
+        settings.UPSTOX_ACCESS_TOKEN = req.access_token
+        
         if hasattr(engine, "data_feed"):
-            engine.data_feed.update_token(new_token)
+            engine.data_feed.update_token(req.access_token)
         if hasattr(engine, "api"):
-            await engine.api.update_token(new_token)
+            await engine.api.update_token(req.access_token)
         if hasattr(engine, "greek_validator"):
-            await engine.greek_validator.update_token(new_token)
+            await engine.greek_validator.update_token(req.access_token)
             
         return {"status": "success", "message": "Token refreshed", "timestamp": datetime.now().isoformat()}
     except Exception as e:
@@ -203,8 +208,8 @@ async def refresh_token(req: TokenUpdateRequest, engine: VolGuard17Engine = Depe
 
 @app.post("/api/capital/adjust", dependencies=[Depends(get_admin_key)])
 async def adjust_capital(
-    req: CapitalAdjustmentRequest,
-    dry_run: bool = Query(False),
+    req: CapitalAdjustmentRequest, 
+    dry_run: bool = Query(False), 
     engine: VolGuard17Engine = Depends(get_engine)
 ):
     try:
@@ -213,11 +218,10 @@ async def adjust_capital(
             "monthly_expiries": req.monthly_pct,
             "intraday_adjustments": req.intraday_pct
         }
-        
         total = sum(new_alloc.values())
         if abs(total - 1.0) > 0.01:
             raise HTTPException(400, f"Allocation must sum to 100%. Got {total*100:.1f}%")
-
+        
         status_info = await engine.capital_allocator.get_status()
         
         violations = []
@@ -231,7 +235,7 @@ async def adjust_capital(
                     "new_limit": new_limit,
                     "shortfall": used - new_limit
                 })
-
+                
         if violations:
             msg = "New limits below current usage. Close positions first."
             if not dry_run:
@@ -240,15 +244,11 @@ async def adjust_capital(
 
         if dry_run:
             return {"status": "safe", "allocation": new_alloc}
-
+            
         engine.capital_allocator.bucket_config = new_alloc
         settings.CAPITAL_ALLOCATION = new_alloc
-        
-        return {
-            "status": "updated",
-            "new_allocation": new_alloc,
-            "timestamp": datetime.now().isoformat()
-        }
+            
+        return {"status": "updated", "new_allocation": new_alloc, "timestamp": datetime.now().isoformat()}
     except HTTPException as he:
         raise he
     except Exception as e:
@@ -266,13 +266,11 @@ async def emergency_flatten(engine: VolGuard17Engine = Depends(get_engine)):
 # ==========================================
 
 @app.post("/api/trades/manual", dependencies=[Depends(get_admin_key)])
-async def place_manual_trade(
-    req: ManualTradeRequest,
-    engine: VolGuard17Engine = Depends(get_engine)
-):
+async def place_manual_trade(req: ManualTradeRequest, engine: VolGuard17Engine = Depends(get_engine)):
     try:
         real_legs = []
         for l in req.legs:
+            # Note: Assuming 'ManualLegRequest' schema from core.models matches
             expiry_dt = datetime.strptime(l.expiry_date, "%Y-%m-%d").date()
             token = engine.instruments_master.get_option_token(
                 l.symbol, l.strike, l.option_type, expiry_dt
@@ -296,7 +294,7 @@ async def place_manual_trade(
 
         new_trade = MultiLegTrade(
             legs=real_legs,
-            strategy_type=StrategyType.WAIT, 
+            strategy_type=StrategyType.WAIT,
             net_premium_per_share=0.0,
             entry_time=datetime.now(settings.IST),
             expiry_date=req.legs[0].expiry_date,
@@ -305,7 +303,7 @@ async def place_manual_trade(
             status=TradeStatus.PENDING,
             id=f"MANUAL-{int(time.time())}"
         )
-
+        
         logger.info(f"Manual Trade Request Received: {len(real_legs)} legs")
         success = await engine.trade_mgr.execute_strategy(new_trade)
         
@@ -322,10 +320,7 @@ async def place_manual_trade(
         raise HTTPException(500, str(e))
 
 @app.delete("/api/trades/{trade_id}", dependencies=[Depends(get_admin_key)])
-async def close_specific_trade(
-    trade_id: str,
-    engine: VolGuard17Engine = Depends(get_engine)
-):
+async def close_specific_trade(trade_id: str, engine: VolGuard17Engine = Depends(get_engine)):
     trade = next((t for t in engine.trades if t.id == trade_id), None)
     if not trade:
         raise HTTPException(404, "Trade ID not found")
