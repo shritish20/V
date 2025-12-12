@@ -152,31 +152,29 @@ class HybridVolatilityAnalytics:
 
     def calculate_chain_metrics(self, chain_data: List[Dict]) -> Dict:
         """
-        Helper to get aggregate chain metrics (PCR, Straddle Price).
-        Calculates Straddle Price by finding the ATM strike where 
-        Call Price is closest to Put Price (Min Delta).
+        Helper to get aggregate chain metrics (PCR, Straddle Price, Max Pain).
         """
         call_oi = 0
         put_oi = 0
-        
-        # Straddle Price Discovery
         min_diff = float('inf')
         straddle_price = 0.0
-
+        
+        # 1. Collect Data & Calculate OI / Straddle Price
+        strikes = []
         try:
             for item in chain_data:
+                k = item.get('strike_price', 0)
+                if k: strikes.append(k)
+
                 ce = item.get('call_options', {}).get('market_data', {})
                 pe = item.get('put_options', {}).get('market_data', {})
                 
-                # 1. Sum OI
                 call_oi += ce.get('oi', 0)
                 put_oi += pe.get('oi', 0)
 
-                # 2. Find Straddle Price (ATM Proxy)
-                # We identify ATM as the strike where |Call_LTP - Put_LTP| is minimized.
+                # Straddle Price (ATM Proxy)
                 ce_ltp = ce.get('ltp', 0)
                 pe_ltp = pe.get('ltp', 0)
-                
                 if ce_ltp > 0 and pe_ltp > 0:
                     diff = abs(ce_ltp - pe_ltp)
                     if diff < min_diff:
@@ -185,17 +183,43 @@ class HybridVolatilityAnalytics:
 
             pcr = round(put_oi / call_oi, 2) if call_oi > 0 else 1.0
             
-            # If logic failed (e.g. bad data), return 0 so engine falls back to 1% rule
+            # 2. Calculate Max Pain (THE FIX IS HERE)
+            # Iterate strikes to find the point of minimum pain for option buyers
+            max_pain = 0.0
+            if strikes:
+                strikes.sort()
+                pain_points = []
+                for test_strike in strikes:
+                    total_pain = 0.0
+                    for item in chain_data:
+                        k = item.get('strike_price', 0)
+                        c_oi = item.get('call_options', {}).get('market_data', {}).get('oi', 0)
+                        p_oi = item.get('put_options', {}).get('market_data', {}).get('oi', 0)
+                        
+                        if k < test_strike:
+                            # ITM Calls lose value (Pain for sellers if we assume infinite loss, 
+                            # but Max Pain theory usually minimizes intrinsic value)
+                            # Pain = Intrinsic Value * OI
+                            total_pain += c_oi * (test_strike - k)
+                        elif k > test_strike:
+                            # ITM Puts lose value
+                            total_pain += p_oi * (k - test_strike)
+                    pain_points.append((test_strike, total_pain))
+                
+                if pain_points:
+                    max_pain = min(pain_points, key=lambda x: x[1])[0]
+
             if straddle_price == 0:
-                logger.debug("Straddle price calc found no valid data, returning 0")
+                logger.debug("Straddle/Pain calc found no valid data")
 
             return {
                 "call_oi": call_oi, 
                 "put_oi": put_oi, 
                 "pcr": pcr,
-                "straddle_price": straddle_price
+                "straddle_price": straddle_price,
+                "max_pain": max_pain
             }
 
         except Exception as e:
             logger.error(f"Chain metrics calculation failed: {e}")
-            return {"pcr": 1.0, "straddle_price": 0.0}
+            return {"pcr": 1.0, "straddle_price": 0.0, "max_pain": 0.0}
