@@ -27,7 +27,6 @@ class Order(BaseModel):
     validity: str = "DAY"
     is_amo: bool = False
     tag: Optional[str] = None
-    
     # Response fields from Broker
     order_id: Optional[str] = None
     status: Optional[OrderStatus] = None
@@ -96,20 +95,17 @@ class MultiLegTrade(BaseModel):
     expiry_date: str
     expiry_type: ExpiryType
     capital_bucket: CapitalBucket
-    
     # Risk Limits
     max_loss_per_lot: float = 0.0
     max_profit_per_lot: float = 0.0
     breakeven_lower: float = 0.0
     breakeven_upper: float = 0.0
     transaction_costs: float = 0.0
-    
     # Execution Details
     basket_order_id: Optional[str] = None
     gtt_order_ids: List[str] = Field(default_factory=list)
     id: Optional[str] = None
     exit_reason: Optional[ExitReason] = None
-    
     # Portfolio Greeks
     trade_vega: float = 0.0
     trade_delta: float = 0.0
@@ -151,21 +147,22 @@ class AdvancedMetrics:
     spot_price: float
     vix: float
     ivp: float
-    
     # --- NEW QUANT FIELDS ---
     realized_vol_7d: float
     garch_vol_7d: float
-    iv_rv_spread: float      # VIX - RV (Positive = Expensive)
-    volatility_skew: float   # Put IV - Call IV (Positive = Fear)
-    straddle_price: float    # Market Expected Move
+    atm_iv: float              # <--- ADDED for Dashboard
+    iv_rv_spread: float        # VIX - RV (Positive = Expensive)
+    volatility_skew: float     # Put IV - Call IV (Positive = Fear)
+    straddle_price: float      # Market Expected Move
     # ------------------------
-    
     event_risk_score: float
     regime: str
     pcr: float
     max_pain: float
     term_structure_slope: float
-    
+    # --- DASHBOARD METADATA ---
+    expiry_date: str           # <--- ADDED for Dashboard (e.g., "2024-01-25")
+    days_to_expiry: float      # <--- ADDED for Dashboard (e.g., 4.5)
     # SABR Params
     sabr_alpha: float
     sabr_beta: float
