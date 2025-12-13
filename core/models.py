@@ -9,6 +9,7 @@ from core.enums import *
 # ==========================================
 # ORDER MODELS
 # ==========================================
+
 class OrderStatus(Enum):
     PENDING = "PENDING"
     FILLED = "FILLED"
@@ -20,8 +21,8 @@ class Order(BaseModel):
     instrument_key: str
     transaction_type: str  # "BUY" or "SELL"
     quantity: int = Field(gt=0)
-    order_type: str  # "MARKET", "LIMIT", "SL", "SL-M"
-    product: str  # "I", "D", "CO", "OCO", "MTF"
+    order_type: str        # "MARKET", "LIMIT", "SL", "SL-M"
+    product: str           # "I", "D", "CO", "OCO", "MTF"
     price: float = 0.0
     trigger_price: float = 0.0
     validity: str = "DAY"
@@ -36,6 +37,7 @@ class Order(BaseModel):
 # ==========================================
 # TRADING DATA MODELS
 # ==========================================
+
 @dataclass
 class GreeksSnapshot:
     timestamp: datetime
@@ -47,6 +49,11 @@ class GreeksSnapshot:
     pop: float = 0.5
     charm: float = 0.0
     vanna: float = 0.0
+    # HARDENING FIX: Confidence Score (0.0 to 1.0)
+    # 1.0 = High Confidence (Broker & SABR agree)
+    # 0.5 = Suspicious (Significant Divergence)
+    # 0.0 = Dangerous (Data Stale or Missing)
+    confidence_score: float = 1.0
 
     def is_stale(self, max_age: float = 30.0) -> bool:
         return (datetime.now(IST) - self.timestamp).total_seconds() > max_age
@@ -55,6 +62,7 @@ class GreeksSnapshot:
         return {
             'delta': self.delta, 'gamma': self.gamma, 'theta': self.theta,
             'vega': self.vega, 'iv': self.iv, 'pop': self.pop,
+            'confidence': self.confidence_score,
             'timestamp': self.timestamp.isoformat()
         }
 
@@ -124,6 +132,7 @@ class MultiLegTrade(BaseModel):
 # ==========================================
 # MANUAL REQUEST MODELS (For Terminal)
 # ==========================================
+
 class ManualLegRequest(BaseModel):
     symbol: str = "NIFTY"
     strike: float = Field(..., gt=0)
@@ -141,6 +150,7 @@ class ManualTradeRequest(BaseModel):
 # ==========================================
 # QUANT & METRICS MODELS (THE UPGRADE)
 # ==========================================
+
 @dataclass
 class AdvancedMetrics:
     timestamp: datetime
@@ -150,10 +160,10 @@ class AdvancedMetrics:
     # --- NEW QUANT FIELDS ---
     realized_vol_7d: float
     garch_vol_7d: float
-    atm_iv: float              # <--- ADDED for Dashboard
-    iv_rv_spread: float        # VIX - RV (Positive = Expensive)
-    volatility_skew: float     # Put IV - Call IV (Positive = Fear)
-    straddle_price: float      # Market Expected Move
+    atm_iv: float
+    iv_rv_spread: float
+    volatility_skew: float
+    straddle_price: float
     # ------------------------
     event_risk_score: float
     regime: str
@@ -161,8 +171,8 @@ class AdvancedMetrics:
     max_pain: float
     term_structure_slope: float
     # --- DASHBOARD METADATA ---
-    expiry_date: str           # <--- ADDED for Dashboard (e.g., "2024-01-25")
-    days_to_expiry: float      # <--- ADDED for Dashboard (e.g., 4.5)
+    expiry_date: str
+    days_to_expiry: float
     # SABR Params
     sabr_alpha: float
     sabr_beta: float
