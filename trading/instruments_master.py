@@ -19,7 +19,6 @@ JSON_FILE_GZ = DATA_DIR / "complete.json.gz"
 JSON_FILE_PLAIN = DATA_DIR / "complete.json"
 
 # PRIMARY SOURCE: Your GitHub Repo (Raw Content URL)
-# We use the 'raw.githubusercontent.com' domain which gives the file content directly
 DOWNLOAD_URLS = [
     "https://raw.githubusercontent.com/shritish20/V/main/data/complete.json.gz",
     "https://assets.upstox.com/feed/instruments/NSE_FO/complete.json.gz",
@@ -49,7 +48,7 @@ class InstrumentMaster:
             return
 
         # 2. Force Download from GitHub
-        logger.info("⬇️ Local files missing/stale. downloading from GitHub...")
+        logger.info("⬇️ Local files missing/stale. Downloading from GitHub...")
         try:
             await self._download_and_build()
         except Exception as e:
@@ -134,12 +133,13 @@ class InstrumentMaster:
         
         # --- STRICT FILTERING ---
         # We strictly need NSE_FO and NSE_INDEX
-        mask = (
-            (df["segment"] == "NSE_FO") | 
-            (df["segment"] == "NSE_INDEX")
-        )
-        df = df[mask]
-        
+        if 'segment' in df.columns:
+            mask = (df["segment"] == "NSE_FO") | (df["segment"] == "NSE_INDEX")
+            df = df[mask]
+        elif 'exchange' in df.columns:
+            mask = (df["exchange"] == "NSE_FO") | (df["exchange"] == "NSE_INDEX")
+            df = df[mask]
+            
         # Filter for NIFTY, BANKNIFTY, INDIA VIX
         symbols = ["NIFTY", "BANKNIFTY", "INDIA VIX", "Nifty 50", "Nifty Bank"]
         mask_sym = (
@@ -150,7 +150,7 @@ class InstrumentMaster:
         df = df[mask_sym]
         
         if df.empty:
-            raise RuntimeError("Filtered dataframe is empty. No NIFTY/BANKNIFTY found.")
+            raise RuntimeError("CRITICAL: Loaded file contains 0 NIFTY records. File is invalid.")
 
         # --- TIMEZONE FIX ---
         # Upstox provides expiry in milliseconds (int)
@@ -182,11 +182,12 @@ class InstrumentMaster:
         self.last_updated = datetime.now()
         self._cache_options.clear()
         
+        # Verify Data Integrity
         exps = self.get_all_expiries("NIFTY")
-        if exps:
-            logger.info(f"✅ Data Loaded. NIFTY Expiries: {exps[0]} (Near) to {exps[-1]} (Far)")
+        if len(exps) < 2:
+            logger.warning(f"⚠️ Data Warning: Only found {len(exps)} NIFTY expiries.")
         else:
-            logger.warning("⚠️ Data Loaded but NO NIFTY Expiries found. Check filtering logic.")
+            logger.info(f"✅ Data Ready: NIFTY Weekly={exps[0]}, Monthly={exps[-1]}")
 
     def get_all_expiries(self, symbol: str = "NIFTY") -> List[date]:
         if self.df is None: return []
