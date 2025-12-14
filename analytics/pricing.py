@@ -34,7 +34,7 @@ class HybridPricingEngine:
                 if len(expiries) >= 2:
                     has_real_data = True
             
-            # If no real data (e.g. Sunday), create Mock Expiries to verify logic
+            # If no real data (e.g. Sunday or API Failure), create Mock Data
             if not has_real_data:
                 today = datetime.now(IST).date()
                 # Find next Thursday
@@ -92,6 +92,8 @@ class HybridPricingEngine:
             
             # Check for Empty/Zero Data (Closed Market)
             is_empty = not greeks or all(g.get("iv", 0) == 0 for g in greeks.values())
+            
+            # If Live Market is closed, we return 0 confidence.
             if is_empty: 
                 logger.warning("⛔ Market Data Empty (Closed Market).")
                 return {"confidence": 0.0}
@@ -110,7 +112,6 @@ class HybridPricingEngine:
                 "term_structure": (m_iv - w_iv) * 100,
                 "skew_index": (otm_iv - w_iv) * 100,
                 "days_to_expiry": float(dte),
-                # Pouring in the Dates explicitly
                 "near_expiry": near_expiry.strftime("%Y-%m-%d"),
                 "far_expiry": far_expiry.strftime("%Y-%m-%d"),
                 "confidence": 1.0
