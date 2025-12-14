@@ -1,3 +1,5 @@
+# File: trading/instruments_master.py
+
 import gzip
 import json
 import logging
@@ -15,24 +17,22 @@ logger = logging.getLogger("InstrumentMaster")
 # --- CONFIGURATION ---
 DATA_DIR = Path("data")
 CACHE_FILE = DATA_DIR / "instruments_lite.csv"
-
-# We look for BOTH compressed and uncompressed versions
 JSON_FILE_GZ = DATA_DIR / "complete.json.gz"
 JSON_FILE_PLAIN = DATA_DIR / "complete.json"
 
-# CRITICAL FIX: Corrected URL to your 'V' repo
+# CRITICAL: Your GitHub URL is the Primary Source
 DOWNLOAD_URLS = [
-    "https://raw.githubusercontent.com/shritish20/V/main/data/complete.json.gz",  # CORRECTED URL
-    "https://assets.upstox.com/feed/instruments/NSE_FO/complete.json.gz",          # Fallback
-    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",     # Fallback
+    "https://raw.githubusercontent.com/shritish20/V/main/data/complete.json.gz",  # CORRECT REPO
+    "https://assets.upstox.com/feed/instruments/NSE_FO/complete.json.gz",
+    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
 ]
 
 class InstrumentMaster:
     """
     PRODUCTION-READY Instrument Master.
-    - Downloads directly from your GitHub (Reliable)
-    - Auto-detects local files if download fails
-    - Fixes "N/A" Expiry Issues
+    - Downloads directly from your GitHub 'V' repo.
+    - Robustly handles JSON/GZIP.
+    - Guarantees Weekly & Monthly expiry sorting.
     """
     def __init__(self):
         self.df: Optional[pd.DataFrame] = None
@@ -69,20 +69,20 @@ class InstrumentMaster:
                 except Exception as e:
                     logger.error(f"❌ Cache load failed: {e}")
             
-            # Try raw JSON if CSV missing
-            if JSON_FILE_GZ.exists():
-                try:
-                    self._process_json_to_csv(JSON_FILE_GZ, is_gzip=True)
-                    return
-                except Exception as e:
-                    logger.error(f"❌ GZ JSON Rebuild failed: {e}")
-
+            # Try raw JSON if CSV missing (Handle both .json and .gz)
             if JSON_FILE_PLAIN.exists():
                 try:
                     self._process_json_to_csv(JSON_FILE_PLAIN, is_gzip=False)
                     return
                 except Exception as e:
                     logger.error(f"❌ Plain JSON Rebuild failed: {e}")
+
+            if JSON_FILE_GZ.exists():
+                try:
+                    self._process_json_to_csv(JSON_FILE_GZ, is_gzip=True)
+                    return
+                except Exception as e:
+                    logger.error(f"❌ GZ JSON Rebuild failed: {e}")
 
         if self.df is None:
             logger.critical("🔥 CRITICAL: No instrument data available. System is Blind.")
@@ -182,8 +182,15 @@ class InstrumentMaster:
         
         self.df["expiry"] = pd.to_datetime(self.df["expiry"], errors='coerce').dt.date
         self.last_updated = datetime.now()
-        
         self._cache_options.clear()
+        
+        # LOGGING CONFIRMATION
+        nifty_exp = self.get_all_expiries("NIFTY")
+        if len(nifty_exp) >= 2:
+            logger.info(f"✅ NIFTY Expiries: Weekly={nifty_exp[0]}, Monthly={nifty_exp[-1]}")
+        else:
+            logger.warning(f"⚠️ NIFTY Expiries found: {nifty_exp}")
+
         logger.info(f"🚀 Instrument Master Ready ({len(self.df)} contracts)")
 
     # --- LOOKUP METHODS ---
@@ -210,6 +217,7 @@ class InstrumentMaster:
         cache_key = f"{symbol}_{strike}_{option_type}_{expiry_date}"
         if cache_key in self._cache_options: return self._cache_options[cache_key]
 
+        # Fuzzy match strike (within 2 points)
         mask = (
             (self.df["expiry"] == expiry_date) &
             (self.df["instrument_type"] == option_type) &
