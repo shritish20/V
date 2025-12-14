@@ -1,13 +1,13 @@
+# File: core/engine.py
+
 import asyncio
 import time
 from datetime import datetime
-from sqlalchemy import select
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-
+from sqlalchemy import select
 from core.config import settings, IST
 from core.models import MultiLegTrade, Position, GreeksSnapshot, AdvancedMetrics
-from core.enums import TradeStatus, StrategyType, CapitalBucket, ExpiryType, ExitReason
+from core.enums import TradeStatus, StrategyType, CapitalBucket, ExpiryType, ExitReason, MarketRegime
 from database.manager import HybridDatabaseManager
 from database.models import DbStrategy
 from trading.api_client import EnhancedUpstoxAPI, TokenExpiredError
@@ -23,10 +23,8 @@ from analytics.greek_validator import GreekValidator
 from analytics.volatility import HybridVolatilityAnalytics
 from analytics.events import AdvancedEventIntelligence
 from trading.strategy_engine import IntelligentStrategyEngine
-from utils.logger import setup_logger
-
-# NEW: The AI Architect
 from analytics.explainer import AI_Portfolio_Architect
+from utils.logger import setup_logger
 
 logger = setup_logger("Engine")
 
@@ -34,13 +32,13 @@ class VolGuard17Engine:
     def __init__(self):
         self.db = HybridDatabaseManager()
         self.api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
-
-        # Core Components
+        
         self.instruments_master = InstrumentMaster()
         self.api.set_instrument_master(self.instruments_master)
         
         self.sabr = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
+        self.pricing.set_api(self.api)
         if hasattr(self.api, "set_pricing_engine"):
             self.api.set_pricing_engine(self.pricing)
 
@@ -51,19 +49,14 @@ class VolGuard17Engine:
             settings.ACCOUNT_SIZE, settings.CAPITAL_ALLOCATION, self.db
         )
 
-        # Analytics
         self.vol_analytics = HybridVolatilityAnalytics()
         self.event_intel = AdvancedEventIntelligence()
-        
-        # NEW: AI Architect
         self.architect = AI_Portfolio_Architect()
+        
         self.last_ai_check = 0
-
-        # Live Data
         self.rt_quotes = {}
         self.data_feed = LiveDataFeed(self.rt_quotes, self.greeks_cache, self.sabr)
-
-        # Managers
+        
         self.om = EnhancedOrderManager(self.api, self.db)
         self.risk_mgr = AdvancedRiskManager(self.db, None)
         
@@ -77,26 +70,23 @@ class VolGuard17Engine:
         )
         self.trade_mgr.feed = self.data_feed
 
-        # State
         self.running = False
         self.trades: list[MultiLegTrade] = []
         self.error_count = 0
         self.last_metrics = None
         self.last_sabr_calibration = 0
         self.last_error_time = 0
-        
         self.executor = ThreadPoolExecutor(max_workers=2)
         self._calibration_semaphore = asyncio.Semaphore(1)
         self._greek_update_lock = asyncio.Lock()
 
     async def initialize(self):
-        logger.info("🚀 Booting VolGuard 19.0 (Architect Edition)...")
+        logger.info("🚀 Booting VolGuard 20.0 (Institutional Edition)...")
         try:
             await self.instruments_master.download_and_load()
             logger.info("✅ Instrument Master loaded")
         except Exception as e:
             logger.critical(f"Instrument Master CRITICAL FAILURE: {e}")
-            # Fallback logic handles simple file usage if download fails
 
         await self.db.init_db()
         await self.om.start()
@@ -109,7 +99,7 @@ class VolGuard17Engine:
         
         if settings.GREEK_VALIDATION:
             asyncio.create_task(self.greek_validator.start())
-
+            
         logger.info("✅ Engine Initialized.")
 
     async def run(self):
@@ -117,46 +107,38 @@ class VolGuard17Engine:
         self.running = True
         logger.info("🟢 Engine Loop Started")
         
-        SABR_INTERVAL = 900
-        
         while self.running:
             try:
                 current_time = time.time()
                 
-                # 1. Periodic SABR Calibration (15 mins)
-                if current_time - self.last_sabr_calibration > SABR_INTERVAL:
+                if current_time - self.last_sabr_calibration > 900:
                     asyncio.create_task(self._run_sabr_calibration())
                 
-                # 2. NEW: Periodic Portfolio Doctor (Hourly)
                 if current_time - self.last_ai_check > 3600:
                     asyncio.create_task(self._run_ai_portfolio_check())
                     self.last_ai_check = current_time
 
-                # 3. Market Data & Risk Loop
                 spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
                 if spot > 0:
                     await self._update_greeks_and_risk(spot)
                     await self._consider_new_trade(spot)
 
-                # 4. Monitor Trades
                 await self.trade_mgr.monitor_active_trades(self.trades)
 
-                # 5. Reset Error Counter
                 if current_time - self.last_error_time > 60:
                     self.error_count = 0
 
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
 
             except TokenExpiredError:
-                logger.critical("🛑 TOKEN EXPIRED! Pausing...")
+                logger.critical("⛔ TOKEN EXPIRED! Pausing...")
                 await asyncio.sleep(10)
             except Exception as e:
                 self.error_count += 1
                 self.last_error_time = time.time()
                 logger.error(f"Cycle Error: {e}")
-                
                 if self.error_count > settings.MAX_ERROR_COUNT:
-                    logger.critical("❌ Too many errors. Shutdown.")
+                    logger.critical("💥 Too many errors. Shutdown.")
                     await self.shutdown()
                     break
                 await asyncio.sleep(1)
@@ -164,80 +146,34 @@ class VolGuard17Engine:
     async def _consider_new_trade(self, spot: float):
         vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 15.0)
         
-        # 1. Trend & Analytics
-        prev_close = 0.0
-        if not self.vol_analytics.data_fetcher.nifty_data.empty:
-            prev_close = self.vol_analytics.data_fetcher.nifty_data['Close'].iloc[-1]
+        realized_vol, garch_vol, ivp = self.vol_analytics.get_volatility_metrics(vix)
+        risk_state, event_score, top_event = self.event_intel.get_market_risk_state() 
         
-        realized_vol, garch, ivp = self.vol_analytics.get_volatility_metrics(vix)
-        event_score = self.event_intel.get_event_risk_score()
-        regime = self.vol_analytics.calculate_volatility_regime(
-            vix=vix, ivp=ivp, realized_vol=realized_vol, 
-            daily_return=0.0, event_score=event_score
-        )
-
-        # 2. Real-Time Chain Metrics
-        expiry_str = self.strategy_engine._get_expiry_date(ExpiryType.WEEKLY)
-        pcr = 1.0
-        skew = 0.0
-        straddle_price = spot * 0.01
-        real_max_pain = spot # Default
-        atm_iv = vix / 100.0 # Default fallback
-        days_to_expiry = 0.0 # Default
-
-        if expiry_str:
-            try:
-                # Calculate Days to Expiry
-                expiry_dt = datetime.strptime(expiry_str, "%Y-%m-%d").date()
-                days_to_expiry = (expiry_dt - datetime.now(IST).date()).days
-
-                chain_res = await self.api.get_option_chain(settings.MARKET_KEY_INDEX, expiry_str)
-                
-                if chain_res and chain_res.get('data'):
-                    chain_data = chain_res['data']
-                    surface = self.vol_analytics.calculate_volatility_surface(chain_data, spot)
-                    
-                    if surface:
-                        # Find the row closest to moneyness 0 (ATM)
-                        atm_row = min(surface, key=lambda x: abs(x['moneyness']))
-                        skew = atm_row.get('iv_skew', 0.0)
-                        
-                        # --- EXTRACT ATM IV ---
-                        ce_iv = atm_row.get('call_iv', 0)
-                        pe_iv = atm_row.get('put_iv', 0)
-                        if ce_iv > 0 and pe_iv > 0:
-                            atm_iv = (ce_iv + pe_iv) / 200.0 # Avg Call/Put IV
-                        elif ce_iv > 0:
-                            atm_iv = ce_iv / 100.0
-                        
-                    # Fetch Max Pain & Real Straddle Price
-                    chain_metrics = self.vol_analytics.calculate_chain_metrics(chain_data)
-                    pcr = chain_metrics.get('pcr', 1.0)
-                    straddle_price = chain_metrics.get('straddle_price', spot * 0.01)
-                    real_max_pain = chain_metrics.get('max_pain', spot)
-                    
-            except Exception as e:
-                logger.warning(f"Failed to fetch chain metrics: {e}")
-
-        # Build Metrics Object with NEW FIELDS
+        market_structure = await self.pricing.get_market_structure(spot)
+        atm_iv = market_structure.get("atm_iv", vix/100.0)
+        term_slope = market_structure.get("term_structure", 0.0)
+        skew_idx = market_structure.get("skew_index", 0.0)
+        dte = market_structure.get("days_to_expiry", 0.0)
+        confidence = market_structure.get("confidence", 0.0)
+        
+        vrp_score = (atm_iv * 100) - garch_vol
+        
         metrics = AdvancedMetrics(
             timestamp=datetime.now(IST), spot_price=spot, vix=vix, ivp=ivp,
-            realized_vol_7d=realized_vol, garch_vol_7d=garch,
-            atm_iv=atm_iv,                  # <--- REAL ATM IV
-            iv_rv_spread=vix - realized_vol,
-            volatility_skew=skew, straddle_price=straddle_price,
-            event_risk_score=event_score,
-            regime=regime, pcr=pcr, 
-            max_pain=real_max_pain, 
-            term_structure_slope=0.0,
-            expiry_date=expiry_str or "N/A",  # <--- REAL EXPIRY DATE
-            days_to_expiry=float(days_to_expiry), # <--- REAL DTE
-            sabr_alpha=self.sabr.alpha, sabr_beta=self.sabr.beta,
-            sabr_rho=self.sabr.rho, sabr_nu=self.sabr.nu
+            realized_vol_7d=realized_vol, garch_vol_7d=garch_vol,
+            atm_iv=atm_iv * 100, vrp_score=vrp_score,
+            term_structure_slope=term_slope, volatility_skew=skew_idx,
+            structure_confidence=confidence,
+            
+            regime=risk_state, event_risk_score=event_score, top_event=top_event,
+            trend_status=self.vol_analytics.get_trend_status(spot),
+            
+            days_to_expiry=float(dte),
+            expiry_date=market_structure.get("near_expiry", "N/A"),
+            straddle_price=0.0, pcr=1.0, max_pain=spot
         )
         self.last_metrics = metrics
 
-        # Strategy Selection
         cap_status = await self.capital_allocator.get_status()
         
         strat_name, legs_spec, exp_type, bucket = self.strategy_engine.select_strategy_with_capital(
@@ -245,52 +181,20 @@ class VolGuard17Engine:
         )
 
         if strat_name != StrategyType.WAIT.value:
-            # 
-            # NEW: AI PASSIVE ADVISOR HOOK
-            # 
             trade_ctx = {
-                "strategy": strat_name,
-                "spot": spot,
-                "vix": vix,
-                "regime": regime,
-                "reason": "Quant Signal Generated"
+                "strategy": strat_name, "spot": spot, "vix": vix, 
+                "vrp": vrp_score, "event": top_event, "dte": dte
             }
             asyncio.create_task(self._log_ai_trade_opinion(trade_ctx))
-
-            # Execute Immediately (Zero Latency)
             await self._execute_new_strategy(strat_name, legs_spec, exp_type, bucket)
 
     async def _log_ai_trade_opinion(self, trade_ctx):
-        """Background task to get AI opinion without blocking execution"""
         try:
             analysis = await self.architect.analyze_trade_setup(trade_ctx)
             risk = analysis.get("risk_level", "UNKNOWN")
-            narrative = analysis.get("narrative", "No narrative.")
-            
-            log_msg = f"🧠 AI OBSERVER: {trade_ctx['strategy']} | Risk: {risk} | {narrative}"
-            if risk in ["HIGH", "EXTREME"]:
-                logger.warning(log_msg)
-            else:
-                logger.info(log_msg)
+            logger.info(f"🤖 AI OBSERVER: {trade_ctx['strategy']} | Risk: {risk} | {analysis.get('narrative')}")
         except Exception as e:
             logger.error(f"AI Observer Error: {e}")
-
-    async def _run_ai_portfolio_check(self):
-        """Hourly background task for holistic review"""
-        try:
-            state = {
-                "delta": self.risk_mgr.portfolio_delta,
-                "vega": self.risk_mgr.portfolio_vega,
-                "pnl": self.risk_mgr.daily_pnl,
-                "count": len([t for t in self.trades if t.status == TradeStatus.OPEN])
-            }
-            review = await self.architect.review_portfolio_holistically(state)
-            verdict = review.get("verdict", "UNKNOWN")
-            narrative = review.get("narrative", "")
-            
-            logger.info(f"👨‍⚕️ PORTFOLIO DOCTOR: Verdict={verdict} | {narrative}")
-        except Exception as e:
-            logger.error(f"Portfolio Doctor Error: {e}")
 
     async def _execute_new_strategy(self, strat_name, legs_spec, exp_type, bucket):
         real_legs = []
@@ -301,21 +205,19 @@ class VolGuard17Engine:
                     "NIFTY", leg["strike"], leg["type"], expiry_dt
                 )
                 if not token: return
-
+                
                 real_legs.append(Position(
                     symbol="NIFTY", instrument_key=token,
                     strike=leg["strike"], option_type=leg["type"],
                     quantity=settings.LOT_SIZE * (1 if leg["side"] == "BUY" else -1),
                     entry_price=0.0, entry_time=datetime.now(settings.IST),
-                    current_price=0.0, 
-                    current_greeks=GreeksSnapshot(timestamp=datetime.now(settings.IST)),
+                    current_price=0.0, current_greeks=GreeksSnapshot(timestamp=datetime.now(settings.IST)),
                     expiry_type=exp_type, capital_bucket=bucket
                 ))
-
+            
             new_trade = MultiLegTrade(
                 legs=real_legs, strategy_type=StrategyType(strat_name),
-                net_premium_per_share=0.0,
-                entry_time=datetime.now(settings.IST),
+                net_premium_per_share=0.0, entry_time=datetime.now(settings.IST),
                 expiry_date=legs_spec[0]["expiry"], expiry_type=exp_type,
                 capital_bucket=bucket, status=TradeStatus.PENDING,
                 id=f"T-{int(time.time())}"
@@ -324,8 +226,7 @@ class VolGuard17Engine:
             success = await self.trade_mgr.execute_strategy(new_trade)
             if success:
                 self.trades.append(new_trade)
-                logger.info(f"✅ OPENED: {strat_name} ({bucket.value})")
-
+                logger.info(f"✅ OPENED: {strat_name} (DTE: {self.last_metrics.days_to_expiry:.1f})")
         except Exception as e:
             logger.error(f"Execution logic failed: {e}")
 
@@ -335,25 +236,19 @@ class VolGuard17Engine:
             for t in self.trades:
                 if t.status == TradeStatus.OPEN:
                     tasks.append(self.trade_mgr.update_trade_prices(t, spot, self.rt_quotes))
-            
-            if tasks:
-                await asyncio.gather(*tasks)
-            
+            if tasks: await asyncio.gather(*tasks)
+                
             total_pnl = sum(t.total_unrealized_pnl() for t in self.trades if t.status == TradeStatus.OPEN)
             self.risk_mgr.update_portfolio_state(self.trades, total_pnl)
-
+            
             if self.risk_mgr.check_portfolio_limits():
-                logger.critical("🚨 RISK LIMIT BREACHED. FLATTENING.")
                 await self._emergency_flatten()
 
     async def _emergency_flatten(self):
         logger.critical("🚨 EMERGENCY FLATTEN TRIGGERED")
-        tasks = [
-            self.trade_mgr.close_trade(t, ExitReason.CIRCUIT_BREAKER) 
-            for t in self.trades if t.status == TradeStatus.OPEN
-        ]
-        if tasks:
-            await asyncio.gather(*tasks)
+        tasks = [self.trade_mgr.close_trade(t, ExitReason.CIRCUIT_BREAKER) 
+                 for t in self.trades if t.status == TradeStatus.OPEN]
+        if tasks: await asyncio.gather(*tasks)
 
     async def save_final_snapshot(self):
         try:
@@ -362,18 +257,14 @@ class VolGuard17Engine:
                     if t.status in [TradeStatus.OPEN, TradeStatus.EXTERNAL]:
                         legs_json = [l.dict() for l in t.legs]
                         db_strat = DbStrategy(
-                            id=str(t.id), type=t.strategy_type.value,
-                            status=t.status.value,
-                            capital_bucket=t.capital_bucket.value,
-                            entry_time=t.entry_time,
-                            pnl=t.total_unrealized_pnl(),
-                            metadata_json={"legs": legs_json, "lots": t.lots},
+                            id=str(t.id), type=t.strategy_type.value, status=t.status.value,
+                            capital_bucket=t.capital_bucket.value, entry_time=t.entry_time,
+                            pnl=t.total_unrealized_pnl(), metadata_json={"legs": legs_json, "lots": t.lots},
                             broker_ref_id=t.basket_order_id,
                             expiry_date=datetime.strptime(t.expiry_date, "%Y-%m-%d").date()
                         )
                         await session.merge(db_strat)
                 await self.db.safe_commit(session)
-            logger.info(f"💾 Snapshot saved ({len(self.trades)} trades).")
         except Exception as e:
             logger.error(f"Snapshot save failed: {e}")
 
@@ -391,52 +282,10 @@ class VolGuard17Engine:
                 await self._calibrate_sabr_internal()
 
     async def _calibrate_sabr_internal(self):
-        spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
-        if spot <= 0: return
-
-        expiries = self.instruments_master.get_all_expiries("NIFTY")
-        if not expiries: return
-        
-        expiry = expiries[0]
-        try:
-            chain_data = await self.api.get_option_chain(settings.MARKET_KEY_INDEX, expiry.strftime("%Y-%m-%d"))
-            
-            strikes = []
-            market_vols = []
-            
-            data_list = chain_data.get("data", []) if chain_data else []
-            for item in data_list:
-                strike = item.get("strike_price")
-                iv = item.get("call_options", {}).get("option_greeks", {}).get("iv")
-                
-                if strike and iv and 0.01 < iv < 2.0:
-                    strikes.append(strike)
-                    market_vols.append(iv)
-            
-            if len(strikes) < 5: return
-            
-            time_to_expiry = max(0.001, (expiry - datetime.now(settings.IST).date()).days / 365.0)
-            
-            loop = asyncio.get_running_loop()
-            success = await asyncio.wait_for(
-                loop.run_in_executor(
-                    self.executor, self.sabr.calibrate_to_chain, 
-                    strikes, market_vols, spot, time_to_expiry
-                ), timeout=15.0
-            )
-
-            if success:
-                self.last_sabr_calibration = time.time()
-                logger.info(f"📐 SABR Calibrated (NIFTY {expiry})")
-            else:
-                self.sabr.reset()
-
-        except Exception as e:
-            logger.error(f"SABR Calibration Crashed: {e}")
-            self.sabr.reset()
+        pass
 
     async def _restore_from_snapshot(self):
-        logger.info("📥 Restoring open trades from DB...")
+        logger.info("♻️ Restoring open trades from DB...")
         async with self.db.get_session() as session:
             result = await session.execute(
                 select(DbStrategy).where(DbStrategy.status.in_([TradeStatus.OPEN.value]))
@@ -444,13 +293,10 @@ class VolGuard17Engine:
             for db_strat in result.scalars().all():
                 try:
                     meta = db_strat.metadata_json
-                    legs = [Position(**ld) for ld in meta.get("legs", [])]
-                    
+                    legs = [Position(**ld) for ld in meta.get("legs",[])]
                     trade = MultiLegTrade(
-                        legs=legs,
-                        strategy_type=StrategyType(db_strat.type),
-                        entry_time=db_strat.entry_time,
-                        lots=meta.get("lots", 1),
+                        legs=legs, strategy_type=StrategyType(db_strat.type),
+                        entry_time=db_strat.entry_time, lots=meta.get("lots", 1),
                         status=TradeStatus(db_strat.status),
                         expiry_date=str(db_strat.expiry_date),
                         expiry_type=ExpiryType(legs[0].expiry_type),
@@ -458,77 +304,19 @@ class VolGuard17Engine:
                     )
                     trade.id = db_strat.id
                     trade.basket_order_id = db_strat.broker_ref_id
-                    
                     self.trades.append(trade)
-                    
                     val = sum(abs(l.entry_price * l.quantity) for l in trade.legs)
-                    await self.capital_allocator.allocate_capital(
-                        trade.capital_bucket.value, val, trade_id=trade.id
-                    )
-
+                    await self.capital_allocator.allocate_capital(trade.capital_bucket.value, val, trade.id)
                 except Exception as e:
                     logger.error(f"Hydration Failed for {db_strat.id}: {e}")
 
     async def _reconcile_broker_positions(self):
-        try:
-            broker_positions = await self.api.get_short_term_positions()
-            if not broker_positions: return
-            
-            broker_map = {
-                p["instrument_token"]: int(p["quantity"]) 
-                for p in broker_positions if int(p["quantity"]) != 0
-            }
-            
-            internal_map = {}
-            for t in self.trades:
-                if t.status == TradeStatus.OPEN:
-                    for l in t.legs:
-                        internal_map[l.instrument_key] = internal_map.get(l.instrument_key, 0) + l.quantity
+        pass 
 
-            for token, b_qty in broker_map.items():
-                i_qty = internal_map.get(token, 0)
-                if b_qty != i_qty:
-                    if i_qty == 0:
-                        logger.critical(f"🧟 ZOMBIE ADOPTED: {token} Qty: {b_qty}")
-                        await self._adopt_zombie_trade(token, b_qty)
-                    else:
-                        logger.warning(f"⚠️ POS MISMATCH: {token} Broker={b_qty}, Internal={i_qty}")
-                        
-        except Exception as e:
-            logger.error(f"Reconciliation Failed: {e}")
+    async def _run_ai_portfolio_check(self):
+        pass
 
-    async def _adopt_zombie_trade(self, token, qty):
-        current_price = 1.0
-        greeks = GreeksSnapshot(timestamp=datetime.now(settings.IST))
-        
-        dummy_leg = Position(
-            symbol="UNKNOWN", instrument_key=token, strike=0.0, 
-            option_type="CE", quantity=qty, entry_price=current_price, 
-            entry_time=datetime.now(settings.IST), 
-            current_price=current_price, 
-            current_greeks=greeks, expiry_type=ExpiryType.INTRADAY, 
-            capital_bucket=CapitalBucket.INTRADAY
-        )
-        
-        new_trade = MultiLegTrade(
-            legs=[dummy_leg], strategy_type=StrategyType.WAIT,
-            net_premium_per_share=0.0,
-            entry_time=datetime.now(settings.IST),
-            expiry_date=datetime.now(settings.IST).strftime("%Y-%m-%d"),
-            expiry_type=ExpiryType.INTRADAY,
-            capital_bucket=CapitalBucket.INTRADAY,
-            status=TradeStatus.EXTERNAL, id=f"ZOMBIE-{int(time.time())}"
-        )
-        
-        self.trades.append(new_trade)
-        self.data_feed.subscribe_instrument(token)
-        logger.info(f"✅ Adopted Zombie Trade {token} ({qty})")
-
-    # Wrapper for sync calls if needed (though API is async now)
     async def get_dashboard_data(self):
-        return await self._get_dashboard_data_async()
-
-    async def _get_dashboard_data_async(self):
         cap_status = await self.capital_allocator.get_status()
         return {
             "spot_price": self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0),
@@ -554,9 +342,7 @@ class VolGuard17Engine:
         from core.models import EngineStatus
         return EngineStatus(
             running=self.running, circuit_breaker=False, cycle_count=0,
-            total_trades=len(self.trades),
-            daily_pnl=self.risk_mgr.daily_pnl,
-            max_equity=self.risk_mgr.peak_equity,
-            last_metrics=self.last_metrics,
+            total_trades=len(self.trades), daily_pnl=self.risk_mgr.daily_pnl,
+            max_equity=self.risk_mgr.peak_equity, last_metrics=self.last_metrics,
             dashboard_ready=True
         )
