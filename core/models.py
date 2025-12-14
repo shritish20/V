@@ -128,7 +128,7 @@ class AdvancedMetrics:
     vix: float
     ivp: float
     
-    # --- PRO METRICS ---
+    # --- PRO METRICS (MANDATORY) ---
     realized_vol_7d: float      
     garch_vol_7d: float         
     atm_iv: float               
@@ -136,20 +136,22 @@ class AdvancedMetrics:
     
     term_structure_slope: float 
     volatility_skew: float      
-    structure_confidence: float = 1.0 # Data Quality Flag
     
-    # --- CONTEXT ---
+    # --- CONTEXT (MANDATORY) ---
     trend_status: str           
     event_risk_score: float     
     regime: str                 
-    top_event: str = "None"     
     
-    # --- EXECUTION ---
+    # --- EXECUTION (MANDATORY) ---
     straddle_price: float
     pcr: float
     max_pain: float
     expiry_date: str
     days_to_expiry: float       
+    
+    # --- OPTIONAL FIELDS (DEFAULTS MUST BE LAST) ---
+    structure_confidence: float = 1.0 # Data Quality Flag
+    top_event: str = "None"     
     
     # SABR
     sabr_alpha: float = 0.0
