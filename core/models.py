@@ -118,6 +118,24 @@ class MultiLegTrade(BaseModel):
         self.trade_vega = sum((leg.current_greeks.vega or 0.0) * leg.quantity for leg in self.legs)
 
 # ==========================================
+# MANUAL REQUEST MODELS (FIXED: Added Back)
+# ==========================================
+
+class ManualLegRequest(BaseModel):
+    symbol: str = "NIFTY"
+    strike: float = Field(..., gt=0)
+    option_type: str = Field(..., pattern="^(CE|PE)$")
+    side: str = Field(..., pattern="^(BUY|SELL)$")
+    expiry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    quantity: int = Field(..., gt=0, le=1800)
+
+class ManualTradeRequest(BaseModel):
+    strategy_name: str = "MANUAL"
+    legs: List[ManualLegRequest]
+    capital_bucket: CapitalBucket = CapitalBucket.INTRADAY
+    tag: str = "Discretionary"
+
+# ==========================================
 # METRICS MODELS
 # ==========================================
 
