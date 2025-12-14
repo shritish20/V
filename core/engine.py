@@ -1,5 +1,3 @@
-# File: core/engine.py
-
 import asyncio
 import time
 from datetime import datetime
@@ -33,17 +31,21 @@ class VolGuard17Engine:
         self.db = HybridDatabaseManager()
         self.api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
         
+        # 1. Instrument Master (The Phonebook)
         self.instruments_master = InstrumentMaster()
         self.api.set_instrument_master(self.instruments_master)
         
+        # 2. Analytics Core
         self.sabr = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
         self.pricing.set_api(self.api)
+        self.pricing.instrument_master = self.instruments_master # Explicit Link
         if hasattr(self.api, "set_pricing_engine"):
             self.api.set_pricing_engine(self.pricing)
 
         self.greeks_cache = {}
         self.greek_validator = GreekValidator(self.greeks_cache, self.sabr, settings.GREEK_REFRESH_SEC)
+        self.greek_validator.set_instrument_master(self.instruments_master)
         
         self.capital_allocator = SmartCapitalAllocator(
             settings.ACCOUNT_SIZE, settings.CAPITAL_ALLOCATION, self.db
@@ -57,6 +59,7 @@ class VolGuard17Engine:
         self.rt_quotes = {}
         self.data_feed = LiveDataFeed(self.rt_quotes, self.greeks_cache, self.sabr)
         
+        # 3. Execution Managers
         self.om = EnhancedOrderManager(self.api, self.db)
         self.risk_mgr = AdvancedRiskManager(self.db, None)
         
@@ -70,6 +73,7 @@ class VolGuard17Engine:
         )
         self.trade_mgr.feed = self.data_feed
 
+        # 4. Engine State
         self.running = False
         self.trades: list[MultiLegTrade] = []
         self.error_count = 0
@@ -82,17 +86,24 @@ class VolGuard17Engine:
 
     async def initialize(self):
         logger.info("🚀 Booting VolGuard 20.0 (Institutional Edition)...")
+        
+        # A. Download Instruments (Real Data Only)
         try:
             await self.instruments_master.download_and_load()
             logger.info("✅ Instrument Master loaded")
         except Exception as e:
             logger.critical(f"Instrument Master CRITICAL FAILURE: {e}")
-
+            # In production, we might want to exit here if no data
+            
+        # B. Database & Order Manager
         await self.db.init_db()
         await self.om.start()
+        
+        # C. Restore State
         await self._restore_from_snapshot()
         await self._reconcile_broker_positions()
         
+        # D. Start Feeds
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_VIX)
         asyncio.create_task(self.data_feed.start())
@@ -111,20 +122,25 @@ class VolGuard17Engine:
             try:
                 current_time = time.time()
                 
+                # 1. Periodic SABR Calibration (15 mins)
                 if current_time - self.last_sabr_calibration > 900:
                     asyncio.create_task(self._run_sabr_calibration())
                 
+                # 2. Portfolio Doctor (Hourly)
                 if current_time - self.last_ai_check > 3600:
                     asyncio.create_task(self._run_ai_portfolio_check())
                     self.last_ai_check = current_time
 
+                # 3. Market Data & Risk Loop
                 spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
                 if spot > 0:
                     await self._update_greeks_and_risk(spot)
                     await self._consider_new_trade(spot)
 
+                # 4. Monitor Trades
                 await self.trade_mgr.monitor_active_trades(self.trades)
 
+                # 5. Reset Error Counter
                 if current_time - self.last_error_time > 60:
                     self.error_count = 0
 
@@ -146,47 +162,73 @@ class VolGuard17Engine:
     async def _consider_new_trade(self, spot: float):
         vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 15.0)
         
+        # 1. ANALYTICS
         realized_vol, garch_vol, ivp = self.vol_analytics.get_volatility_metrics(vix)
+        
+        # 2. EVENT INTEL
         risk_state, event_score, top_event = self.event_intel.get_market_risk_state() 
         
+        # 3. MARKET STRUCTURE (Deep Scan)
         market_structure = await self.pricing.get_market_structure(spot)
-        atm_iv = market_structure.get("atm_iv", vix/100.0)
-        term_slope = market_structure.get("term_structure", 0.0)
-        skew_idx = market_structure.get("skew_index", 0.0)
-        dte = market_structure.get("days_to_expiry", 0.0)
+        
+        # -- REAL DATA EXTRACTION --
+        atm_iv_decimal = market_structure.get("atm_iv", 0.0) # e.g. 0.145
         confidence = market_structure.get("confidence", 0.0)
+        dte = market_structure.get("days_to_expiry", 0.0)
         
-        vrp_score = (atm_iv * 100) - garch_vol
+        real_straddle_price = market_structure.get("straddle_price", 0.0)
+        real_term_slope = market_structure.get("term_structure", 0.0)
+        real_skew_idx = market_structure.get("skew_index", 0.0)
         
+        # VRP Calculation (Percent based)
+        # Convert decimal IV (0.145) to Percent (14.5) for proper comparison
+        atm_iv_percent = atm_iv_decimal * 100.0
+        vrp_score = atm_iv_percent - garch_vol
+        
+        # 4. METRICS PACKAGE
         metrics = AdvancedMetrics(
             timestamp=datetime.now(IST), spot_price=spot, vix=vix, ivp=ivp,
+            
+            # Pro Metrics
             realized_vol_7d=realized_vol, garch_vol_7d=garch_vol,
-            atm_iv=atm_iv * 100, vrp_score=vrp_score,
-            term_structure_slope=term_slope, volatility_skew=skew_idx,
+            atm_iv=atm_iv_percent, vrp_score=vrp_score,
+            
+            # Structure
+            term_structure_slope=real_term_slope, 
+            volatility_skew=real_skew_idx,
+            straddle_price=real_straddle_price,
             structure_confidence=confidence,
             
+            # Risk Context
             regime=risk_state, event_risk_score=event_score, top_event=top_event,
             trend_status=self.vol_analytics.get_trend_status(spot),
             
+            # Execution
             days_to_expiry=float(dte),
             expiry_date=market_structure.get("near_expiry", "N/A"),
-            straddle_price=0.0, pcr=1.0, max_pain=spot
+            
+            pcr=1.0, max_pain=spot,
+            sabr_alpha=self.sabr.alpha, sabr_beta=self.sabr.beta,
+            sabr_rho=self.sabr.rho, sabr_nu=self.sabr.nu
         )
         self.last_metrics = metrics
 
-        cap_status = await self.capital_allocator.get_status()
-        
-        strat_name, legs_spec, exp_type, bucket = self.strategy_engine.select_strategy_with_capital(
-            metrics, spot, cap_status
-        )
+        # 5. DATA INTEGRITY CHECK (Strict)
+        if confidence < 0.5:
+            # If Sunday or bad data, we STOP here. No trading.
+            return
 
-        if strat_name != StrategyType.WAIT.value:
+        # 6. STRATEGY SELECTION
+        cap_status = await self.capital_allocator.get_status()
+        strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(metrics, spot, cap_status)
+        
+        if strat != "WAIT":
             trade_ctx = {
-                "strategy": strat_name, "spot": spot, "vix": vix, 
+                "strategy": strat, "spot": spot, "vix": vix, 
                 "vrp": vrp_score, "event": top_event, "dte": dte
             }
             asyncio.create_task(self._log_ai_trade_opinion(trade_ctx))
-            await self._execute_new_strategy(strat_name, legs_spec, exp_type, bucket)
+            await self._execute_new_strategy(strat, legs, etype, bucket)
 
     async def _log_ai_trade_opinion(self, trade_ctx):
         try:
@@ -282,7 +324,51 @@ class VolGuard17Engine:
                 await self._calibrate_sabr_internal()
 
     async def _calibrate_sabr_internal(self):
-        pass
+        # Full Implementation of SABR Calibration
+        spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
+        if spot <= 0: return
+
+        expiries = self.instruments_master.get_all_expiries("NIFTY")
+        if not expiries: return
+        expiry = expiries[0]
+
+        try:
+            chain_res = await self.api.get_option_chain(settings.MARKET_KEY_INDEX, expiry.strftime("%Y-%m-%d"))
+            if not chain_res or not chain_res.get("data"): return
+            
+            strikes = []
+            market_vols = []
+            
+            for item in chain_res["data"]:
+                strike = item.get("strike_price")
+                iv = item.get("call_options", {}).get("option_greeks", {}).get("iv", 0)
+                # Normalize IV if needed
+                if iv > 5.0: iv /= 100.0
+                
+                if strike and iv > 0.01:
+                    strikes.append(strike)
+                    market_vols.append(iv)
+            
+            if len(strikes) < 5: return
+            
+            time_to_expiry = max(0.001, (expiry - datetime.now(settings.IST).date()).days / 365.0)
+            
+            loop = asyncio.get_running_loop()
+            success = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self.executor, self.sabr.calibrate_to_chain,
+                    strikes, market_vols, spot, time_to_expiry
+                ), timeout=15.0
+            )
+            
+            if success:
+                self.last_sabr_calibration = time.time()
+                logger.info(f"✅ SABR Calibrated (NIFTY {expiry})")
+            else:
+                self.sabr.reset()
+        except Exception as e:
+            logger.error(f"SABR Calibration Failed: {e}")
+            self.sabr.reset()
 
     async def _restore_from_snapshot(self):
         logger.info("♻️ Restoring open trades from DB...")
@@ -311,12 +397,73 @@ class VolGuard17Engine:
                     logger.error(f"Hydration Failed for {db_strat.id}: {e}")
 
     async def _reconcile_broker_positions(self):
-        pass 
+        try:
+            broker_positions = await self.api.get_short_term_positions()
+            if not broker_positions: return
+            
+            # Map Broker Positions
+            broker_map = {p["instrument_token"]: int(p["quantity"]) for p in broker_positions if int(p["quantity"]) != 0}
+            
+            # Map Internal Positions
+            internal_map = {}
+            for t in self.trades:
+                if t.status == TradeStatus.OPEN:
+                    for l in t.legs:
+                        internal_map[l.instrument_key] = internal_map.get(l.instrument_key, 0) + l.quantity
+            
+            # Compare
+            for token, b_qty in broker_map.items():
+                i_qty = internal_map.get(token, 0)
+                if b_qty != i_qty:
+                    if i_qty == 0:
+                        logger.critical(f"🧟 ZOMBIE ADOPTED: {token} Qty: {b_qty}")
+                        await self._adopt_zombie_trade(token, b_qty)
+                    else:
+                        logger.warning(f"⚠️ POS MISMATCH: {token} Broker={b_qty}, Internal={i_qty}")
+        except Exception as e:
+            logger.error(f"Reconciliation Failed: {e}")
+
+    async def _adopt_zombie_trade(self, token, qty):
+        current_price = 1.0 # Placeholder, will update on next tick
+        greeks = GreeksSnapshot(timestamp=datetime.now(settings.IST))
+        dummy_leg = Position(
+            symbol="UNKNOWN", instrument_key=token, strike=0.0,
+            option_type="CE", quantity=qty, entry_price=current_price,
+            entry_time=datetime.now(settings.IST),
+            current_price=current_price,
+            current_greeks=greeks, expiry_type=ExpiryType.INTRADAY,
+            capital_bucket=CapitalBucket.INTRADAY
+        )
+        new_trade = MultiLegTrade(
+            legs=[dummy_leg], strategy_type=StrategyType.WAIT,
+            net_premium_per_share=0.0,
+            entry_time=datetime.now(settings.IST),
+            expiry_date=datetime.now(settings.IST).strftime("%Y-%m-%d"),
+            expiry_type=ExpiryType.INTRADAY,
+            capital_bucket=CapitalBucket.INTRADAY,
+            status=TradeStatus.EXTERNAL, id=f"ZOMBIE-{int(time.time())}"
+        )
+        self.trades.append(new_trade)
+        self.data_feed.subscribe_instrument(token)
 
     async def _run_ai_portfolio_check(self):
-        pass
+        try:
+            state = {
+                "delta": self.risk_mgr.portfolio_delta,
+                "vega": self.risk_mgr.portfolio_vega,
+                "pnl": self.risk_mgr.daily_pnl,
+                "count": len([t for t in self.trades if t.status == TradeStatus.OPEN])
+            }
+            review = await self.architect.review_portfolio_holistically(state)
+            verdict = review.get("verdict", "UNKNOWN")
+            logger.info(f"👨‍⚕️ PORTFOLIO DOCTOR: Verdict={verdict} | {review.get('narrative')}")
+        except Exception as e:
+            logger.error(f"Portfolio Doctor Error: {e}")
 
     async def get_dashboard_data(self):
+        return await self._get_dashboard_data_async()
+
+    async def _get_dashboard_data_async(self):
         cap_status = await self.capital_allocator.get_status()
         return {
             "spot_price": self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0),
