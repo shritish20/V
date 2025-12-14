@@ -1,7 +1,9 @@
+# File: trading/strategy_engine.py
+
 import logging
-import time
-from datetime import datetime, timedelta, time as dtime
-from typing import List, Dict, Tuple, Optional
+import math
+from datetime import datetime
+from typing import List, Dict, Tuple
 from core.config import settings, IST
 from core.models import AdvancedMetrics
 from core.enums import StrategyType, ExpiryType, CapitalBucket
@@ -9,13 +11,6 @@ from core.enums import StrategyType, ExpiryType, CapitalBucket
 logger = logging.getLogger("StrategyEngine")
 
 class IntelligentStrategyEngine:
-    """
-    VolGuard 2.0 Strategy Engine (Institutional Grade)
-    Features:
-    - Multi-Factor Consensus (GARCH vs IV, Skew, PCR)
-    - Dynamic DTE Aggression (Theta Eater vs Gamma Guard)
-    - "No Fly Zone" Strike Safety (Straddle Price)
-    """
     def __init__(self, vol_analytics, event_intel, capital_allocator, pricing_engine):
         self.vol_analytics = vol_analytics
         self.event_intel = event_intel
@@ -27,173 +22,96 @@ class IntelligentStrategyEngine:
     def set_instruments_master(self, master):
         self.instruments_master = master
 
-    def select_strategy_with_capital(self, metrics: AdvancedMetrics, spot: float,
+    def select_strategy_with_capital(self, metrics: AdvancedMetrics, spot: float, 
                                    capital_status: Dict) -> Tuple[str, List[Dict], ExpiryType, CapitalBucket]:
         
         now = datetime.now(IST)
         bucket = CapitalBucket.WEEKLY
-        
-        # 1. Cooldown (5 mins)
+
+        # 1. Data Integrity Check (CRITICAL FIX)
+        if metrics.structure_confidence < 0.5:
+            logger.warning("⛔ WAIT: Market Data Integrity Low")
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
+
+        # 2. VRP Sanity Check (CRITICAL FIX)
+        if metrics.vrp_score > 15.0:
+            logger.critical(f"⛔ WAIT: VRP {metrics.vrp_score:.1f} too high (Model Mismatch)")
+            return "WAIT", [], ExpiryType.WEEKLY, bucket
+
+        # 3. Standard Checks
         if self.last_trade_time and (now - self.last_trade_time).total_seconds() < 300:
             return "WAIT", [], ExpiryType.WEEKLY, bucket
-
-        # 2. Capital Check (Min 2% or 1.5L)
+        
         available = capital_status.get("available", {}).get(bucket.value, 0)
-        min_req = max(settings.ACCOUNT_SIZE * 0.02, 150000)
-        if available < min_req:
+        if available < 250000: return "WAIT", [], ExpiryType.WEEKLY, bucket
+
+        expiry_date = metrics.expiry_date
+        if not expiry_date or expiry_date == "N/A": 
             return "WAIT", [], ExpiryType.WEEKLY, bucket
 
-        # 3. Get Valid Expiry
-        expiry_date = self._get_expiry_date(ExpiryType.WEEKLY)
-        if not expiry_date:
+        # --- LOGIC MATRIX ---
+        if metrics.regime == "BINARY_EVENT":
+            logger.warning(f"☢️ BINARY EVENT ({metrics.top_event}).")
+            if metrics.vrp_score < 0:
+                return "LONG_STRADDLE", self._generate_straddle(spot, expiry_date, "BUY"), ExpiryType.WEEKLY, bucket
             return "WAIT", [], ExpiryType.WEEKLY, bucket
 
-        # =========================================================
-        # PHASE 1: THE QUANT FILTER (Value & Safety)
-        # =========================================================
-        
-        # Safety Hard Stops
-        dangerous_regimes = ["PANIC", "FEAR_BACKWARDATION"]
-        if metrics.regime in dangerous_regimes:
-            logger.warning(f"⛔ Strategy Hold: Market Regime is {metrics.regime}")
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
-            
-        if metrics.event_risk_score >= 3.0:
-            logger.warning(f"⛔ Strategy Hold: High Event Risk ({metrics.event_risk_score})")
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
-            
-        if metrics.vix > 28.0:
-             logger.warning(f"⛔ Strategy Hold: VIX {metrics.vix} too high")
-             return "WAIT", [], ExpiryType.WEEKLY, bucket
+        dte = metrics.days_to_expiry
+        is_expiry_week = dte <= 2.0
+        vrp = metrics.vrp_score
+        is_rich = vrp > 4.0
+        is_cheap = vrp < 0.0
+        is_backwardation = metrics.term_structure_slope < -2.0
+        is_contango = metrics.term_structure_slope > 1.0
+        trend = metrics.trend_status
 
-        # Value Check: Is Volatility Cheap or Expensive? (IV vs GARCH)
-        # Positive = Expensive (Sell). Negative = Cheap (Trap).
-        # We look for a spread where Implied Vol is irrationally higher than Forecast
-        vol_premium = metrics.vix - metrics.garch_vol_7d
-        
-        # Thresholds
-        is_vol_expensive = vol_premium > 0.5   # Edge found
-        is_vol_cheap = vol_premium < -1.5      # Trap found
+        strategy = "WAIT"
 
-        # =========================================================
-        # PHASE 2: THE COMPASS (Directional Bias)
-        # =========================================================
-        bias = "NEUTRAL"
-        
-        # Put-Call Ratio Logic
-        if metrics.pcr > 1.25: 
-            bias = "BULLISH" # Strong Support
-        elif metrics.pcr < 0.70: 
-            bias = "BEARISH" # Strong Resistance
+        # --- SCENARIO 1: EXPIRY WEEK (Gamma Defense) ---
+        if is_expiry_week:
+            if is_rich: strategy = "IRON_FLY"
+            elif is_cheap: 
+                strategy = "LONG_CALENDAR_CALL" if trend == "BULLISH_TREND" else "LONG_CALENDAR_PUT"
+                bucket = CapitalBucket.MONTHLY
+        else: 
+            if is_rich and is_backwardation: strategy = "SHORT_STRANGLE"
+            elif trend == "BULLISH_TREND" and metrics.volatility_skew > 4.0:
+                strategy = "RATIO_SPREAD_PUT"
+            elif is_contango and (is_rich or 0 < vrp <= 4.0):
+                strategy = "IRON_CONDOR"
+            elif is_cheap:
+                strategy = "LONG_CALENDAR_CALL" if trend == "BULLISH_TREND" else "LONG_CALENDAR_PUT"
+                bucket = CapitalBucket.MONTHLY
 
-        # Optional: Gravity Check (Price vs Max Pain)
-        # If Price is significantly far from Max Pain, it might snap back
-        dist_pain = (spot - metrics.max_pain) / spot
-        if abs(dist_pain) > 0.015 and bias == "NEUTRAL":
-            if dist_pain > 0: bias = "BEARISH_LEAN" # Price too high
-            else: bias = "BULLISH_LEAN" # Price too low
+        if strategy != "WAIT":
+            legs = self._generate_pro_legs(strategy, spot, expiry_date, metrics)
+            if legs:
+                self.last_trade_time = now
+                return strategy, legs, ExpiryType.WEEKLY, bucket
 
-        # =========================================================
-        # PHASE 3: THE MATRIX (Strategy Selection)
-        # =========================================================
-        strategy_name = "WAIT"
+        return "WAIT", [], ExpiryType.WEEKLY, bucket
 
-        # A. DIRECTIONAL (Trend is King)
-        if bias in ["BULLISH", "BULLISH_LEAN"]:
-            strategy_name = "BULL_PUT_SPREAD"
-        
-        elif bias in ["BEARISH", "BEARISH_LEAN"]:
-            strategy_name = "BEAR_CALL_SPREAD"
-        
-        # B. NEUTRAL (Vol is King)
-        else:
-            # 1. Skew Exploit: Puts are insanely expensive? Sell Jade Lizard.
-            # (Jade Lizard = Short Put + Bear Call Spread)
-            # Only do this if Puts are expensive (High Skew) AND Vol is decent
-            if metrics.volatility_skew > 4.0 and is_vol_expensive:
-                strategy_name = "JADE_LIZARD"
-            
-            # 2. Income Harvest: Vol is expensive? Sell Strangle (Naked).
-            elif is_vol_expensive:
-                strategy_name = "SHORT_STRANGLE"
-                
-            # 3. Defensive: Vol is cheap (Trap) or Normal? Buy Iron Condor (Wings).
-            else:
-                strategy_name = "IRON_CONDOR"
-
-        # =========================================================
-        # PHASE 4: EXECUTION MAP (Strikes & DTE)
-        # =========================================================
-        
-        # Calculate Days to Expiry (DTE)
-        today_date = datetime.now(IST).date()
-        exp_dt = datetime.strptime(expiry_date, "%Y-%m-%d").date()
-        dte = (exp_dt - today_date).days
-
-        # Generate Legs with Safety Zones
-        legs = self._generate_smart_legs(strategy_name, spot, expiry_date, dte, metrics)
-        
-        if not legs:
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
-
-        # Final Sizing (Freeze Limits)
-        lots = self._calculate_dynamic_lots(available, 150000.0)
-        
-        # Final Freeze Check
-        if self._validate_freeze_limits(legs, lots):
-             self.last_trade_time = now
-             return strategy_name, legs, ExpiryType.WEEKLY, bucket
-        else:
-             # Try reducing lots if we hit freeze limit? 
-             # For safety, we just WAIT and log error in validate function
-             return "WAIT", [], ExpiryType.WEEKLY, bucket
-
-    def _generate_smart_legs(self, strategy_name: str, spot: float, expiry: str, dte: int, metrics: AdvancedMetrics) -> List[Dict]:
-        """
-        Generates legs using 'Theta Eater' logic (DTE) and 'Safety Zones' (Straddle Price).
-        """
+    def _generate_pro_legs(self, strategy, spot, expiry, metrics) -> List[Dict]:
         legs = []
-        
-        # 1. The Gamma Guard (DTE Logic)
-        # Mon/Tue (DTE > 2): Aggressive 30 Delta (Eat Theta)
-        # Wed/Thu (DTE <= 2): Defensive 20 Delta (Avoid Gamma)
-        target_delta = 0.30 if dte > 2 else 0.20
-        
-        # 2. The Safety Map (No Fly Zone)
-        # Never sell inside the expected move
-        expected_move = metrics.straddle_price if metrics.straddle_price > 0 else (spot * 0.01)
-        safe_floor = spot - (expected_move * 1.05) # 5% Buffer
-        safe_ceiling = spot + (expected_move * 1.05)
-        
-        width = 200.0 # Wing Width for spreads
-
         try:
-            # --- NEUTRAL: SHORT STRANGLE (Naked) ---
-            if strategy_name == "SHORT_STRANGLE":
-                # For naked, we are always a bit safer unless GARCH screams "FREE MONEY"
-                delta = 0.16 
-                ce = self._find_strike_by_delta(spot, "CE", expiry, delta)
-                pe = self._find_strike_by_delta(spot, "PE", expiry, delta)
-                
-                # Push out if inside safety zone
-                final_ce = max(ce, safe_ceiling)
-                final_pe = min(pe, safe_floor)
-                
+            dte = max(1.0, metrics.days_to_expiry)
+            iv = metrics.atm_iv if metrics.atm_iv > 0 else 15.0
+            implied_move = spot * (iv / 100.0) * math.sqrt(dte / 365.0)
+            width = max(100, round(implied_move / 50) * 50)
+            strangle_width = max(150, round((implied_move * 1.5) / 50) * 50)
+
+            if strategy == "IRON_FLY":
+                atm = self._round_strike(spot)
                 legs = [
-                    {"strike": final_ce, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": final_pe, "type": "PE", "side": "SELL", "expiry": expiry}
+                    {"strike": atm, "type": "CE", "side": "SELL", "expiry": expiry},
+                    {"strike": atm, "type": "PE", "side": "SELL", "expiry": expiry},
+                    {"strike": atm + width, "type": "CE", "side": "BUY", "expiry": expiry},
+                    {"strike": atm - width, "type": "PE", "side": "BUY", "expiry": expiry}
                 ]
 
-            # --- NEUTRAL: IRON CONDOR (Defined Risk) ---
-            elif strategy_name == "IRON_CONDOR":
-                # Sell at Target Delta (20 or 30)
-                raw_ce = self._find_strike_by_delta(spot, "CE", expiry, target_delta)
-                raw_pe = self._find_strike_by_delta(spot, "PE", expiry, target_delta)
-                
-                # Enforce Safety Zone
-                ce_sell = max(raw_ce, safe_ceiling)
-                pe_sell = min(raw_pe, safe_floor)
-                
+            elif strategy == "IRON_CONDOR":
+                ce_sell = self._round_strike(spot + implied_move)
+                pe_sell = self._round_strike(spot - implied_move)
                 legs = [
                     {"strike": ce_sell, "type": "CE", "side": "SELL", "expiry": expiry},
                     {"strike": ce_sell + width, "type": "CE", "side": "BUY", "expiry": expiry},
@@ -201,115 +119,75 @@ class IntelligentStrategyEngine:
                     {"strike": pe_sell - width, "type": "PE", "side": "BUY", "expiry": expiry}
                 ]
 
-            # --- BULLISH: BULL PUT SPREAD ---
-            elif strategy_name == "BULL_PUT_SPREAD":
-                # Sell Put (Bullish). We can be aggressive on Delta (target_delta)
-                raw_pe = self._find_strike_by_delta(spot, "PE", expiry, target_delta)
-                
-                # Safety: Don't sell above floor (too close to money)
-                pe_sell = min(raw_pe, safe_floor) 
-                
-                legs = [
-                    {"strike": pe_sell, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": pe_sell - width, "type": "PE", "side": "BUY", "expiry": expiry}
-                ]
-
-            # --- BEARISH: BEAR CALL SPREAD ---
-            elif strategy_name == "BEAR_CALL_SPREAD":
-                # Sell Call (Bearish)
-                raw_ce = self._find_strike_by_delta(spot, "CE", expiry, target_delta)
-                
-                # Safety: Don't sell below ceiling
-                ce_sell = max(raw_ce, safe_ceiling)
-                
+            elif strategy == "SHORT_STRANGLE":
+                ce_sell = self._round_strike(spot + strangle_width)
+                pe_sell = self._round_strike(spot - strangle_width)
                 legs = [
                     {"strike": ce_sell, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": ce_sell + width, "type": "CE", "side": "BUY", "expiry": expiry}
+                    {"strike": pe_sell, "type": "PE", "side": "SELL", "expiry": expiry}
                 ]
 
-            # --- SPECIAL: JADE LIZARD ---
-            elif strategy_name == "JADE_LIZARD":
-                # 1. Sell Big Put (Aggressive 30 Delta) - The Income Engine
-                # Jade Lizard relies on Put Credit to offset Call risk.
-                raw_pe = self._find_strike_by_delta(spot, "PE", expiry, 0.30)
-                pe_sell = min(raw_pe, safe_floor)
+            # BROKEN WING BUTTERFLY (Ratio Spread Fix)
+            elif strategy == "RATIO_SPREAD_PUT":
+                atm_pe = self._round_strike(spot)
+                otm_pe = self._round_strike(spot - implied_move)
                 
-                # 2. Sell Bear Call Spread (Conservative 15 Delta)
-                ce_sell = max(self._find_strike_by_delta(spot, "CE", expiry, 0.15), safe_ceiling)
+                # Capped Wing Distance (Max 1500pts)
+                wing_dist = min(1500, implied_move * 2.5)
+                disaster_wing = self._round_strike(spot - wing_dist)
                 
                 legs = [
-                    {"strike": pe_sell, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": ce_sell, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": ce_sell + width, "type": "CE", "side": "BUY", "expiry": expiry}
+                    {"strike": atm_pe, "type": "PE", "side": "BUY", "expiry": expiry},
+                    {"strike": otm_pe, "type": "PE", "side": "SELL", "expiry": expiry},
+                    {"strike": otm_pe, "type": "PE", "side": "SELL", "expiry": expiry},
+                    {"strike": disaster_wing, "type": "PE", "side": "BUY", "expiry": expiry} # SAFETY CAP
+                ]
+
+            elif "CALENDAR" in strategy:
+                far_expiry = self._get_far_expiry(expiry)
+                if not far_expiry: return []
+                atm = self._round_strike(spot)
+                otype = "CE" if "CALL" in strategy else "PE"
+                legs = [
+                    {"strike": atm, "type": otype, "side": "SELL", "expiry": expiry},
+                    {"strike": atm, "type": otype, "side": "BUY", "expiry": far_expiry}
+                ]
+            
+            elif strategy == "LONG_STRADDLE":
+                atm = self._round_strike(spot)
+                legs = [
+                    {"strike": atm, "type": "CE", "side": "BUY", "expiry": expiry},
+                    {"strike": atm, "type": "PE", "side": "BUY", "expiry": expiry}
                 ]
 
         except Exception as e:
-            logger.error(f"Leg Generation Error: {e}")
+            logger.error(f"Leg Gen Error: {e}")
             return []
-
+            
         return legs
 
-    # --- HELPER METHODS ---
-    
-    def _calculate_dynamic_lots(self, available, margin_per_lot):
-        raw_lots = int(available / margin_per_lot)
-        # 1. Cap by Config Max
-        capped_lots = min(raw_lots, settings.MAX_LOTS)
-        # 2. Cap by Exchange Freeze (1800 qty / 75 lot = 24 lots)
-        freeze_cap = settings.NIFTY_FREEZE_QTY // settings.LOT_SIZE
-        return min(capped_lots, freeze_cap)
+    def _round_strike(self, price):
+        return round(price / 50) * 50
 
-    def _validate_freeze_limits(self, legs, lots):
-        total_qty = lots * settings.LOT_SIZE
-        if total_qty > settings.NIFTY_FREEZE_QTY:
-            logger.error(f"🚫 Freeze Limit Breach: {total_qty} > {settings.NIFTY_FREEZE_QTY}")
-            return False
-        return True
-
-    def _find_strike_by_delta(self, spot: float, option_type: str, expiry: str, target_delta: float) -> float:
-        """
-        Binary Search for strike matching target Delta.
-        """
-        step = 50.0
-        # Initial guess based on spot
-        best_strike = round(spot / step) * step
-        best_error = float('inf')
+    def _get_far_expiry(self, near_expiry_str):
+        if not self.instruments_master: return None
+        all_exp = self.instruments_master.get_all_expiries("NIFTY")
+        if not all_exp: return None
         
-        # Define a search window (+/- 20% from spot)
-        lower_bound = int(spot * 0.8)
-        upper_bound = int(spot * 1.2)
+        near_dt = datetime.strptime(near_expiry_str, "%Y-%m-%d").date()
+        for e in all_exp:
+            days = (e - near_dt).days
+            if 25 <= days <= 45: return e.strftime("%Y-%m-%d")
         
-        # Iterate through strikes
-        # Note: In production, you might optimize this to not loop every 50pts, 
-        # but for Nifty, looping 100 strikes is very fast.
-        for strike in range(lower_bound, upper_bound, int(step)):
-            greeks = self.pricing.calculate_greeks(spot, strike, option_type, expiry)
-            
-            current_delta = abs(greeks.delta) if greeks.delta is not None else 0.0
-            error = abs(current_delta - target_delta)
-            
-            if error < best_error:
-                best_error = error
-                best_strike = strike
-        
-        return float(best_strike)
-
-    def _get_expiry_date(self, expiry_type: ExpiryType) -> Optional[str]:
-        # Rely on Instrument Master
-        if self.instruments_master:
-            try:
-                # Get all NIFTY expiries sorted
-                expiries = self.instruments_master.get_all_expiries("NIFTY")
-                if not expiries:
-                    return None
+        for e in all_exp:
+            days = (e - near_dt).days
+            if 7 < days <= 60: return e.strftime("%Y-%m-%d")
                 
-                # Logic for Weekly: Just return the nearest one
-                # Logic for Monthly: Return last Thursday of month
-                # For simplicity in this engine, we default to nearest available (Weekly logic)
-                # You can expand this if you specifically want Monthly buckets.
-                
-                return expiries[0].strftime("%Y-%m-%d")
-            except Exception as e:
-                logger.error(f"Expiry Lookup Failed: {e}")
-                return None
         return None
+
+    def _generate_straddle(self, spot, expiry, side="BUY"):
+        atm = self._round_strike(spot)
+        return [
+            {"strike": atm, "type": "CE", "side": side, "expiry": expiry},
+            {"strike": atm, "type": "PE", "side": side, "expiry": expiry}
+        ]
