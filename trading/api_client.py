@@ -7,9 +7,11 @@ from core.models import Order
 
 logger = logging.getLogger("UpstoxAPI")
 
+
 class TokenExpiredError(Exception):
     """Custom exception to signal immediate token refresh"""
     pass
+
 
 class EnhancedUpstoxAPI:
     """
@@ -55,6 +57,7 @@ class EnhancedUpstoxAPI:
         # Close the old session OUTSIDE the lock to prevent freezing
         if old_session:
             await old_session.close()
+        
         logger.info("✅ Token rotation complete.")
 
     async def _session(self) -> aiohttp.ClientSession:
@@ -94,12 +97,12 @@ class EnhancedUpstoxAPI:
                         logger.warning(f"Server Error {response.status}. Retrying...")
                         await asyncio.sleep(1 * (i + 1))
                         continue
-                        
+                    
                     # Client Error (4xx) - usually fatal, don't retry
                     text = await response.text()
                     logger.error(f"Client error {response.status} on {url}: {text}")
                     return {"status": "error", "message": text, "code": response.status}
-
+                    
             except TokenExpiredError:
                 raise  # Propagate up
             except asyncio.TimeoutError:
@@ -112,7 +115,8 @@ class EnhancedUpstoxAPI:
         return {"status": "error", "message": "Max retries exceeded"}
 
     async def get_quotes(self, instrument_keys: List[str]) -> Dict:
-        if not instrument_keys: return {}
+        if not instrument_keys:
+            return {}
         url = "https://api-v2.upstox.com/v2/market-quote/quotes"
         return await self._request_with_retry("GET", url, params={"instrument_key": ",".join(instrument_keys)})
 
@@ -126,11 +130,16 @@ class EnhancedUpstoxAPI:
         
         url = "https://api-v2.upstox.com/v2/order/place"
         payload = {
-            "quantity": abs(order.quantity), "product": order.product,
-            "validity": order.validity, "price": float(order.price),
-            "tag": "VG19", "instrument_token": order.instrument_key,
-            "order_type": order.order_type, "transaction_type": order.transaction_type,
-            "disclosed_quantity": 0, "trigger_price": float(order.trigger_price),
+            "quantity": abs(order.quantity),
+            "product": order.product,
+            "validity": order.validity,
+            "price": float(order.price),
+            "tag": "VG19",
+            "instrument_token": order.instrument_key,
+            "order_type": order.order_type,
+            "transaction_type": order.transaction_type,
+            "disclosed_quantity": 0,
+            "trigger_price": float(order.trigger_price),
             "is_amo": order.is_amo
         }
         res = await self._request_with_retry("POST", url, json=payload)
@@ -138,12 +147,39 @@ class EnhancedUpstoxAPI:
             return True, res["data"]["order_id"]
         return False, None
 
+    # ============================================
+    # 🔧 FIX: Added missing place_order_raw method
+    # ============================================
+    async def place_order_raw(self, payload: Dict) -> Tuple[bool, Optional[str]]:
+        """
+        Place order with raw payload dictionary.
+        Used by emergency rollback logic in live_order_executor.py
+        
+        Args:
+            payload: Dictionary containing order parameters matching Upstox API schema
+            
+        Returns:
+            Tuple of (success: bool, order_id: Optional[str])
+        """
+        if settings.SAFETY_MODE != "live":
+            return True, f"SIM-{int(asyncio.get_event_loop().time())}"
+        
+        url = "https://api-v2.upstox.com/v2/order/place"
+        res = await self._request_with_retry("POST", url, json=payload)
+        
+        if res.get("status") == "success":
+            order_id = res.get("data", {}).get("order_id")
+            return True, order_id
+        
+        return False, None
+
     async def place_multi_order(self, orders_payload: List[Dict]) -> Dict:
         url = "https://api-v2.upstox.com/v2/order/multi/place"
         return await self._request_with_retry("POST", url, json=orders_payload)
 
     async def cancel_order(self, order_id: str) -> bool:
-        if str(order_id).startswith("SIM"): return True
+        if str(order_id).startswith("SIM"):
+            return True
         url = "https://api-v2.upstox.com/v2/order/cancel"
         res = await self._request_with_retry("DELETE", url, params={"order_id": order_id})
         return res.get("status") == "success"
@@ -168,7 +204,8 @@ class EnhancedUpstoxAPI:
         return await self._request_with_retry("POST", url, json={"instruments": instruments_payload})
 
     async def get_option_greeks(self, instrument_keys: List[str]) -> Dict[str, Any]:
-        if not instrument_keys: return {}
+        if not instrument_keys:
+            return {}
         url = "https://api-v2.upstox.com/v3/market-quote/option-greek"
         res = await self._request_with_retry("GET", url, params={"instrument_key": ",".join(instrument_keys)})
         return res.get("data", {}) if res.get("status") == "success" else {}
@@ -183,4 +220,4 @@ class EnhancedUpstoxAPI:
         async with self._session_lock:
             if self.session and not self.session.closed:
                 await self.session.close()
-        logger.info("✅ API session closed")
+                logger.info("✅ API session closed")
