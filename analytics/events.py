@@ -1,165 +1,93 @@
+# File: analytics/events.py
+
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Tuple
 import logging
 from core.config import settings, IST
 from utils.data_fetcher import DashboardDataFetcher
 
-logger = logging.getLogger("VolGuard18")
+logger = logging.getLogger("EventIntel")
 
 class AdvancedEventIntelligence:
     def __init__(self):
         self.data_fetcher = DashboardDataFetcher()
-        self.events_cache: Dict[str, List[Dict]] = {}
-        self.event_scores: Dict[str, float] = {}
-        self.last_update: datetime = None
-        
         self.event_weights = {
-            'FED_MEETING': 2.5,
-            'RBI_POLICY': 2.0,
-            'BUDGET': 3.0,
-            'QUARTERLY_RESULTS': 1.5,
-            'GLOBAL_EVENT': 2.0,
-            'ECONOMIC_DATA': 1.0,
-            'EXPIRY_DAY': 1.2,
-            'WEEKEND_GAP': 1.3,
+            'BUDGET': 5.0, 'ELECTION': 5.0, 'WAR': 5.0,
+            'RBI_POLICY': 3.0, 'FED_MEETING': 3.0,
+            'GDP': 2.0, 'INFLATION': 2.0, 'EARNINGS': 1.5,
+            'OTHER': 1.0
         }
 
-    def get_event_risk_score(self) -> float:
-        try:
-            events = self._load_upcoming_events()
-            base_score = self._calculate_events_score(events)
-            regime_adjustment = self._get_regime_adjustment()
-            time_adjustment = self._get_time_adjustment()
+    def get_market_risk_state(self) -> Tuple[str, float, str]:
+        events = self._get_upcoming_events()
+        if not events: return "SAFE", 0.0, "None"
+
+        max_score = 0.0
+        top_event = "None"
+
+        for e in events:
+            base_score = self.event_weights.get(e.get('category', 'OTHER'), 1.0)
+            days_out = e.get('days_to_event')
             
-            final_score = base_score + regime_adjustment + time_adjustment
-            final_score = min(5.0, max(0.0, final_score))
-            
-            self.event_scores[datetime.now(IST).strftime("%Y-%m-%d")] = final_score
-            logger.debug(f"Event risk score: {final_score:.2f}")
-            return final_score
-        except Exception as e:
-            logger.error(f"Event risk score calculation failed: {e}")
-            return 1.0
+            if days_out <= 1: current_score = base_score * 1.5 # Immediate
+            elif days_out <= 3: current_score = base_score
+            else: current_score = base_score * 0.5
 
-    def _load_upcoming_events(self) -> List[Dict]:
-        cache_key = "upcoming_events"
-        if (cache_key in self.events_cache and self.last_update and 
-            (datetime.now(IST) - self.last_update).total_seconds() < 3600):
-            return self.events_cache[cache_key]
+            if current_score > max_score:
+                max_score = current_score
+                top_event = e.get('name')
 
-        events = []
+        if max_score >= 4.0: return "BINARY_EVENT", round(max_score, 2), top_event
+        elif max_score >= 2.5: return "MACRO_RISK", round(max_score, 2), top_event
+        else: return "SAFE", round(max_score, 2), top_event
+
+    def _get_upcoming_events(self) -> List[Dict]:
         try:
-            if self.data_fetcher.events_calendar is not None:
-                df = self.data_fetcher.events_calendar
-                today = datetime.now(IST).date()
-                next_week = today + timedelta(days=7)
-
-                for _, row in df.iterrows():
-                    event_date = row.get('Date')
-                    if isinstance(event_date, pd.Timestamp):
-                        event_date = event_date.date()
-                    
-                    if event_date and today <= event_date <= next_week:
-                        events.append({
-                            'date': event_date.isoformat(),
-                            'name': row.get('Event', 'Unknown'),
-                            'impact': row.get('Impact', 'Medium'),
-                            'category': self._categorize_event(row.get('Event', ''))
-                        })
-
-            events.extend(self._get_market_events())
-            self.events_cache[cache_key] = events
-            self.last_update = datetime.now(IST)
+            if self.data_fetcher.events_calendar is None:
+                return []
+            
+            df = self.data_fetcher.events_calendar
+            today = datetime.now(IST).date()
+            
+            # Robust Date Parsing (Safe Access)
+            if not pd.api.types.is_datetime64_any_dtype(df['Date']):
+                df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            
+            df = df.dropna(subset=['Date'])
+            
+            # Filter Next 7 Days
+            limit = today + timedelta(days=7)
+            mask = (df['Date'].dt.date >= today) & (df['Date'].dt.date <= limit)
+            active = df[mask].copy()
+            
+            events = []
+            for _, row in active.iterrows():
+                name = str(row.get('Event', 'Unknown'))
+                category = self._categorize(name)
+                
+                # Correct safe date access
+                event_dt = row['Date'].date()
+                days_out = (event_dt - today).days
+                
+                events.append({
+                    'date': event_dt,
+                    'name': name,
+                    'category': category,
+                    'impact': row.get('Impact', 'Medium'),
+                    'days_to_event': days_out
+                })
             return events
-
         except Exception as e:
-            logger.error(f"Failed to load events: {e}")
+            logger.error(f"Event Fetch Failed: {e}")
             return []
 
-    def _get_market_events(self) -> List[Dict]:
-        today = datetime.now(IST)
-        events = []
-        if today.weekday() == 3: # Thursday
-            events.append({
-                'date': today.date().isoformat(),
-                'name': 'Weekly Options Expiry',
-                'impact': 'High',
-                'category': 'EXPIRY_DAY'
-            })
-        if today.weekday() == 4: # Friday
-            events.append({
-                'date': (today + timedelta(days=1)).date().isoformat(),
-                'name': 'Weekend Gap Risk',
-                'impact': 'Medium',
-                'category': 'WEEKEND_GAP'
-            })
-        return events
-
-    def _categorize_event(self, event_name: str) -> str:
-        """
-        UPDATED: Matches specific terms in User's 'events_calendar.csv'.
-        """
-        event_name_lower = event_name.lower()
-        
-        # 1. Central Bank & Policy
-        if any(k in event_name_lower for k in ['fed', 'federal reserve', 'jerome powell', 'fomc']):
-            return 'FED_MEETING'
-        elif any(k in event_name_lower for k in ['rbi', 'monetary policy', 'repo rate']):
-            return 'RBI_POLICY'
-        elif any(k in event_name_lower for k in ['interest rate', 'policy rate', 'central bank']):
-            return 'GLOBAL_EVENT'
-
-        # 2. Fiscal Policy
-        elif any(k in event_name_lower for k in ['budget', 'union budget']):
-            return 'BUDGET'
-
-        # 3. Earnings
-        elif any(k in event_name_lower for k in ['results', 'earnings', 'quarterly']):
-            return 'QUARTERLY_RESULTS'
-
-        # 4. Economic Data (Matches "PPI MoM", "Retail Sales", "Jobless")
-        elif any(k in event_name_lower for k in ['gdp', 'inflation', 'cpi', 'wpi', 'ppi', 'sales', 'jobless', 'employment', 'consumer confidence']):
-            return 'ECONOMIC_DATA'
-        
-        # 5. Holidays
-        elif 'holiday' in event_name_lower:
-             return 'GLOBAL_EVENT'
-
-        else:
-            return 'GLOBAL_EVENT'
-
-    def _calculate_events_score(self, events: List[Dict]) -> float:
-        if not events: return 0.0
-        total_score = 0.0
-        
-        for event in events:
-            category = event.get('category', 'GLOBAL_EVENT')
-            impact = event.get('impact', 'Medium')
-            
-            base_weight = self.event_weights.get(category, 1.0)
-            # Map Impact Text to Multiplier
-            impact_multiplier = {
-                'Low': 0.5, 'Medium': 1.0, 'High': 1.5, 'Very High': 2.0
-            }.get(impact, 1.0)
-            
-            try:
-                event_date = datetime.strptime(event['date'], "%Y-%m-%d").date()
-                days_to_event = (event_date - datetime.now(IST).date()).days
-                time_decay = max(0.1, 1.0 - (days_to_event / 7))
-                
-                event_score = base_weight * impact_multiplier * time_decay
-                total_score += event_score
-            except:
-                continue
-                
-        return min(3.0, total_score)
-
-    def _get_regime_adjustment(self) -> float:
-        return 0.0
-
-    def _get_time_adjustment(self) -> float:
-        now = datetime.now(IST)
-        if now.day >= 25: return 0.2
-        if 1 <= now.day <= 7: return 0.1
-        return 0.0
+    def _categorize(self, name: str) -> str:
+        name = name.upper()
+        if 'BUDGET' in name or 'ELECTION' in name: return 'BUDGET'
+        if 'RBI' in name or 'REPO' in name: return 'RBI_POLICY'
+        if 'FED' in name or 'FOMC' in name: return 'FED_MEETING'
+        if 'GDP' in name: return 'GDP'
+        if 'CPI' in name or 'INFLATION' in name: return 'INFLATION'
+        if 'EARNINGS' in name or 'RESULTS' in name: return 'EARNINGS'
+        return 'OTHER'
