@@ -1,3 +1,5 @@
+# File: core/models.py
+
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any
 from datetime import datetime
@@ -10,27 +12,19 @@ from core.enums import *
 # ORDER MODELS
 # ==========================================
 
-class OrderStatus(Enum):
-    PENDING = "PENDING"
-    FILLED = "FILLED"
-    REJECTED = "REJECTED"
-    CANCELLED = "CANCELLED"
-    PARTIAL = "PARTIAL"
-
 class Order(BaseModel):
     instrument_key: str
-    transaction_type: str  # "BUY" or "SELL"
-    quantity: int = Field(gt=0)
-    order_type: str        # "MARKET", "LIMIT", "SL", "SL-M"
-    product: str           # "I", "D", "CO", "OCO", "MTF"
+    transaction_type: str 
+    quantity: int = Field(..., gt=0)
+    order_type: str       
+    product: str          
     price: float = 0.0
     trigger_price: float = 0.0
     validity: str = "DAY"
     is_amo: bool = False
     tag: Optional[str] = None
-    # Response fields from Broker
     order_id: Optional[str] = None
-    status: Optional[OrderStatus] = None
+    status: Optional[str] = None
     average_price: Optional[float] = None
     filled_quantity: Optional[int] = None
 
@@ -47,12 +41,6 @@ class GreeksSnapshot:
     vega: float = 0.0
     iv: float = 0.0
     pop: float = 0.5
-    charm: float = 0.0
-    vanna: float = 0.0
-    # HARDENING FIX: Confidence Score (0.0 to 1.0)
-    # 1.0 = High Confidence (Broker & SABR agree)
-    # 0.5 = Suspicious (Significant Divergence)
-    # 0.0 = Dangerous (Data Stale or Missing)
     confidence_score: float = 1.0
 
     def is_stale(self, max_age: float = 30.0) -> bool:
@@ -70,7 +58,7 @@ class Position(BaseModel):
     symbol: str
     instrument_key: str
     strike: float
-    option_type: str  # CE or PE
+    option_type: str 
     quantity: int
     entry_price: float
     entry_time: datetime
@@ -130,25 +118,7 @@ class MultiLegTrade(BaseModel):
         self.trade_vega = sum((leg.current_greeks.vega or 0.0) * leg.quantity for leg in self.legs)
 
 # ==========================================
-# MANUAL REQUEST MODELS (For Terminal)
-# ==========================================
-
-class ManualLegRequest(BaseModel):
-    symbol: str = "NIFTY"
-    strike: float = Field(..., gt=0)
-    option_type: str = Field(..., pattern="^(CE|PE)$")
-    side: str = Field(..., pattern="^(BUY|SELL)$")
-    expiry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-    quantity: int = Field(..., gt=0, le=1800)
-
-class ManualTradeRequest(BaseModel):
-    strategy_name: str = "MANUAL"
-    legs: List[ManualLegRequest]
-    capital_bucket: CapitalBucket = CapitalBucket.INTRADAY
-    tag: str = "Discretionary"
-
-# ==========================================
-# QUANT & METRICS MODELS (THE UPGRADE)
+# METRICS MODELS
 # ==========================================
 
 @dataclass
@@ -157,27 +127,35 @@ class AdvancedMetrics:
     spot_price: float
     vix: float
     ivp: float
-    # --- NEW QUANT FIELDS ---
-    realized_vol_7d: float
-    garch_vol_7d: float
-    atm_iv: float
-    iv_rv_spread: float
-    volatility_skew: float
+    
+    # --- PRO METRICS ---
+    realized_vol_7d: float      
+    garch_vol_7d: float         
+    atm_iv: float               
+    vrp_score: float            
+    
+    term_structure_slope: float 
+    volatility_skew: float      
+    structure_confidence: float = 1.0 # Data Quality Flag
+    
+    # --- CONTEXT ---
+    trend_status: str           
+    event_risk_score: float     
+    regime: str                 
+    top_event: str = "None"     
+    
+    # --- EXECUTION ---
     straddle_price: float
-    # ------------------------
-    event_risk_score: float
-    regime: str
     pcr: float
     max_pain: float
-    term_structure_slope: float
-    # --- DASHBOARD METADATA ---
     expiry_date: str
-    days_to_expiry: float
-    # SABR Params
-    sabr_alpha: float
-    sabr_beta: float
-    sabr_rho: float
-    sabr_nu: float
+    days_to_expiry: float       
+    
+    # SABR
+    sabr_alpha: float = 0.0
+    sabr_beta: float = 0.0
+    sabr_rho: float = 0.0
+    sabr_nu: float = 0.0
 
     def dict(self):
         return {k: str(v) if isinstance(v, datetime) else v for k, v in self.__dict__.items()}
@@ -190,6 +168,7 @@ class DashboardData:
     capital: Dict[str, Dict[str, float]]
     trades: List[Dict]
     metrics: Dict[str, Any]
+    ai_insight: Dict[str, Any]
 
 @dataclass
 class EngineStatus:
