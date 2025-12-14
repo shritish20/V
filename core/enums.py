@@ -1,15 +1,33 @@
+# File: core/enums.py
+
 from enum import Enum
 
 class StrategyType(Enum):
     WAIT = "WAIT"
-    ATM_STRADDLE = "ATM_STRADDLE"
-    ATM_STRANGLE = "ATM_STRANGLE"
-    SHORT_STRANGLE = "SHORT_STRANGLE"
-    IRON_CONDOR = "IRON_CONDOR"
-    DEFENSIVE_IRON_CONDOR = "DEFENSIVE_IRON_CONDOR"
-    BULL_PUT_SPREAD = "BULL_PUT_SPREAD"
-    CALENDAR_SPREAD = "CALENDAR_SPREAD"
-    RATIO_SPREAD = "RATIO_SPREAD"
+    
+    # --- INCOME (High Probability, Theta Focus) ---
+    IRON_CONDOR = "IRON_CONDOR"          # Neutral, Defined Risk, Standard Income
+    IRON_FLY = "IRON_FLY"                # Neutral, Centered Risk, High IV Crush
+    SHORT_STRANGLE = "SHORT_STRANGLE"    # Neutral, Undefined Risk, Aggressive
+    SHORT_STRADDLE = "SHORT_STRADDLE"    # Neutral, Max Theta, Binary Event Capture
+
+    # --- DIRECTIONAL (Delta Focus) ---
+    BULL_PUT_SPREAD = "BULL_PUT_SPREAD"  # Bullish, Credit
+    BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD" # Bearish, Credit
+    BULL_CALL_SPREAD = "BULL_CALL_SPREAD" # Bullish, Debit (Low Vol)
+    BEAR_PUT_SPREAD = "BEAR_PUT_SPREAD"   # Bearish, Debit (Low Vol)
+
+    # --- SKEW / VOLATILITY (Vega/Gamma Focus) ---
+    RATIO_SPREAD_PUT = "RATIO_SPREAD_PUT" # Bullish/Neutral, financed by OTM Panic
+    RATIO_SPREAD_CALL = "RATIO_SPREAD_CALL" # Bearish/Neutral, financed by Call FOMO
+    JADE_LIZARD = "JADE_LIZARD"           # Bullish/Neutral, No Upside Risk
+    REVERSE_JADE_LIZARD = "REVERSE_JADE_LIZARD" # Bearish/Neutral, No Downside Risk
+
+    # --- TERM STRUCTURE (Calendar Focus) ---
+    # Used when Volatility is CHEAP (VRP < 0)
+    LONG_CALENDAR_CALL = "LONG_CALENDAR_CALL" 
+    LONG_CALENDAR_PUT = "LONG_CALENDAR_PUT"   
+    LONG_STRADDLE = "LONG_STRADDLE"       # Buying Volatility (Gamma Long)
 
 class TradeStatus(Enum):
     PENDING = "PENDING"
@@ -32,6 +50,7 @@ class ExitReason(Enum):
     CIRCUIT_BREAKER = "CIRCUIT_BREAKER"
     RISK_BREACH = "RISK_BREACH"
     MANUAL = "MANUAL"
+    GAMMA_HEDGE = "GAMMA_HEDGE"
 
 class CapitalBucket(Enum):
     WEEKLY = "weekly_expiries"
@@ -44,11 +63,19 @@ class ExpiryType(Enum):
     INTRADAY = "INTRADAY"
 
 class MarketRegime(Enum):
-    PANIC = "PANIC"
-    FEAR_BACKWARDATION = "FEAR_BACKWARDATION"
-    LOW_VOL_COMPRESSION = "LOW_VOL_COMPRESSION"
-    CALM_COMPRESSION = "CALM_COMPRESSION"
-    DEFENSIVE_EVENT = "DEFENSIVE_EVENT"
-    BULL_EXPANSION = "BULL_EXPANSION"  # ADDED - Was missing
-    BEAR_CONTRACTION = "BEAR_CONTRACTION"  # ADDED - For completeness
+    # RISK STATES
+    PANIC = "PANIC"                       # Crash Mode (VIX > 25, Backwardation)
+    BINARY_EVENT = "BINARY_EVENT"         # Pre-Budget/Election (Do Not Trade)
+    MACRO_RISK = "MACRO_RISK"             # Fed/RBI Day (Defined Risk Only)
+    
+    # VOLATILITY STATES
+    FEAR_BACKWARDATION = "FEAR_BACKWARDATION" # Short term panic
+    LOW_VOL_COMPRESSION = "LOW_VOL_COMPRESSION" # VIX < 12, Contango
+    CALM_COMPRESSION = "CALM_COMPRESSION"     # Standard grind
+    
+    # TREND STATES
+    BULL_EXPANSION = "BULL_EXPANSION"
+    BEAR_CONTRACTION = "BEAR_CONTRACTION"
     TRANSITION = "TRANSITION"
+    
+    SAFE = "SAFE" # Default
