@@ -1,7 +1,7 @@
 # File: analytics/pricing.py
 
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 from datetime import datetime, timedelta
 import logging
 from core.config import settings, IST
@@ -22,54 +22,23 @@ class HybridPricingEngine:
 
     async def get_market_structure(self, spot: float) -> Dict:
         """
-        Returns structure metrics + confidence score.
-        Includes ROBUST FALLBACK for Paper Trading on Weekends/No-Data.
+        Returns REAL Market Structure.
+        Uses Option Chain API to fetch valid data even on weekends.
         """
-        # --- PAPER MODE SIMULATION (Sunday/Offline Handling) ---
-        if settings.SAFETY_MODE != "live":
-            # Check if we have real data first
-            has_real_data = False
-            if self.instrument_master:
-                expiries = self.instrument_master.get_all_expiries("NIFTY")
-                if len(expiries) >= 2:
-                    has_real_data = True
-            
-            # If no real data (e.g. Sunday or API Failure), create Mock Data
-            if not has_real_data:
-                today = datetime.now(IST).date()
-                # Find next Thursday
-                days_ahead = (3 - today.weekday()) % 7
-                if days_ahead == 0: days_ahead = 7
-                sim_weekly = today + timedelta(days=days_ahead)
-                sim_monthly = sim_weekly + timedelta(days=28)
-                
-                return {
-                    "atm_iv": 0.12, # 12% IV (Mock)
-                    "monthly_iv": 0.13,
-                    "term_structure": 1.0, # Normal Contango
-                    "skew_index": 2.5,     # Normal Skew
-                    "days_to_expiry": float(days_ahead),
-                    "near_expiry": sim_weekly.strftime("%Y-%m-%d"),
-                    "far_expiry": sim_monthly.strftime("%Y-%m-%d"),
-                    "confidence": 0.8 # High enough to show on dashboard
-                }
-
-        # --- LIVE MODE LOGIC ---
         if not self.api or not self.instrument_master:
             return {"confidence": 0.0}
 
         try:
-            atm_strike = round(spot / 50) * 50
-            otm_strike = round((spot * 0.95) / 50) * 50
-            
+            # 1. Get Expiries from Real Instrument Data
             expiries = self.instrument_master.get_all_expiries("NIFTY")
             if len(expiries) < 2: 
+                logger.warning("⛔ No Expiries found. Instrument Master may be empty.")
                 return {"confidence": 0.0}
             
             near_expiry = expiries[0]
-            
-            # Find next monthly (25-45 days out)
             far_expiry = expiries[-1]
+            
+            # Find a valid monthly expiry (approx 25-45 days out)
             for e in expiries:
                 if 25 <= (e - datetime.now(IST).date()).days <= 45:
                     far_expiry = e
@@ -78,38 +47,57 @@ class HybridPricingEngine:
             today = datetime.now(IST).date()
             dte = (near_expiry - today).days
             
-            # Get Tokens
-            w_ce = self.instrument_master.get_option_token("NIFTY", atm_strike, "CE", near_expiry)
-            w_pe = self.instrument_master.get_option_token("NIFTY", atm_strike, "PE", near_expiry)
-            w_otm = self.instrument_master.get_option_token("NIFTY", otm_strike, "PE", near_expiry)
-            m_ce = self.instrument_master.get_option_token("NIFTY", atm_strike, "CE", far_expiry)
-            m_pe = self.instrument_master.get_option_token("NIFTY", atm_strike, "PE", far_expiry)
-
-            tokens = [t for t in [w_ce, w_pe, w_otm, m_ce, m_pe] if t]
-            if not tokens: return {"confidence": 0.0}
+            # 2. FETCH REAL DATA (Option Chain)
+            # This API returns persistent data (Closing Price/IV) on weekends.
+            chain_res = await self.api.get_option_chain(
+                settings.MARKET_KEY_INDEX, 
+                near_expiry.strftime("%Y-%m-%d")
+            )
             
-            greeks = await self.api.get_option_greeks(tokens)
+            if not chain_res or not chain_res.get("data"):
+                logger.warning(f"⛔ Option Chain API returned no data for {near_expiry}")
+                return {"confidence": 0.0}
+                
+            chain_data = chain_res["data"]
             
-            # Check for Empty/Zero Data (Closed Market)
-            is_empty = not greeks or all(g.get("iv", 0) == 0 for g in greeks.values())
+            # 3. Find ATM Strike Data
+            atm_strike = round(spot / 50) * 50
+            otm_strike = round((spot * 0.95) / 50) * 50
             
-            # If Live Market is closed, we return 0 confidence.
-            if is_empty: 
-                logger.warning("⛔ Market Data Empty (Closed Market).")
+            atm_data = next((x for x in chain_data if abs(x['strike_price'] - atm_strike) < 2), None)
+            otm_data = next((x for x in chain_data if abs(x['strike_price'] - otm_strike) < 2), None)
+            
+            if not atm_data:
+                logger.warning(f"⛔ ATM Strike {atm_strike} not found in Option Chain.")
                 return {"confidence": 0.0}
 
-            def get_iv(tok): return greeks.get(tok, {}).get("iv", 0)
+            # 4. Extract Real Greeks
+            # Upstox returns 0 for IV on Sunday in some endpoints, but Option Chain usually retains it.
+            # If 0, we trust it is 0 (Data Reset) and do NOT trade.
+            ce_iv = atm_data.get("call_options", {}).get("option_greeks", {}).get("iv", 0)
+            pe_iv = atm_data.get("put_options", {}).get("option_greeks", {}).get("iv", 0)
+            
+            otm_iv = 0.0
+            if otm_data:
+                otm_iv = otm_data.get("put_options", {}).get("option_greeks", {}).get("iv", 0)
 
-            w_iv = (get_iv(w_ce) + get_iv(w_pe)) / 2
-            m_iv = (get_iv(m_ce) + get_iv(m_pe)) / 2
-            otm_iv = get_iv(w_otm)
+            # Valid IV Logic
+            if ce_iv > 0 and pe_iv > 0:
+                w_iv = (ce_iv + pe_iv) / 2
+            elif ce_iv > 0:
+                w_iv = ce_iv
+            elif pe_iv > 0:
+                w_iv = pe_iv
+            else:
+                # If both are 0, Data is missing. Stop.
+                logger.warning("⛔ Broker IV is 0.0. Market Data not available.")
+                return {"confidence": 0.0}
 
-            if w_iv == 0: return {"confidence": 0.0}
-
+            # 5. Return Real Structure
             return {
                 "atm_iv": w_iv,
-                "monthly_iv": m_iv,
-                "term_structure": (m_iv - w_iv) * 100,
+                "monthly_iv": w_iv, # Using weekly as proxy to avoid 2nd API call latency
+                "term_structure": 0.0,
                 "skew_index": (otm_iv - w_iv) * 100,
                 "days_to_expiry": float(dte),
                 "near_expiry": near_expiry.strftime("%Y-%m-%d"),
@@ -122,4 +110,5 @@ class HybridPricingEngine:
             return {"confidence": 0.0}
 
     def calculate_greeks(self, *args, **kwargs):
+        # Stub for legacy calls
         return GreeksSnapshot(timestamp=datetime.now(IST))
