@@ -1,5 +1,3 @@
-# File: trading/instruments_master.py
-
 import gzip
 import json
 import logging
@@ -20,11 +18,11 @@ CACHE_FILE = DATA_DIR / "instruments_lite.csv"
 JSON_FILE_GZ = DATA_DIR / "complete.json.gz"
 JSON_FILE_PLAIN = DATA_DIR / "complete.json"
 
-# CRITICAL: Your GitHub URL is the Primary Source
+# CRITICAL FIX: Pointing to YOUR 'V' Repo (Raw URL)
 DOWNLOAD_URLS = [
-    "https://raw.githubusercontent.com/shritish20/V/main/data/complete.json.gz",  # CORRECT REPO
-    "https://assets.upstox.com/feed/instruments/NSE_FO/complete.json.gz",
-    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",
+    "https://raw.githubusercontent.com/shritish20/V/main/data/complete.json.gz",  # CORRECT RAW URL
+    "https://assets.upstox.com/feed/instruments/NSE_FO/complete.json.gz",          # Fallback 1
+    "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz",     # Fallback 2
 ]
 
 class InstrumentMaster:
@@ -182,6 +180,7 @@ class InstrumentMaster:
         
         self.df["expiry"] = pd.to_datetime(self.df["expiry"], errors='coerce').dt.date
         self.last_updated = datetime.now()
+        
         self._cache_options.clear()
         
         # LOGGING CONFIRMATION
