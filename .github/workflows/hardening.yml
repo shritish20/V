@@ -1,0 +1,47 @@
+name: VolGuard Hardening Protocol
+
+on: [push, pull_request]
+
+jobs:
+  chaos-testing:
+    runs-on: ubuntu-latest
+    services:
+      # We spin up a dummy postgres to satisfy connection checks
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: secure_trading_password
+          POSTGRES_DB: volguard_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        # Install testing tools specifically
+        pip install pytest pytest-asyncio pytest-mock httpx
+
+    - name: 🛡️ Run Full Hardening Suite
+      env:
+        # Inject dummy env vars so config.py doesn't crash
+        UPSTOX_ACCESS_TOKEN: "mock_token"
+        SAFETY_MODE: "paper"
+        POSTGRES_SERVER: "localhost"
+        POSTGRES_PASSWORD: "secure_trading_password"
+      run: |
+        # Run the chaos tests you built
+        python run_tests.py
