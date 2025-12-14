@@ -1,6 +1,6 @@
 import pytest
 import asyncio
-from datetime import datetime # FIXED: Added Missing Import
+from datetime import datetime 
 from core.models import MultiLegTrade, Position, GreeksSnapshot, StrategyType, CapitalBucket, ExpiryType
 from trading.live_order_executor import LiveOrderExecutor
 from core.config import settings
@@ -23,10 +23,11 @@ async def test_freeze_quantity_slicing(mock_api):
         legs=[leg1], strategy_type=StrategyType.IRON_CONDOR,
         net_premium_per_share=0, entry_time=datetime.now(),
         expiry_date="2024-01-01", expiry_type=ExpiryType.WEEKLY,
-        capital_bucket=CapitalBucket.WEEKLY
+        capital_bucket=CapitalBucket.WEEKLY,
+        id="TEST-HEAVY-1" # FIXED: Added ID to prevent slicing error
     )
 
-    # 2. Mock the API call to capture the payload
+    # 2. Mock the API call
     # Note: We rely on the mock_api fixture passed from conftest.py
     
     # 3. Run
@@ -78,7 +79,8 @@ async def test_atomic_failure_recovery(mock_api):
         strategy_type=StrategyType.SHORT_STRANGLE,
         net_premium_per_share=0, entry_time=datetime.now(),
         expiry_date="2024-01-01", expiry_type=ExpiryType.WEEKLY,
-        capital_bucket=CapitalBucket.WEEKLY
+        capital_bucket=CapitalBucket.WEEKLY,
+        id="TEST-FAIL-1" # FIXED: Added ID here to prevent TypeError
     )
 
     # 3. Execute
