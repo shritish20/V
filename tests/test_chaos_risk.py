@@ -104,6 +104,4 @@ async def test_scenario_3_websocket_circuit_breaker(mocker):
     assert feed._circuit_breaker_active is True
     
     # We expect a CRITICAL log indicating a pause
-    # Note: Depending on implementation, it might be critical or warning, 
-    # but the state check above confirms the logic works.
     assert feed._circuit_breaker_until > 0, "FAILED: Circuit Breaker timer not set!"
