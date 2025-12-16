@@ -6,20 +6,20 @@ from pydantic_settings import BaseSettings
 from pydantic import Field
 from pydantic_core import MultiHostUrl
 
-# --- UPSTOX API MAP (Verified against OpenAPI 3.1.0 Spec) ---
+# --- UPSTOX API MAP (Verified against OpenAPI 3.1.0) ---
 UPSTOX_API_ENDPOINTS = {
     # Auth
     "authorization_token": "/v2/login/authorization/token",
     
-    # Orders (V2 for Batching, V3 for GTT)
+    # Orders
     "place_order": "/v2/order/place",
-    "place_multi_order": "/v2/order/multi/place", # Spec Source: 1669
+    "place_multi_order": "/v2/order/multi/place",
     "modify_order": "/v2/order/modify",
     "cancel_order": "/v2/order/cancel",
     "order_details": "/v2/order/details",
     "retrieve_orders": "/v2/order/retrieve-all",
     
-    # GTT (Must be V3 per Spec Source: 1669)
+    # GTT (V3)
     "place_gtt": "/v3/order/gtt/place",
     "modify_gtt": "/v3/order/gtt/modify",
     "cancel_gtt": "/v3/order/gtt/cancel",
@@ -27,13 +27,13 @@ UPSTOX_API_ENDPOINTS = {
     
     # Market Data
     "market_quote": "/v2/market-quote/quotes",
-    "option_chain": "/v2/option/chain",           # Spec Source: 1757 (Includes Greeks)
-    "option_greek": "/v3/market-quote/option-greek", # Spec Source: 1676
+    "option_chain": "/v2/option/chain",
+    "option_greek": "/v3/market-quote/option-greek",
     
     # Funds & Portfolio
     "funds_margin": "/v2/user/get-funds-and-margin",
     "positions": "/v2/portfolio/short-term-positions",
-    "margin_calc": "/v2/charges/margin"           # Spec Source: 1675
+    "margin_calc": "/v2/charges/margin"
 }
 
 class Settings(BaseSettings):
@@ -65,17 +65,18 @@ class Settings(BaseSettings):
             )
         )
 
-    # --- UPSTOX ---
+    # --- UPSTOX API ---
     UPSTOX_ACCESS_TOKEN: str = Field(..., env="UPSTOX_ACCESS_TOKEN")
-    API_BASE_V2: str = "https://api.upstox.com/v2"
-    API_BASE_V3: str = "https://api-v2.upstox.com/v3"
+    
+    # CRITICAL FIX: Base URL must NOT have /v2 suffix, as endpoints already include it
+    API_BASE_URL: str = "https://api-v2.upstox.com" 
     
     # --- CAPITAL & RISK ---
     ACCOUNT_SIZE: float = Field(default=2_000_000.0, env="ACCOUNT_SIZE")
     LOT_SIZE: int = Field(default=75, env="LOT_SIZE")
     MAX_LOTS: int = Field(default=10, env="MAX_LOTS")
     
-    # Freeze Limits (NSE Standards)
+    # Freeze Limits
     NIFTY_FREEZE_QTY: int = Field(default=1800, env="NIFTY_FREEZE_QTY")
     BANKNIFTY_FREEZE_QTY: int = Field(default=900, env="BANKNIFTY_FREEZE_QTY")
 
@@ -124,12 +125,11 @@ class Settings(BaseSettings):
         'nu': (0.01, 5.0)
     }
 
-    # Runtime
+    # Runtime & Validation (CRITICAL FIX FOR CRASH)
     PERSISTENT_DATA_DIR: str = "./data"
     DASHBOARD_DATA_DIR: str = "dashboard_data"
     TRADING_LOOP_INTERVAL: int = 5
     
-    # Greek Validator Settings (CRITICAL FIX FOR CRASH)
     GREEK_VALIDATION: bool = True
     GREEK_REFRESH_SEC: int = 15
     GREEK_TOLERANCE_PCT: float = 15.0
