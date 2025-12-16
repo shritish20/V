@@ -8,16 +8,13 @@ from enum import Enum
 from core.config import settings, IST
 from core.enums import *
 
-# ==========================================
-# ORDER MODELS
-# ==========================================
-
+# --- ORDER MODELS ---
 class Order(BaseModel):
     instrument_key: str
-    transaction_type: str 
+    transaction_type: str
     quantity: int = Field(..., gt=0)
-    order_type: str       
-    product: str          
+    order_type: str
+    product: str
     price: float = 0.0
     trigger_price: float = 0.0
     validity: str = "DAY"
@@ -28,9 +25,7 @@ class Order(BaseModel):
     average_price: Optional[float] = None
     filled_quantity: Optional[int] = None
 
-# ==========================================
-# TRADING DATA MODELS
-# ==========================================
+# --- TRADING DATA MODELS ---
 
 @dataclass
 class GreeksSnapshot:
@@ -58,7 +53,7 @@ class Position(BaseModel):
     symbol: str
     instrument_key: str
     strike: float
-    option_type: str 
+    option_type: str
     quantity: int
     entry_price: float
     entry_time: datetime
@@ -91,17 +86,20 @@ class MultiLegTrade(BaseModel):
     expiry_date: str
     expiry_type: ExpiryType
     capital_bucket: CapitalBucket
+    
     # Risk Limits
     max_loss_per_lot: float = 0.0
     max_profit_per_lot: float = 0.0
     breakeven_lower: float = 0.0
     breakeven_upper: float = 0.0
     transaction_costs: float = 0.0
+
     # Execution Details
     basket_order_id: Optional[str] = None
     gtt_order_ids: List[str] = Field(default_factory=list)
     id: Optional[str] = None
     exit_reason: Optional[ExitReason] = None
+
     # Portfolio Greeks
     trade_vega: float = 0.0
     trade_delta: float = 0.0
@@ -117,10 +115,7 @@ class MultiLegTrade(BaseModel):
         self.trade_theta = sum((leg.current_greeks.theta or 0.0) * leg.quantity for leg in self.legs)
         self.trade_vega = sum((leg.current_greeks.vega or 0.0) * leg.quantity for leg in self.legs)
 
-# ==========================================
-# MANUAL REQUEST MODELS (FIXED: Added Back)
-# ==========================================
-
+# --- MANUAL REQUEST MODELS ---
 class ManualLegRequest(BaseModel):
     symbol: str = "NIFTY"
     strike: float = Field(..., gt=0)
@@ -135,43 +130,39 @@ class ManualTradeRequest(BaseModel):
     capital_bucket: CapitalBucket = CapitalBucket.INTRADAY
     tag: str = "Discretionary"
 
-# ==========================================
-# METRICS MODELS
-# ==========================================
-
+# --- METRICS MODELS (DASHBOARD) ---
 @dataclass
 class AdvancedMetrics:
     timestamp: datetime
     spot_price: float
     vix: float
-    ivp: float
+    ivp: float  # IV Percentile (0-100)
+
+    # PRO METRICS
+    realized_vol_7d: float
+    garch_vol_7d: float
+    atm_iv: float
+    vrp_score: float  # IV - GARCH
+    iv_rv_spread: float  # IV - Realized Vol (NEW FIELD)
     
-    # --- PRO METRICS (MANDATORY) ---
-    realized_vol_7d: float      
-    garch_vol_7d: float         
-    atm_iv: float               
-    vrp_score: float            
-    
-    term_structure_slope: float 
-    volatility_skew: float      
-    
-    # --- CONTEXT (MANDATORY) ---
-    trend_status: str           
-    event_risk_score: float     
-    regime: str                 
-    
-    # --- EXECUTION (MANDATORY) ---
+    term_structure_slope: float
+    volatility_skew: float
+
+    # CONTEXT
+    trend_status: str
+    event_risk_score: float
+    regime: str  # e.g., PANIC, NORMAL
+
+    # EXECUTION
     straddle_price: float
     pcr: float
     max_pain: float
     expiry_date: str
-    days_to_expiry: float       
-    
-    # --- OPTIONAL FIELDS (DEFAULTS MUST BE LAST) ---
-    structure_confidence: float = 1.0 # Data Quality Flag
-    top_event: str = "None"     
-    
-    # SABR
+    days_to_expiry: float
+
+    # OPTIONAL
+    structure_confidence: float = 1.0
+    top_event: str = "None"
     sabr_alpha: float = 0.0
     sabr_beta: float = 0.0
     sabr_rho: float = 0.0
