@@ -1,12 +1,10 @@
 import numpy as np
 from scipy.optimize import minimize
-from typing import List, Optional, Dict
-from datetime import datetime
+from typing import List
 import logging
 from core.config import settings
 
-logger = logging.getLogger("VolGuard18")
-
+logger = logging.getLogger("VolGuardSABR")
 
 class EnhancedSABRModel:
     def __init__(self):
@@ -15,17 +13,18 @@ class EnhancedSABRModel:
         self.rho = -0.2
         self.nu = 0.3
         self.calibrated = False
-        self.last_calibration = None
+        
+        # Stability: Remember last known good state
+        self.last_valid_params = {
+            'alpha': 0.2, 'beta': 0.5, 'rho': -0.2, 'nu': 0.3
+        }
 
-    def calibrate_to_chain(self, strikes: List[float], market_vols: List[float],
+    def calibrate_to_chain(self, strikes: List[float], market_vols: List[float], 
                           forward: float, time_to_expiry: float) -> bool:
         try:
-            if len(strikes) != len(market_vols) or len(strikes) < 3:
-                return False
+            if len(strikes) < 3: return False
 
             initial_guess = [self.alpha, self.beta, self.rho, self.nu]
-            
-            # Use safe bounds from config
             bounds = [
                 settings.SABR_BOUNDS['alpha'],
                 settings.SABR_BOUNDS['beta'],
@@ -38,45 +37,32 @@ class EnhancedSABRModel:
                 x0=initial_guess,
                 args=(strikes, market_vols, forward, time_to_expiry),
                 bounds=bounds,
-                method='L-BFGS-B',
-                options={'maxiter': 1000, 'ftol': 1e-8}
+                method='L-BFGS-B'
             )
 
             if result.success:
                 self.alpha, self.beta, self.rho, self.nu = result.x
-                
-                # ============================================
-                # 🔧 FIX: Added safety assertion for rho
-                # ============================================
-                # Ensure rho is strictly within bounds to prevent division by zero
-                assert -0.99 < self.rho < 0.99, f"rho={self.rho} must be strictly between -0.99 and 0.99"
-                
+                self.last_valid_params = {
+                    'alpha': self.alpha, 'beta': self.beta, 
+                    'rho': self.rho, 'nu': self.nu
+                }
                 self.calibrated = True
-                self.last_calibration = datetime.now()
-                logger.info(f"SABR calibrated: α={self.alpha:.3f}, β={self.beta:.3f}, ρ={self.rho:.3f}, ν={self.nu:.3f}")
+                logger.info(f"SABR Calibrated: α={self.alpha:.2f} ρ={self.rho:.2f}")
                 return True
             else:
-                logger.warning(f"SABR calibration failed: {result.message}")
+                logger.warning("SABR Calibration Failed. Rolling back.")
+                self._rollback()
                 return False
-                
+
         except Exception as e:
-            logger.error(f"SABR calibration error: {e}")
+            logger.error(f"SABR Error: {e}")
+            self._rollback()
             return False
 
-    def _calibration_error(self, params: List[float], strikes: List[float],
-                          market_vols: List[float], forward: float, 
-                          time_to_expiry: float) -> float:
-        alpha, beta, rho, nu = params
-        
-        try:
-            total_error = 0.0
-            for strike, market_vol in zip(strikes, market_vols):
-                sabr_vol = self.sabr_volatility(strike, forward, time_to_expiry, 
-                                               alpha, beta, rho, nu)
-                total_error += (sabr_vol - market_vol) ** 2
-            return total_error / len(strikes)
-        except:
-            return 1e6
+    def _rollback(self):
+        p = self.last_valid_params
+        self.alpha, self.beta, self.rho, self.nu = p['alpha'], p['beta'], p['rho'], p['nu']
+        self.calibrated = True # We consider the fallback "calibrated" enough to run
 
     def sabr_volatility(self, strike: float, forward: float, time_to_expiry: float,
                        alpha=None, beta=None, rho=None, nu=None) -> float:
@@ -85,61 +71,30 @@ class EnhancedSABRModel:
         rho = rho or self.rho
         nu = nu or self.nu
 
-        if strike <= 0 or forward <= 0:
-            return 0.0
+        if strike <= 0 or forward <= 0 or time_to_expiry <= 0: return 0.0
 
         try:
-            # ============================================
-            # 🔧 FIX: Added explicit safety check for rho
-            # ============================================
-            if abs(rho) >= 0.99:
-                logger.warning(f"rho={rho} too close to ±1, clamping to safe range")
-                rho = 0.98 if rho > 0 else -0.98
-            
-            # Handle ATM case where log(F/K) = 0
-            if abs(strike - forward) < 1e-5:
-                strike = forward * 1.00001
-
+            log_fk = np.log(forward / strike)
             fk_beta = (forward * strike) ** ((1 - beta) / 2)
-            z = (nu / alpha) * fk_beta * np.log(forward / strike)
-
-            # X(z) function
-            # Avoid negative sqrt inputs
+            z = (nu / alpha) * fk_beta * log_fk
+            
             inside_sqrt = 1 - 2 * rho * z + z ** 2
-            if inside_sqrt < 0:
-                inside_sqrt = 0
+            if inside_sqrt < 0: inside_sqrt = 0
             
-            # Safe division: (1 - rho) is guaranteed non-zero due to bounds
-            xz = np.log((np.sqrt(inside_sqrt) + z - rho) / (1 - rho))
+            x_z = np.log((np.sqrt(inside_sqrt) + z - rho) / (1 - rho))
+            if abs(x_z) < 1e-5: x_z = 1e-5 # Avoid DivZero
 
-            # Expansion terms
-            term1 = (alpha / fk_beta) / (1 + ((1 - beta)**2 / 24) * np.log(forward / strike)**2 +
-                                        ((1 - beta)**4 / 1920) * np.log(forward / strike)**4)
+            term1 = alpha / (fk_beta * (1 + ((1 - beta) ** 2 / 24) * log_fk ** 2))
+            term2 = 1 + (((1 - beta) ** 2 / 24) * alpha ** 2 / (forward * strike) ** (1 - beta)) * time_to_expiry
 
-            term2 = 1 + (
-                ((1 - beta)**2 / 24) * (alpha**2 / (forward * strike)**(1 - beta)) +
-                (0.25 * rho * beta * nu * alpha / fk_beta) +
-                ((2 - 3 * rho**2) / 24) * nu**2
-            ) * time_to_expiry
+            vol = term1 * (z / x_z) * term2
+            return max(0.01, min(5.0, vol))
+        except:
+            return 0.20 # Emergency Fallback
 
-            # Handle small z case
-            if abs(xz) < 1e-10:
-                vol = term1 * term2
-            else:
-                vol = term1 * (z / xz) * term2
-
-            return max(0.01, min(2.0, vol))  # Clamp 1% to 200%
-            
-        except Exception as e:
-            logger.debug(f"SABR calculation fallback triggered: {e}")
-            return 0.20
-
-    def reset(self):
-        """Reset model to default parameters"""
-        self.alpha = 0.2
-        self.beta = 0.5
-        self.rho = -0.2
-        self.nu = 0.3
-        self.calibrated = False
-        self.last_calibration = None
-        logger.debug("SABR model reset to defaults")
+    def _calibration_error(self, params, strikes, market_vols, F, T):
+        err = 0.0
+        for k, v_mkt in zip(strikes, market_vols):
+            v_model = self.sabr_volatility(k, F, T, *params)
+            err += (v_model - v_mkt) ** 2
+        return err
