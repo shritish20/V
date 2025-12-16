@@ -3,7 +3,7 @@
 import numpy as np
 import asyncio
 from typing import Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import logging
 from core.config import settings, IST
 from core.models import GreeksSnapshot
@@ -23,38 +23,58 @@ class HybridPricingEngine:
 
     async def get_market_structure(self, spot: float) -> Dict:
         """
-        Returns DEEP Market Structure. 
-        Sanitizes ATM IV to ensure it's always decimal (e.g. 0.14 for 14%).
+        Returns DEEP Market Structure.
+        SMART LOGIC: Automatically rolls to next expiry if today > 15:30 IST.
         """
         if not self.api or not self.instrument_master:
             return {"confidence": 0.0}
 
         try:
-            # 1. Get Expiries
+            # 1. Get All Expiries
             expiries = self.instrument_master.get_all_expiries("NIFTY")
-            if len(expiries) < 2:
+            if len(expiries) < 3:
                 return {"confidence": 0.0}
             
+            # --- SMART ROLLOVER LOGIC ---
+            now = datetime.now(IST)
+            today_date = now.date()
+            market_close_time = time(15, 30)
+            
+            # Default: Nearest is index 0
             near_expiry = expiries[0]
-            far_expiry = expiries[-1]
-            
-            # Find a valid monthly expiry (25-45 days out)
-            for e in expiries:
-                if 25 <= (e - datetime.now(IST).date()).days <= 45:
-                    far_expiry = e
-                    break
-            
-            today = datetime.now(IST).date()
-            dte = (near_expiry - today).days
+            next_expiry = expiries[1]
+            far_expiry = expiries[-1] # Default Monthly/Far
 
-            # 2. FETCH DATA IN PARALLEL (Weekly + Monthly)
+            # CHECK: Is the nearest expiry "Dead"?
+            # If today is the expiry date AND it is past 3:30 PM
+            if near_expiry == today_date and now.time() > market_close_time:
+                # ROLL FORWARD
+                near_expiry = expiries[1] # Next Week
+                next_expiry = expiries[2] # Week after that
+                # Recalculate monthly target
+                for e in expiries:
+                    if 25 <= (e - near_expiry).days <= 50:
+                        far_expiry = e
+                        break
+            else:
+                # Standard logic for monthly
+                for e in expiries:
+                    if 25 <= (e - near_expiry).days <= 50:
+                        far_expiry = e
+                        break
+            
+            # Calculate Valid DTE (Days To Expiry)
+            # We add a small epsilon (1/365) to avoid DivisionByZero if we check exactly at open on expiry day
+            delta = near_expiry - today_date
+            dte = max(0.01, delta.days + (0.5 if now.time() < market_close_time else 0.0))
+
+            # 2. FETCH DATA IN PARALLEL (Smart Expiry vs Monthly)
             task_weekly = self.api.get_option_chain(settings.MARKET_KEY_INDEX, near_expiry.strftime("%Y-%m-%d"))
             task_monthly = self.api.get_option_chain(settings.MARKET_KEY_INDEX, far_expiry.strftime("%Y-%m-%d"))
             
             chain_res_w, chain_res_m = await asyncio.gather(task_weekly, task_monthly)
             
             if not chain_res_w or not chain_res_w.get("data"):
-                logger.warning(f"Weekly Chain Empty for {near_expiry}")
                 return {"confidence": 0.0}
 
             chain_w = chain_res_w["data"]
@@ -70,6 +90,7 @@ class HybridPricingEngine:
             if not row_w_atm:
                 return {"confidence": 0.0}
 
+            # Extract IVs (Upstox gives 14.5 for 14.5%)
             w_ce_iv = row_w_atm.get("call_options", {}).get("option_greeks", {}).get("iv", 0)
             w_pe_iv = row_w_atm.get("put_options", {}).get("option_greeks", {}).get("iv", 0)
             
@@ -98,33 +119,39 @@ class HybridPricingEngine:
                     elif m_ce_iv > 0: m_iv = m_ce_iv
                     elif m_pe_iv > 0: m_iv = m_pe_iv
 
-            # 5. DATA SANITIZATION (The 7111% Fix)
-            # Ensure IV is returned as a DECIMAL (e.g., 0.15 for 15%)
-            
+            # 5. DATA SANITIZATION (Strict Logic)
             def sanitize_iv(val):
                 if val <= 0: return 0.0
-                if val > 5.0: val = val / 100.0  # Assume it was percentage (e.g. 15.5 -> 0.155)
-                if val > 5.0: val = val / 100.0  # Double check if it was scaled 10000x
-                if val > 2.0: return 0.0  # Cap at 200% IV (Invalid for Index)
+                # If IV is > 500% (5.0) or massive, it's garbage/expired
+                if val > 5.0 and val < 500.0: val = val / 100.0 
+                # If still crazy high (> 200%), clamp it. NIFTY never hits 200% IV.
+                if val > 2.0: return 0.0
                 return val
 
             w_iv = sanitize_iv(w_iv)
             m_iv = sanitize_iv(m_iv)
             otm_iv = sanitize_iv(otm_iv)
 
+            # Force decimal if API returns whole numbers (e.g. 15.0 -> 0.15)
+            if w_iv > 2.0: w_iv /= 100.0
+            if m_iv > 2.0: m_iv /= 100.0
+            if otm_iv > 2.0: otm_iv /= 100.0
+
             if w_iv <= 0.001: return {"confidence": 0.0}
 
             # 6. Final Pack
             return {
-                "atm_iv": w_iv,  # Returns 0.145
+                "atm_iv": w_iv,  # Returns 0.14
                 "monthly_iv": m_iv,
-                "term_structure": (m_iv - w_iv) * 100, # Scaled difference
+                "term_structure": (m_iv - w_iv) * 100, # e.g., (0.16 - 0.14)*100 = 2.0
                 "skew_index": (otm_iv - w_iv) * 100,
                 "straddle_price": straddle_price,
                 "days_to_expiry": float(dte),
-                "near_expiry": near_expiry.strftime("%Y-%m-%d"),
+                "near_expiry": near_expiry.strftime("%Y-%m-%d"), # Will show Next Week's Date
                 "far_expiry": far_expiry.strftime("%Y-%m-%d"),
-                "confidence": 1.0
+                "confidence": 1.0,
+                "pcr": 1.0, # Placeholder or fetch real
+                "max_pain": spot # Placeholder or fetch real
             }
 
         except Exception as e:
