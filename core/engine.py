@@ -1,3 +1,5 @@
+# File: core/engine.py
+
 import asyncio
 import time
 from datetime import datetime
@@ -32,7 +34,7 @@ class VolGuard17Engine:
         self.db = HybridDatabaseManager()
         self.api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
         
-        # 1. Instrument Master (The Phonebook)
+        # 1. Instrument Master
         self.instruments_master = InstrumentMaster()
         self.api.set_instrument_master(self.instruments_master)
         
@@ -40,7 +42,7 @@ class VolGuard17Engine:
         self.sabr = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
         self.pricing.set_api(self.api)
-        self.pricing.instrument_master = self.instruments_master # Explicit Link
+        self.pricing.instrument_master = self.instruments_master
         if hasattr(self.api, "set_pricing_engine"):
             self.api.set_pricing_engine(self.pricing)
             
@@ -88,15 +90,14 @@ class VolGuard17Engine:
         self._greek_update_lock = asyncio.Lock()
 
     async def initialize(self):
-        logger.info("🟢 Booting VolGuard 20.0 (Institutional Edition)...")
+        logger.info("🟢 Booting VolGuard 2.0 (Institutional Edition)...")
         
-        # A. Download Instruments (Real Data Only)
+        # A. Download Instruments
         try:
             await self.instruments_master.download_and_load()
             logger.info("✅ Instrument Master loaded")
         except Exception as e:
             logger.critical(f"Instrument Master CRITICAL FAILURE: {e}")
-            # In production, we might want to exit here if no data
             
         # B. Database & Order Manager
         await self.db.init_db()
@@ -165,30 +166,41 @@ class VolGuard17Engine:
     async def _consider_new_trade(self, spot: float):
         vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 15.0)
         
-        # 1. ANALYTICS (GARCH is Annualized Vol %)
+        # 1. ANALYTICS (Get the raw numbers)
         realized_vol, garch_vol, ivp = self.vol_analytics.get_volatility_metrics(vix)
         
         # 2. EVENT INTEL
-        risk_state, event_score, top_event = self.event_intel.get_market_risk_state()
+        risk_state_event, event_score, top_event = self.event_intel.get_market_risk_state()
         
-        # 3. MARKET STRUCTURE (Deep Scan)
+        # 3. Z-SCORE REGIME CALCULATION (The VolGuard 2.0 Upgrade)
+        # We assume daily_return is ~0.0 for intraday checks unless we fetch open price
+        daily_return = 0.0 
+        vol_regime = self.vol_analytics.calculate_volatility_regime(vix, daily_return)
+        
+        # 4. MERGE REGIMES (Event Trumps Volatility)
+        # If there is a Binary Event (Budget/Election), that overrides Vol signals.
+        final_regime = "BINARY_EVENT" if risk_state_event == "BINARY_EVENT" else vol_regime
+        
+        # 5. MARKET STRUCTURE (Deep Scan)
         market_structure = await self.pricing.get_market_structure(spot)
         
-        # REAL DATA EXTRACTION (Now using normalized values)
-        atm_iv_percent = market_structure.get("atm_iv", 0.0)      
+        # Extract and Normalize Data
+        # Ensure we don't get 7111% IV. pricing.py now returns decimal (e.g., 0.15)
+        atm_iv_decimal = market_structure.get("atm_iv", 0.0)
         confidence = market_structure.get("confidence", 0.0)
         dte = market_structure.get("days_to_expiry", 0.0)
-        real_straddle_price = market_structure.get("straddle_price", 0.0)
-        real_term_slope = market_structure.get("term_structure", 0.0)
-        real_skew_idx = market_structure.get("skew_index", 0.0)
-        real_pcr = market_structure.get("pcr", 1.0)
-        real_max_pain = market_structure.get("max_pain", spot)
+        real_straddle = market_structure.get("straddle_price", 0.0)
+        term_slope = market_structure.get("term_structure", 0.0)
+        skew_idx = market_structure.get("skew_index", 0.0)
         
-        # VRP Calculation (IV - RV)
-        # Both inputs are now properly scaled percentages.
+        # Convert decimal IV to Percent for display/metrics (0.15 -> 15.0)
+        atm_iv_percent = atm_iv_decimal * 100.0
+        
+        # 6. CALCULATE SPREADS (The Alpha)
         vrp_score = atm_iv_percent - garch_vol
+        iv_rv_spread = atm_iv_percent - realized_vol # New field for Frontend
         
-        # 4. METRICS PACKAGE
+        # 7. METRICS PACKAGE
         metrics = AdvancedMetrics(
             timestamp=datetime.now(IST), spot_price=spot, vix=vix, ivp=ivp,
             
@@ -197,22 +209,24 @@ class VolGuard17Engine:
             garch_vol_7d=garch_vol,
             atm_iv=atm_iv_percent, 
             vrp_score=vrp_score, 
+            iv_rv_spread=iv_rv_spread, # Added
             
             # Structure
-            term_structure_slope=real_term_slope,
-            volatility_skew=real_skew_idx,
-            straddle_price=real_straddle_price,
+            term_structure_slope=term_slope,
+            volatility_skew=skew_idx,
+            straddle_price=real_straddle,
             structure_confidence=confidence,
             
-            # Risk Context
-            regime=risk_state, event_risk_score=event_score, top_event=top_event,
+            # Risk Context (Z-Score Regime)
+            regime=final_regime, 
+            event_risk_score=event_score, top_event=top_event,
             trend_status=self.vol_analytics.get_trend_status(spot),
             
-            # Execution (Now Real Values)
+            # Execution
             days_to_expiry=float(dte),
             expiry_date=market_structure.get("near_expiry", "N/A"),
-            pcr=real_pcr,
-            max_pain=real_max_pain,
+            pcr=market_structure.get("pcr", 1.0),
+            max_pain=market_structure.get("max_pain", spot),
             
             # SABR
             sabr_alpha=self.sabr.alpha, sabr_beta=self.sabr.beta,
@@ -221,19 +235,19 @@ class VolGuard17Engine:
         
         self.last_metrics = metrics
         
-        # 5. DATA INTEGRITY CHECK (Strict)
+        # 8. DATA INTEGRITY CHECK
         if confidence < 0.5:
-            # If Sunday or bad data, we STOP here. No trading.
             return
             
-        # 6. STRATEGY SELECTION
+        # 9. STRATEGY SELECTION
         cap_status = await self.capital_allocator.get_status()
         strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(metrics, spot, cap_status)
         
         if strat != "WAIT":
             trade_ctx = {
                 "strategy": strat, "spot": spot, "vix": vix,
-                "vrp": vrp_score, "event": top_event, "dte": dte
+                "vrp": vrp_score, "event": top_event, "dte": dte,
+                "regime": final_regime
             }
             asyncio.create_task(self._log_ai_trade_opinion(trade_ctx))
             await self._execute_new_strategy(strat, legs, etype, bucket)
@@ -338,7 +352,6 @@ class VolGuard17Engine:
                 await self._calibrate_sabr_internal()
 
     async def _calibrate_sabr_internal(self):
-        # Full Implementation of SABR Calibration
         spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
         if spot <= 0: return
 
@@ -357,8 +370,8 @@ class VolGuard17Engine:
                 strike = item.get("strike_price")
                 iv = item.get("call_options", {}).get("option_greeks", {}).get("iv", 0)
                 
-                # Normalize IV if needed (Standardize to decimal 0.20 for solver stability)
-                if iv > 5.0: iv /= 100.0
+                # Normalize IV logic (Fixes 7111% issue here too)
+                if iv > 5.0: iv /= 100.0 
                 
                 if strike and iv > 0.01:
                     strikes.append(strike)
