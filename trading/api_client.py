@@ -45,10 +45,9 @@ class EnhancedUpstoxAPI:
         return self.session
 
     async def _request_with_retry(self, method: str, endpoint_key: str, **kwargs) -> Dict:
-        # Resolve URL from Config Map
-        base = settings.API_BASE_V3 if "greek" in endpoint_key or "gtt" in endpoint_key else settings.API_BASE_V2
+        # CRITICAL FIX: Use single base URL + exact path from config
         path = UPSTOX_API_ENDPOINTS.get(endpoint_key, "")
-        url = f"{base}{path}"
+        url = f"{settings.API_BASE_URL}{path}"
 
         for i in range(3):
             try:
@@ -129,7 +128,6 @@ class EnhancedUpstoxAPI:
         if settings.SAFETY_MODE != "live":
             return {"status": "success", "data": [{"order_id": f"SIM-BATCH-{i}"} for i in range(len(orders_payload))]}
         
-        # NOTE: Upstox V2 batch order expects the list directly as body
         return await self._request_with_retry("POST", "place_multi_order", json=orders_payload)
 
     async def cancel_order(self, order_id: str) -> bool:
@@ -145,17 +143,11 @@ class EnhancedUpstoxAPI:
     # --- MARKET DATA & FUNDS ---
 
     async def get_option_chain(self, instrument_key: str, expiry_date: str) -> Dict:
-        """
-        Spec Note: /v2/option/chain returns PutCallOptionChainData containing 'option_greeks'.
-        """
         return await self._request_with_retry("GET", "option_chain", params={
             "instrument_key": instrument_key, "expiry_date": expiry_date
         })
 
     async def get_option_greeks(self, instrument_keys: List[str]) -> Dict[str, Any]:
-        """
-        Spec Note: /v3/market-quote/option-greek for live updates on specific keys.
-        """
         if not instrument_keys: return {}
         res = await self._request_with_retry("GET", "option_greek", params={"instrument_key": ",".join(instrument_keys)})
         return res.get("data", {}) if res.get("status") == "success" else {}
@@ -167,7 +159,6 @@ class EnhancedUpstoxAPI:
         return {}
     
     async def get_margin(self, instruments_payload: List[Dict]) -> Dict:
-         # Spec Source 1319: /v2/charges/margin
          return await self._request_with_retry("POST", "margin_calc", json={"instruments": instruments_payload})
 
     async def get_short_term_positions(self) -> List[Dict]:
