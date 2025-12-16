@@ -90,11 +90,31 @@ class Settings(BaseSettings):
     TAKE_PROFIT_PCT: float = 0.50     
     STOP_LOSS_PCT: float = 1.0        
 
+    # VolGuard 19.0 Risk Matrix (Restored)
+    WEEKLY_MAX_RISK: float = Field(default=8000.0, env="WEEKLY_MAX_RISK")
+    MONTHLY_MAX_RISK: float = Field(default=10000.0, env="MONTHLY_MAX_RISK")
+    INTRADAY_MAX_RISK: float = Field(default=4000.0, env="INTRADAY_MAX_RISK")
+
     # Greeks Limits (Portfolio Level)
     MAX_PORTFOLIO_VEGA: float = Field(default=1000.0, env="MAX_VEGA")
     MAX_PORTFOLIO_DELTA: float = Field(default=300.0, env="MAX_DELTA")
     MAX_PORTFOLIO_THETA: float = Field(default=-1500.0, env="MAX_THETA")
     MAX_PORTFOLIO_GAMMA: float = Field(default=50.0, env="MAX_GAMMA")
+    MAX_ERROR_COUNT: int = 5
+
+    # Strategy Targets (Delta based - Restored)
+    DELTA_SHORT_STRANGLE: float = 0.16
+    DELTA_IRON_CONDOR_SHORT: float = 0.20
+    DELTA_IRON_CONDOR_LONG: float = 0.05
+
+    # Safety Thresholds (Restored)
+    DTE_THRESHOLD_WEEKLY: int = 2
+    VIX_MIN_THRESHOLD: float = 13.0
+
+    # Transaction Costs & Pricing (Restored)
+    BROKERAGE_PER_ORDER: float = Field(default=20.0, env="BROKERAGE_PER_ORDER")
+    GST_RATE: float = Field(default=0.18, env="GST_RATE")
+    RISK_FREE_RATE: float = Field(default=0.065, env="RISK_FREE_RATE")
 
     # SABR
     SABR_BOUNDS: Dict[str, Tuple[float, float]] = {
@@ -109,11 +129,17 @@ class Settings(BaseSettings):
     DASHBOARD_DATA_DIR: str = "dashboard_data"
     TRADING_LOOP_INTERVAL: int = 5
     
+    # Greek Validator Settings (CRITICAL FIX FOR CRASH)
+    GREEK_VALIDATION: bool = True
+    GREEK_REFRESH_SEC: int = 15
+    GREEK_TOLERANCE_PCT: float = 15.0
+    
     MARKET_KEY_INDEX: str = "NSE_INDEX|Nifty 50"
     MARKET_KEY_VIX: str = "NSE_INDEX|India VIX"
     
     MARKET_OPEN_TIME: dtime = dtime(9, 15)
     MARKET_CLOSE_TIME: dtime = dtime(15, 30)
+    SAFE_TRADE_END: dtime = dtime(15, 15)
 
     class Config:
         env_file = ".env"
