@@ -17,6 +17,7 @@ class EnhancedUpstoxAPI:
     - Atomic Token Rotation (No downtime during refresh).
     - Connection Pooling with optimized timeouts.
     - Automatic Retry Logic for 429/5xx errors.
+    - Schema-Compliant Response Parsing.
     """
     def __init__(self, token: str):
         self.token = token
@@ -41,26 +42,25 @@ class EnhancedUpstoxAPI:
         async with self._session_lock:
             if new_token == self.token:
                 return
-
-            logger.info("🔄 Initiating Atomic Token Rotation...")
             
+            logger.info("🔄 Initiating Atomic Token Rotation...")
             # 1. Save old session reference to close later (prevents blocking)
             old_session = self.session
-
+            
             # 2. Update credentials immediately in memory
             self.token = new_token
             self.headers["Authorization"] = f"Bearer {new_token}"
             
             # 3. Nuke the session reference so the next API call forces a clean reconnect
             self.session = None
-
+            
             # 4. Gracefully close old session in background
             if old_session and not old_session.closed:
                 try:
                     await old_session.close()
                 except Exception as e:
                     logger.warning(f"⚠️ Old session close warning: {e}")
-            
+
             # 5. Force reconnection now to verify it works before trading resumes
             try:
                 await self._get_session()
@@ -104,7 +104,7 @@ class EnhancedUpstoxAPI:
                         logger.warning(f"⛔ Rate Limit. Waiting {wait}s")
                         await asyncio.sleep(wait)
                         continue
-                        
+                    
                     # 5xx Errors -> Retry
                     if response.status >= 500:
                         await asyncio.sleep(1 * (i + 1))
@@ -142,6 +142,7 @@ class EnhancedUpstoxAPI:
             "trigger_price": float(order.trigger_price),
             "is_amo": order.is_amo
         }
+        
         res = await self._request_with_retry("POST", "place_order", json=payload)
         if res.get("status") == "success":
             return True, res["data"]["order_id"]
@@ -154,7 +155,7 @@ class EnhancedUpstoxAPI:
         """
         if settings.SAFETY_MODE != "live":
             return True, f"SIM-{int(asyncio.get_event_loop().time())}"
-        
+
         res = await self._request_with_retry("POST", "place_order", json=payload)
         if res.get("status") == "success":
             return True, res["data"]["order_id"]
@@ -172,12 +173,14 @@ class EnhancedUpstoxAPI:
 
     async def cancel_order(self, order_id: str) -> bool:
         if str(order_id).startswith("SIM"): return True
+        # Schema requires order_id as Query Param for DELETE
         res = await self._request_with_retry("DELETE", "cancel_order", params={"order_id": order_id})
         return res.get("status") == "success"
 
     async def get_order_details(self, order_id: str) -> Dict:
         if str(order_id).startswith("SIM"):
             return {"status": "success", "data": [{"status": "complete", "filled_quantity": 100, "average_price": 100.0}]}
+        
         return await self._request_with_retry("GET", "order_details", params={"order_id": order_id})
 
     # --- MARKET DATA & FUNDS ---
@@ -189,17 +192,26 @@ class EnhancedUpstoxAPI:
 
     async def get_option_greeks(self, instrument_keys: List[str]) -> Dict[str, Any]:
         if not instrument_keys: return {}
+        # V3 Endpoint
         res = await self._request_with_retry("GET", "option_greek", params={"instrument_key": ",".join(instrument_keys)})
         return res.get("data", {}) if res.get("status") == "success" else {}
 
     async def get_funds(self) -> Dict:
+        """
+        CRITICAL FIX: Robust parsing for Funds API.
+        Handles schema variation where key can be 'SEC' or 'equity'.
+        """
         res = await self._request_with_retry("GET", "funds_margin", params={"segment": "SEC"})
+        
         if res.get("status") == "success":
-            return res.get("data", {}).get("equity", {})
+            data = res.get("data", {})
+            # Try 'SEC' first (standard v2 param response), then fallback to 'equity'
+            return data.get("SEC") or data.get("equity") or {}
+            
         return {}
-    
+
     async def get_margin(self, instruments_payload: List[Dict]) -> Dict:
-         return await self._request_with_retry("POST", "margin_calc", json={"instruments": instruments_payload})
+        return await self._request_with_retry("POST", "margin_calc", json={"instruments": instruments_payload})
 
     async def get_short_term_positions(self) -> List[Dict]:
         res = await self._request_with_retry("GET", "positions")
