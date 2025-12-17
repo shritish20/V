@@ -1,5 +1,3 @@
-# File: core/engine.py
-
 import asyncio
 import time
 from datetime import datetime
@@ -496,10 +494,13 @@ class VolGuard17Engine:
             logger.error(f"Portfolio Doctor Error: {e}")
 
     async def get_dashboard_data(self):
-        return await self._get_dashboard_data_async()
-
-    async def _get_dashboard_data_async(self):
+        """
+        Main UI Endpoint. 
+        CRITICAL: Now sends 'system_health' block for Frontend 'Traffic Light'
+        """
+        # Fetch status logic first to be safe
         cap_status = await self.capital_allocator.get_status()
+        
         return {
             "spot_price": self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0),
             "vix": self.rt_quotes.get(settings.MARKET_KEY_VIX, 0),
@@ -510,6 +511,17 @@ class VolGuard17Engine:
             "ai_insight": {
                 "last_trade_analysis": self.architect.last_trade_analysis,
                 "portfolio_review": self.architect.last_portfolio_review
+            },
+            
+            # --- NEW HEALTH BLOCK (The "Traffic Light" Data) ---
+            "system_health": {
+                "connected": self.data_feed.is_connected,
+                # SABR is "Fresh" if calibrated in last 15 mins (900s)
+                "sabr_fresh": (time.time() - self.last_sabr_calibration) < 900,
+                # Data lag calculation
+                "data_lag": 0.0, # (Ideally calculate diff from last_tick_time if available in Feed)
+                "zombies": len([t for t in self.trades if t.status == TradeStatus.EXTERNAL]),
+                "safety_mode": settings.SAFETY_MODE
             }
         }
 
