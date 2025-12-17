@@ -15,6 +15,7 @@ class LiveOrderExecutor:
     CRITICAL FIXES v2.0:
     1. Implements intelligent rollback (Exit filled legs vs Cancel pending legs).
     2. Handles API batch limits by chunking requests.
+    3. SLIPPAGE PROTECTION: Uses Aggressive Limit Orders for emergency exits.
     """
     def __init__(self, api: EnhancedUpstoxAPI):
         self.api = api
@@ -120,7 +121,7 @@ class LiveOrderExecutor:
         """
         Emergency Rollback: 
         1. Checks status of each order.
-        2. If FILLED -> Places Market Exit (Reverse trade).
+        2. If FILLED -> Places Aggressive Limit Exit (Reverse trade).
         3. If PENDING -> Cancels order.
         """
         if not order_ids: return
@@ -158,44 +159,63 @@ class LiveOrderExecutor:
                 logger.critical(f"❌ Rollback CRITICAL FAILURE for {oid}: {e}")
 
     async def _emergency_exit_filled_order(self, order_data: Dict):
-        """Helper to place an opposing market order for a filled leg"""
+        """
+        PRODUCTION FIX: Uses Aggressive LIMIT orders instead of Market orders.
+        Prevents massive slippage during volatility spikes (Flash Crash Protection).
+        """
         try:
+            # 1. Determine Direction (Reverse the original trade)
             original_txn = order_data.get("transaction_type")
-            qty = int(order_data.get("quantity", 0))
-            instrument_token = order_data.get("instrument_token")
-            
-            # Reverse logic
             exit_txn = "SELL" if original_txn == "BUY" else "BUY"
             
+            # 2. Calculate Aggressive Price (2% Tolerance)
+            # We want to cross the spread to get filled, but stop if price is insane (e.g. 0.05).
+            avg_price = float(order_data.get("average_price", 0.0))
+            if avg_price == 0: 
+                avg_price = float(order_data.get("price", 0.0))
+            
+            if exit_txn == "BUY":
+                # To BUY back, we bid 2% HIGHER than entry (willing to pay more to close)
+                limit_price = avg_price * 1.02 
+            else:
+                # To SELL out, we ask 2% LOWER than entry (willing to sell cheaper to close)
+                limit_price = avg_price * 0.98
+
+            # Round to nearest 0.05 (Exchange Requirement)
+            limit_price = round(limit_price / 0.05) * 0.05
+
+            logger.warning(f"⚠️ ROLLING BACK {order_data.get('instrument_token')} with AGGRESSIVE LIMIT @ {limit_price}")
+
+            # 3. Place The Safe Order
             payload = {
-                "quantity": qty,
+                "quantity": int(order_data.get("quantity", 0)),
                 "product": order_data.get("product", "I"),
                 "validity": "DAY",
-                "price": 0.0,
+                "price": limit_price,
                 "tag": "VG19-ATOMIC-ROLLBACK",
-                "instrument_token": instrument_token,
-                "order_type": "MARKET",
+                "instrument_token": order_data.get("instrument_token"),
+                "order_type": "LIMIT",
                 "transaction_type": exit_txn,
                 "disclosed_quantity": 0,
                 "trigger_price": 0.0,
                 "is_amo": False
             }
             
-            # Place single order for emergency exit
-            success, exit_id = await self.api.place_order_raw(payload) # Assuming API has raw placement or use place_order logic
+            # Use raw place_order to bypass standard strategy checks
+            success, exit_id = await self.api.place_order_raw(payload) 
             
-            # Fallback if place_order_raw isn't exposed, use place_multi_order for consistency
+            # Fallback if place_order_raw isn't exposed (or implementation differs), use place_multi_order
             if not success:
                  res = await self.api.place_multi_order([payload])
                  if res.get("status") == "success":
-                     logger.warning(f"✔ Rollback: EMERGENCY EXIT Placed for {instrument_token} (Qty: {qty})")
+                     logger.warning(f"✔ Rollback: EMERGENCY EXIT Placed for {order_data.get('instrument_token')} (Qty: {order_data.get('quantity')})")
                  else:
-                     logger.critical(f"❌ Rollback: EMERGENCY EXIT FAILED for {instrument_token}! MANUAL ACTION REQUIRED.")
+                     logger.critical(f"❌ Rollback: EMERGENCY EXIT FAILED! MANUAL ACTION REQUIRED.")
             else:
                  logger.warning(f"✔ Rollback: EMERGENCY EXIT Placed {exit_id}")
 
         except Exception as e:
-            logger.critical(f"❌ Emergency Exit Logic Error: {e}")
+            logger.critical(f"❌ Emergency Exit Failed: {e}")
 
     async def _place_gtt_batch(self, trade: MultiLegTrade) -> bool:
         gtt_ids = []
