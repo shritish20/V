@@ -16,5 +16,5 @@ class AIDecision:
     alternative_strategy: Optional[str] = None
     
     def should_proceed(self) -> bool:
-        """Determines if the trading engine can continue with the order."""
+        """Safety Gate: Only ALLOW, WARN, or DOWNGRADE pass."""
         return self.action in [AIActionType.ALLOW, AIActionType.WARN, AIActionType.DOWNGRADE]
