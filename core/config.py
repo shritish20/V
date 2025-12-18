@@ -1,8 +1,8 @@
 import os
 import pytz
 from datetime import time as dtime
-from typing import Dict, Any, Tuple
-from pydantic_settings import BaseSettings
+from typing import Dict, Any, Tuple, Optional
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from pydantic_core import MultiHostUrl
 
@@ -37,6 +37,9 @@ UPSTOX_API_ENDPOINTS = {
 }
 
 class Settings(BaseSettings):
+    # Use modern Pydantic V2 ConfigDict
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
     ENV: str = Field(default="production", env="ENV")
     PORT: int = Field(default=8000, env="PORT")
     IST: Any = pytz.timezone("Asia/Kolkata")
@@ -70,6 +73,10 @@ class Settings(BaseSettings):
     
     # CRITICAL FIX: Base URL must NOT have /v2 suffix, as endpoints already include it
     API_BASE_URL: str = "https://api-v2.upstox.com" 
+
+    # --- AI CONFIGURATION (THE FIX) ---
+    # This ensures Pydantic looks for 'GEMINI_API_KEY' in your environment.
+    GEMINI_API_KEY: str = Field(default="", env="GEMINI_API_KEY")
     
     # --- CAPITAL & RISK ---
     ACCOUNT_SIZE: float = Field(default=2_000_000.0, env="ACCOUNT_SIZE")
@@ -91,7 +98,7 @@ class Settings(BaseSettings):
     TAKE_PROFIT_PCT: float = 0.50     
     STOP_LOSS_PCT: float = 1.0        
 
-    # VolGuard 19.0 Risk Matrix (Restored)
+    # VolGuard 19.0 Risk Matrix
     WEEKLY_MAX_RISK: float = Field(default=8000.0, env="WEEKLY_MAX_RISK")
     MONTHLY_MAX_RISK: float = Field(default=10000.0, env="MONTHLY_MAX_RISK")
     INTRADAY_MAX_RISK: float = Field(default=4000.0, env="INTRADAY_MAX_RISK")
@@ -103,16 +110,16 @@ class Settings(BaseSettings):
     MAX_PORTFOLIO_GAMMA: float = Field(default=50.0, env="MAX_GAMMA")
     MAX_ERROR_COUNT: int = 5
 
-    # Strategy Targets (Delta based - Restored)
+    # Strategy Targets (Delta based)
     DELTA_SHORT_STRANGLE: float = 0.16
     DELTA_IRON_CONDOR_SHORT: float = 0.20
     DELTA_IRON_CONDOR_LONG: float = 0.05
 
-    # Safety Thresholds (Restored)
+    # Safety Thresholds
     DTE_THRESHOLD_WEEKLY: int = 2
     VIX_MIN_THRESHOLD: float = 13.0
 
-    # Transaction Costs & Pricing (Restored)
+    # Transaction Costs & Pricing
     BROKERAGE_PER_ORDER: float = Field(default=20.0, env="BROKERAGE_PER_ORDER")
     GST_RATE: float = Field(default=0.18, env="GST_RATE")
     RISK_FREE_RATE: float = Field(default=0.065, env="RISK_FREE_RATE")
@@ -125,7 +132,7 @@ class Settings(BaseSettings):
         'nu': (0.01, 5.0)
     }
 
-    # Runtime & Validation (CRITICAL FIX FOR CRASH)
+    # Runtime & Validation
     PERSISTENT_DATA_DIR: str = "./data"
     DASHBOARD_DATA_DIR: str = "dashboard_data"
     TRADING_LOOP_INTERVAL: int = 5
@@ -140,10 +147,6 @@ class Settings(BaseSettings):
     MARKET_OPEN_TIME: dtime = dtime(9, 15)
     MARKET_CLOSE_TIME: dtime = dtime(15, 30)
     SAFE_TRADE_END: dtime = dtime(15, 15)
-
-    class Config:
-        env_file = ".env"
-        extra = "ignore"
 
 settings = Settings()
 IST = settings.IST
