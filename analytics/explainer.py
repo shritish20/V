@@ -2,88 +2,146 @@ import logging
 import json
 import httpx
 import time
-import google.generativeai as genai
 from typing import Dict, Any
 from core.config import settings
 from analytics.market_intelligence import MarketIntelligence
-from analytics.ai_controls import AIDecision, AIActionType
 
 logger = logging.getLogger("AI_Architect")
 
 class AI_Portfolio_Architect:
+    """
+    The 'Passive Advisor' for VolGuard.
+    Capabilities:
+    1. Trade Analysis: Narrates risks of a specific trade setup.
+    2. Portfolio Doctor: Holistic review of Greeks vs. Macro.
+    3. JSON Output: Structured data for dashboards/logs.
+    4. Non-Blocking: Uses async HTTP to avoid freezing the trading loop.
+    """
     def __init__(self):
         self.api_key = getattr(settings, 'GEMINI_API_KEY', '')
-        if self.api_key:
-            genai.configure(api_key=self.api_key)
-            # INITIALIZE WITH GOOGLE SEARCH
-            self.model = genai.GenerativeModel(
-                model_name='gemini-2.0-flash',
-                tools=[{'google_search': {}}]
-            )
+        self.model_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
         self.intel = MarketIntelligence()
-        self.last_portfolio_review = {}
+        self.client = httpx.AsyncClient(timeout=15.0)
+        
+        # State Storage for Dashboard
         self.last_trade_analysis = {}
+        self.last_portfolio_review = {}
 
-    async def evaluate_proposed_trade(self, trade_ctx: Dict, fii_data: list) -> AIDecision:
-        """The AI Risk Veto Gate. Runs before execution."""
+    async def _call_gemini_json(self, prompt: str) -> Dict[str, Any]:
+        """Helper to force Gemini to return strict JSON."""
         if not self.api_key:
-            return AIDecision(AIActionType.ALLOW, "AI Key Missing", 1.0)
+            return {}
 
-        macro = self.intel.get_macro_sentiment()
+        full_prompt = f"""
+        {prompt}
         
-        prompt = f"""
-        ACT AS: Institutional Risk Officer. 
-        EVALUATE TRADE: {json.dumps(trade_ctx)}
-        FII DATA: {json.dumps(fii_data)}
-        MACRO: {json.dumps(macro)}
-
-        1. Use GOOGLE SEARCH to see if there is an RBI Policy, Fed meet, or War news today.
-        2. Identify if FII 'Strong Bearish' views conflict with this specific trade.
-        3. Decide: BLOCK (Risk extreme), DOWNGRADE (Defined risk only), or ALLOW.
-
-        OUTPUT VALID JSON ONLY:
-        {{
-            "action": "BLOCK" | "DOWNGRADE" | "WARN" | "ALLOW",
-            "reason": "1-sentence technical justification",
-            "confidence": 0.0-1.0,
-            "alternative_strategy": "IRON_CONDOR" | "WAIT" | null
-        }}
+        SYSTEM INSTRUCTION:
+        Reply ONLY with valid raw JSON. 
+        Do not use markdown blocks (```json). 
+        Do not add conversational text.
         """
+        
+        payload = {"contents": [{"parts": [{"text": full_prompt}]}]}
+        
         try:
-            response = self.model.generate_content(prompt)
-            clean_text = response.text.replace("```json", "").replace("```", "").strip()
-            res = json.loads(clean_text)
-            return AIDecision(
-                action=AIActionType[res['action']],
-                reason=res['reason'],
-                confidence=res.get('confidence', 0.8),
-                alternative_strategy=res.get('alternative_strategy')
+            response = await self.client.post(
+                f"{self.model_url}?key={self.api_key}",
+                json=payload
             )
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "candidates" in data and data["candidates"]:
+                    raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                    # Cleaning to ensure JSON parse works
+                    clean_text = raw_text.replace("```json", "").replace("```", "").strip()
+                    try:
+                        return json.loads(clean_text)
+                    except json.JSONDecodeError:
+                        return {}
+            
+            logger.warning(f"AI Call Failed or Empty. Status: {response.status_code}")
+            return {}
+            
         except Exception as e:
-            logger.error(f"AI Veto Failure: {e}")
-            return AIDecision(AIActionType.ALLOW, "AI Context Error - Defaulting to Safety", 0.5)
+            logger.error(f"AI Architect Connection Error: {e}")
+            return {}
 
-    async def review_portfolio_holistically(self, portfolio_state: Dict, fii_data: list) -> Dict:
-        """24/7 Contextual Narrative for the dashboard."""
-        news = self.intel.get_latest_headlines()
+    async def analyze_trade_setup(self, trade_ctx: Dict) -> Dict:
+        """
+        Micro-Level: Observes a specific trade before/during execution.
+        """
+        # 1. Gather Fresh Context (Async)
+        try:
+            news = self.intel.get_latest_headlines(max_age_hours=24)
+            macro = self.intel.get_macro_sentiment()
+        except Exception:
+            news = []
+            macro = {}
+
         prompt = f"""
-        PORTFOLIO: {json.dumps(portfolio_state)}
-        CONTEXT: FII {json.dumps(fii_data)} | News {news}
+        ACT AS: Institutional Risk Manager.
         
-        TASK: Search and explain WHY the market is moving and how it effects this specific position.
-        Provide an institutional view for a pro AND a simple narrative for a random person.
+        PROPOSED TRADE:
+        {json.dumps(trade_ctx)}
         
-        OUTPUT VALID JSON ONLY:
-        {{
-            "health_score": 0-100,
-            "verdict": "SAFE" | "CAUTION" | "DANGER",
-            "narrative": "3-sentence story explaining the 'Why' and the risk",
-            "action": "Immediate command"
-        }}
+        MACRO CONTEXT:
+        Global Markets: {json.dumps(macro)}
+        News Wire (24h): {json.dumps(news)}
+        
+        TASK:
+        Provide a risk commentary. Do NOT decide yes/no.
+        Analyze if the news flow supports or contradicts the trade.
+        
+        OUTPUT JSON KEYS:
+        - risk_level: "LOW" | "MEDIUM" | "HIGH" | "EXTREME"
+        - primary_risk: <Short string identifying the main threat>
+        - narrative: <2 sentence explanation for the trader>
+        - macro_alignment: "SUPPORTIVE" | "NEUTRAL" | "CONTRADICTORY"
+        """
+        
+        result = await self._call_gemini_json(prompt)
+        if result:
+            self.last_trade_analysis = result
+            self.last_trade_analysis['timestamp'] = time.time()
+        return result
+
+    async def review_portfolio_holistically(self, portfolio_state: Dict) -> Dict:
+        """
+        Macro-Level: Checks total Greeks and PnL against market reality.
         """
         try:
-            response = self.model.generate_content(prompt)
-            clean_text = response.text.replace("```json", "").replace("```", "").strip()
-            self.last_portfolio_review = json.loads(clean_text)
-            return self.last_portfolio_review
-        except: return {}
+            news = self.intel.get_latest_headlines(max_age_hours=24)
+            macro = self.intel.get_macro_sentiment()
+        except Exception:
+            news = []
+            macro = {}
+        
+        prompt = f"""
+        ACT AS: Senior Portfolio Manager.
+        
+        PORTFOLIO HEALTH CHECK:
+        - Total Delta: {portfolio_state.get('delta', 0):.2f} (Directional Risk)
+        - Total Vega: {portfolio_state.get('vega', 0):.2f} (Volatility Risk)
+        - Daily PnL: {portfolio_state.get('pnl', 0):.2f}
+        - Open Positions: {portfolio_state.get('count', 0)}
+        
+        MARKET REALITY:
+        - Macro: {json.dumps(macro)}
+        - News: {json.dumps(news)}
+        
+        TASK:
+        Diagnose the portfolio. Are we positioned correctly for this news cycle?
+        
+        OUTPUT JSON KEYS:
+        - health_score: <0 to 100>
+        - verdict: "SAFE" | "CAUTION" | "DANGER"
+        - narrative: <3 sentences explaining the portfolio's vulnerability or strength>
+        - suggested_hedge: <Optional suggestion, e.g. "Buy NIFTY Puts">
+        """
+        
+        result = await self._call_gemini_json(prompt)
+        if result:
+            self.last_portfolio_review = result
+            self.last_portfolio_review['timestamp'] = time.time()
+        return result
