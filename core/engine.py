@@ -21,7 +21,7 @@ from analytics.sabr_model import EnhancedSABRModel
 from analytics.greek_validator import GreekValidator
 from analytics.volatility import HybridVolatilityAnalytics
 from analytics.events import AdvancedEventIntelligence
-from analytics.market_intelligence import MarketIntelligence # CRIL Sensor Import
+from analytics.market_intelligence import MarketIntelligence # CRIL Sensor Update
 from trading.strategy_engine import IntelligentStrategyEngine
 from analytics.explainer import AI_Portfolio_Architect
 from utils.logger import setup_logger
@@ -119,47 +119,54 @@ class VolGuard17Engine:
         logger.info("🚀 Engine Initialized.")
 
     async def run(self):
+        """Main Loop: AI runs 24/7, Trading runs during Market Hours."""
         await self.initialize()
         self.running = True
-        logger.info("🔁 Engine Loop Started")
+        logger.info("🔁 Engine Heartbeat Started (CRIL Active 24/7)")
         
         while self.running:
             try:
                 current_time = time.time()
                 
-                # 1. Periodic SABR Calibration (15 mins)
-                if current_time - self.last_sabr_calibration > 900:
-                    asyncio.create_task(self._run_sabr_calibration())
-                    
-                # 2. AI Contextual Intelligence Cycle (Hourly)
+                # --- 1. AI CONTEXTUAL INTELLIGENCE (24/7) ---
+                # This loop continues hourly regardless of whether the market is open.
                 if current_time - self.last_ai_check > 3600:
                     asyncio.create_task(self._run_ai_portfolio_check())
                     self.last_ai_check = current_time
                 
-                # 3. Market Data & Risk Loop
-                spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
-                if spot > 0:
-                    await self._update_greeks_and_risk(spot)
-                    await self._consider_new_trade(spot)
+                # --- 2. MARKET-ONLY OPERATIONS ---
+                now_time = datetime.now(IST).time()
+                is_market_live = settings.MARKET_OPEN_TIME <= now_time <= settings.MARKET_CLOSE_TIME
                 
-                # 4. Monitor Trades
-                await self.trade_mgr.monitor_active_trades(self.trades)
+                if is_market_live:
+                    # Calibration (Every 15 mins)
+                    if current_time - self.last_sabr_calibration > 900:
+                        asyncio.create_task(self._run_sabr_calibration())
+                    
+                    # Live Data & Risk Loop
+                    spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
+                    if spot > 0:
+                        await self._update_greeks_and_risk(spot)
+                        await self._consider_new_trade(spot)
+                    
+                    # Monitor Active Positions
+                    await self.trade_mgr.monitor_active_trades(self.trades)
                 
-                # 5. Reset Error Counter
+                # --- 3. MAINTENANCE ---
                 if current_time - self.last_error_time > 60:
                     self.error_count = 0
                     
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
                 
             except TokenExpiredError:
-                logger.critical("🔑 TOKEN EXPIRED! Pausing...")
+                logger.critical("🔑 TOKEN EXPIRED! API Paused.")
                 await asyncio.sleep(10)
             except Exception as e:
                 self.error_count += 1
                 self.last_error_time = time.time()
                 logger.error(f"Cycle Error: {e}")
                 if self.error_count > settings.MAX_ERROR_COUNT:
-                    logger.critical("❌ Too many errors. Shutdown.")
+                    logger.critical("❌ Too many consecutive errors. Emergency Shutdown.")
                     await self.shutdown()
                     break
                 await asyncio.sleep(1)
