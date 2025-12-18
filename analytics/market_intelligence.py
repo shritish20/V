@@ -1,101 +1,79 @@
 import yfinance as yf
 import feedparser
 import logging
-import time
-from datetime import datetime, timedelta
+import requests
+import io
+import pandas as pd
+from datetime import datetime
 from core.config import settings
 
 logger = logging.getLogger("MarketIntel")
 
 class MarketIntelligence:
     def __init__(self):
-        # 1. Global Risk Proxies
         self.tickers = {
-            "S&P500_FUT": "ES=F",       # US Markets (Leading indicator)
-            "BITCOIN": "BTC-USD",       # Risk-On/Off Sentiment
-            "USDINR": "INR=X",          # Currency Risk
-            "INDIA_VIX": "^INDIAVIX"    # Validation check
+            "S&P500_FUT": "ES=F",
+            "BITCOIN": "BTC-USD",
+            "USDINR": "INR=X",
+            "INDIA_VIX": "^INDIAVIX"
         }
-        
-        # 2. News Sources (RSS)
         self.news_feeds = [
-            "https://news.google.com/rss/search?q=Indian+Stock+Market+falling&hl=en-IN&gl=IN&ceid=IN:en",
-            "https://news.google.com/rss/search?q=Global+Markets+Crash&hl=en-US&gl=US&ceid=US:en",
-            "https://news.google.com/rss/search?q=Nifty+50+Prediction&hl=en-IN&gl=IN&ceid=IN:en"
+            "https://news.google.com/rss/search?q=Nifty+50+NSE+India&hl=en-IN&gl=IN&ceid=IN:en",
+            "https://news.google.com/rss/search?q=Global+Market+Risk&hl=en-US&gl=US&ceid=US:en"
         ]
+        self.fii_url = "https://raw.githubusercontent.com/shritish20/VolGuard/refs/heads/main/fii_data.csv"
+
+    def _parse_numeric_lakhs(self, val):
+        """Converts '-1.65L' to -165000.0"""
+        if not isinstance(val, str): return float(val)
+        try:
+            clean = val.replace(',', '').upper()
+            if 'L' in clean:
+                return float(clean.replace('L', '')) * 100000
+            if 'K' in clean:
+                return float(clean.replace('K', '')) * 1000
+            return float(clean)
+        except: return 0.0
+
+    def get_fii_data(self):
+        """Ingests and normalizes your FII data from GitHub."""
+        try:
+            res = requests.get(self.fii_url, timeout=10)
+            if res.status_code == 200:
+                df = pd.read_csv(io.StringIO(res.text))
+                # Get the last 4 rows for the most recent date state
+                data = df.tail(4).to_dict('records')
+                for row in data:
+                    row['Net_Value'] = self._parse_numeric_lakhs(row.get('Net', 0))
+                return data
+            return []
+        except Exception as e:
+            logger.error(f"FII GitHub Fetch Failed: {e}")
+            return []
 
     def get_macro_sentiment(self):
-        """Fetches live % change of global assets."""
+        """Fetches live % change of global assets for gap prediction."""
         data = {}
         try:
-            # yfinance allows fetching multiple tickers in one call (faster)
             tickers_list = " ".join(self.tickers.values())
-            tickers = yf.Tickers(tickers_list)
-            
-            for name, symbol in self.tickers.items():
+            t_obj = yf.Tickers(tickers_list)
+            for name, sym in self.tickers.items():
                 try:
-                    # Fast info avoids downloading full history
-                    info = tickers.tickers[symbol].fast_info
-                    last_price = info.last_price
-                    prev_close = info.previous_close
-                    
-                    if last_price and prev_close:
-                        change_pct = ((last_price - prev_close) / prev_close) * 100
-                        data[name] = f"{change_pct:+.2f}%"
-                    else:
-                        data[name] = "N/A"
-                except Exception:
-                    data[name] = "N/A" # Default to neutral on error
+                    price = t_obj.tickers[sym].fast_info.last_price
+                    prev = t_obj.tickers[sym].fast_info.previous_close
+                    change = ((price - prev) / prev) * 100
+                    data[name] = f"{change:+.2f}%"
+                except: data[name] = "N/A"
             return data
-        except Exception as e:
-            logger.error(f"Macro Fetch Error: {e}")
-            return {}
+        except: return {}
 
-    def get_latest_headlines(self, limit=5, max_age_hours=24):
-        """
-        Fetches headlines filtered by time to ensure AI context is fresh.
-        """
+    def get_latest_headlines(self, limit=5):
+        """Scans RSS feeds for context."""
         headlines = []
-        try:
-            # Calculate cutoff time (current time - max_age_hours)
-            now = datetime.now()
-            cutoff = now - timedelta(hours=max_age_hours)
-
-            for url in self.news_feeds:
-                try:
-                    feed = feedparser.parse(url)
-                    if not feed.entries:
-                        continue
-                        
-                    for entry in feed.entries:
-                        try:
-                            # 1. Parse Timestamp
-                            pub_time = None
-                            if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                                # Convert struct_time to datetime
-                                pub_time = datetime.fromtimestamp(time.mktime(entry.published_parsed))
-                            
-                            # 2. Filter Old News
-                            if pub_time and pub_time < cutoff:
-                                continue
-                                
-                            # 3. Format Output
-                            age_str = "FRESH"
-                            if pub_time:
-                                age_hours = (now - pub_time).total_seconds() / 3600
-                                age_str = f"{age_hours:.1f}h ago"
-                            
-                            clean_title = entry.title.split(' - ')[0] # Remove source name often at end
-                            headlines.append(f"[{age_str}] {clean_title}")
-                            
-                        except Exception:
-                            continue
-                except Exception:
-                    continue
-                        
-            # Return top N unique headlines
-            return list(set(headlines))[:limit]
-            
-        except Exception as e:
-            logger.error(f"News Fetch Error: {e}")
-            return []
+        for url in self.news_feeds:
+            try:
+                feed = feedparser.parse(url)
+                for entry in feed.entries[:3]:
+                    headlines.append(entry.title)
+            except: continue
+        return list(set(headlines))[:limit]
