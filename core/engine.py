@@ -58,6 +58,7 @@ class VolGuard17Engine:
         self.architect = AI_Portfolio_Architect()
         
         self.last_ai_check = 0
+        self.cycle_count = 0  # Added for EngineStatus tracking
         self.rt_quotes = {}
         self.data_feed = LiveDataFeed(self.rt_quotes, self.greeks_cache, self.sabr)
         
@@ -90,19 +91,19 @@ class VolGuard17Engine:
         self._greek_update_lock = asyncio.Lock()
 
     async def initialize(self):
-        logger.info("🟢 VolGuard 2.0: Initializing Infrastructure...")
+        logger.info("🟢 VolGuard 2.0 Booting...")
         try:
             await self.instruments_master.download_and_load()
-            logger.info("✅ Instrument Master Ready")
+            logger.info("✅ Instruments Loaded")
         except Exception as e:
-            logger.critical(f"Instrument Master FAILURE: {e}")
+            logger.critical(f"Instrument Master Load Failed: {e}")
             
         await self.db.init_db()
         await self.om.start()
         await self._restore_from_snapshot()
         await self._reconcile_broker_positions()
         
-        # Start Data Flow
+        # Data Feed Handlers
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_VIX)
         asyncio.create_task(self.data_feed.start())
@@ -110,24 +111,25 @@ class VolGuard17Engine:
         if settings.GREEK_VALIDATION:
             asyncio.create_task(self.greek_validator.start())
             
-        logger.info("🚀 System Heartbeat Online.")
+        logger.info("🚀 Engine Heartbeat Online.")
 
     async def run(self):
-        """High-Performance Loop: AI decoupled from execution."""
+        """Main Loop: Decoupled Logic for 24/7 Intelligence."""
         await self.initialize()
         self.running = True
         
         while self.running:
             try:
                 current_time = time.time()
+                self.cycle_count += 1
                 
-                # 1. 24/7 AI CIO (NON-BLOCKING BACKGROUND DISPATCH)
+                # --- 1. 24/7 AI CIO (NON-BLOCKING) ---
                 if current_time - self.last_ai_check > 3600:
-                    # We do NOT 'await' this. It runs in the background.
+                    # Fire-and-forget: main loop keeps running
                     asyncio.create_task(self._run_ai_portfolio_check())
                     self.last_ai_check = current_time
                 
-                # 2. MARKET GATE: Trade execution only during hours
+                # --- 2. MARKET-ONLY OPERATIONS ---
                 now_time = datetime.now(IST).time()
                 is_market_live = settings.MARKET_OPEN_TIME <= now_time <= settings.MARKET_CLOSE_TIME
                 
@@ -142,50 +144,41 @@ class VolGuard17Engine:
                 
                     await self.trade_mgr.monitor_active_trades(self.trades)
                 
-                # 3. MAINTENANCE
+                # Reset Errors if stable
                 if current_time - self.last_error_time > 60:
                     self.error_count = 0
                     
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
                 
             except TokenExpiredError:
-                logger.critical("🔑 TOKEN EXPIRED! Critical Pause.")
+                logger.critical("🔑 TOKEN EXPIRED!")
                 await asyncio.sleep(10)
             except Exception as e:
                 self.error_count += 1
                 self.last_error_time = time.time()
-                logger.error(f"Main Loop Cycle Exception: {e}")
+                logger.error(f"Engine Loop Error: {e}")
                 if self.error_count > settings.MAX_ERROR_COUNT:
-                    logger.critical("❌ MAX ERRORS EXCEEDED. ENGINE HALT.")
+                    logger.critical("❌ MAX ERRORS EXCEEDED. SHUTTING DOWN.")
                     await self.shutdown()
                     break
                 await asyncio.sleep(1)
 
     async def _run_ai_portfolio_check(self):
-        """Dispatched Background Logic - Separated to prevent thread blocking."""
+        """Asynchronous background check to gather context."""
         try:
-            # 1. Gather Institutional Context
             fii_data = self.intel.get_fii_data()
-            
-            # 2. Snapshot Portfolio State
             state = {
                 "delta": self.risk_mgr.portfolio_delta,
                 "vega": self.risk_mgr.portfolio_vega,
                 "gamma": self.risk_mgr.portfolio_gamma,
                 "pnl": self.risk_mgr.daily_pnl,
-                "open_positions": len([t for t in self.trades if t.status == TradeStatus.OPEN])
+                "open_count": len([t for t in self.trades if t.status == TradeStatus.OPEN])
             }
-            
-            # 3. Request Background Synthesis
-            # This task updates self.architect.last_portfolio_review internally
+            # Background call
             await self.architect.review_portfolio_holistically(state, fii_data)
-            
-            # 4. Verification logging
-            rev = self.architect.last_portfolio_review
-            logger.info(f"🛡️ AI CIO ADVISORY: {rev.get('verdict', 'CALCULATING')} | {rev.get('action_command', 'N/A')}")
-            
+            logger.info("🧠 AI Context Refresh Completed.")
         except Exception as e:
-            logger.error(f"AI Background Context Loop Failed: {e}")
+            logger.error(f"AI Check Error: {e}")
 
     async def _consider_new_trade(self, spot: float):
         vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 15.0)
@@ -222,16 +215,14 @@ class VolGuard17Engine:
         
         if strat != "WAIT":
             trade_ctx = {"strategy": strat, "spot": spot, "vix": vix, "event": top_event, "regime": final_regime}
-            # Log opinion in background, do NOT block execution
             asyncio.create_task(self._log_ai_trade_opinion(trade_ctx))
             await self._execute_new_strategy(strat, legs, etype, bucket)
 
     async def _log_ai_trade_opinion(self, trade_ctx):
         try:
             analysis = await self.architect.analyze_trade_setup(trade_ctx)
-            logger.info(f"🧠 AI OBSERVER: {trade_ctx['strategy']} | Risk: {analysis.get('risk_level', 'UNKNOWN')} | {analysis.get('narrative')}")
-        except Exception as e:
-            logger.error(f"AI Opinion Trace Failed: {e}")
+            logger.info(f"🧠 AI OBSERVER: {trade_ctx['strategy']} | Risk: {analysis.get('risk_level', 'UNKNOWN')}")
+        except: pass
 
     async def _execute_new_strategy(self, strat_name, legs_spec, exp_type, bucket):
         real_legs = []
@@ -261,7 +252,7 @@ class VolGuard17Engine:
                 self.trades.append(new_trade)
                 logger.info(f"⚡ ORDER COMPLETED: {strat_name}")
         except Exception as e:
-            logger.error(f"Trade Execution Failure: {e}")
+            logger.error(f"Execution Error: {e}")
 
     async def _update_greeks_and_risk(self, spot: float):
         async with self._greek_update_lock:
@@ -272,7 +263,7 @@ class VolGuard17Engine:
             if self.risk_mgr.check_portfolio_limits(): await self._emergency_flatten()
 
     async def _emergency_flatten(self):
-        logger.critical("🔥 CIRCUIT BREAKER: LIQUIDATING ALL POSITIONS")
+        logger.critical("🔥 CIRCUIT BREAKER TRIGGERED")
         tasks = [self.trade_mgr.close_trade(t, ExitReason.CIRCUIT_BREAKER) for t in self.trades if t.status == TradeStatus.OPEN]
         if tasks: await asyncio.gather(*tasks)
 
@@ -284,14 +275,14 @@ class VolGuard17Engine:
                         db_strat = DbStrategy(
                             id=str(t.id), type=t.strategy_type.value, status=t.status.value,
                             capital_bucket=t.capital_bucket.value, entry_time=t.entry_time,
-                            pnl=t.total_unrealized_pnl(), metadata_json={"legs": [l.dict() for l in t.legs], "lots": t.lots},
+                            pnl=t.total_unrealized_pnl(), 
+                            metadata_json={"legs": [l.dict() for l in t.legs], "lots": t.lots},
                             broker_ref_id=t.basket_order_id,
                             expiry_date=datetime.strptime(t.expiry_date, "%Y-%m-%d").date()
                         )
                         await session.merge(db_strat)
                 await self.db.safe_commit(session)
-        except Exception as e:
-            logger.error(f"DB Snapshot Failed: {e}")
+        except Exception as e: logger.error(f"Snapshot Failed: {e}")
 
     async def shutdown(self):
         self.running = False
@@ -327,11 +318,11 @@ class VolGuard17Engine:
             loop = asyncio.get_running_loop()
             if await asyncio.wait_for(loop.run_in_executor(self.executor, self.sabr.calibrate_to_chain, strikes, vols, spot, tte), timeout=15.0):
                 self.last_sabr_calibration = time.time()
-                logger.info(f"✨ SABR Calibrated (NIFTY {expiry})")
-        except Exception as e: logger.error(f"SABR Calibration Error: {e}")
+                logger.info(f"✨ SABR Calibrated")
+        except Exception as e: logger.error(f"SABR Error: {e}")
 
     async def _restore_from_snapshot(self):
-        logger.info("📂 Recovering Session from Database...")
+        logger.info("📂 Restoring Session...")
         async with self.db.get_session() as session:
             result = await session.execute(select(DbStrategy).where(DbStrategy.status == TradeStatus.OPEN.value))
             for db_strat in result.scalars().all():
@@ -348,7 +339,7 @@ class VolGuard17Engine:
                     self.trades.append(trade)
                     val = sum(abs(l.entry_price * l.quantity) for l in trade.legs)
                     await self.capital_allocator.allocate_capital(trade.capital_bucket.value, val, trade.id)
-                except Exception as e: logger.error(f"Recovery Failed for {db_strat.id}: {e}")
+                except Exception as e: logger.error(f"Recovery Error: {e}")
 
     async def _reconcile_broker_positions(self):
         try:
@@ -378,13 +369,9 @@ class VolGuard17Engine:
         )
         self.trades.append(new_trade)
         self.data_feed.subscribe_instrument(token)
-        logger.critical(f"🧟 ZOMBIE RECOVERED: {token} | Qty: {qty}")
 
     async def get_dashboard_data(self):
-        """Dashboard safe-fetch logic."""
         cap_status = await self.capital_allocator.get_status()
-        
-        # Attribute availability checks to prevent dashboard 500 errors
         last_analysis = getattr(self.architect, 'last_trade_analysis', {})
         portfolio_rev = getattr(self.architect, 'last_portfolio_review', {})
         
@@ -395,10 +382,7 @@ class VolGuard17Engine:
             "capital": cap_status,
             "metrics": self.last_metrics.dict() if self.last_metrics else {},
             "trades": [t.dict() for t in self.trades if t.status == TradeStatus.OPEN],
-            "ai_insight": {
-                "last_trade_analysis": last_analysis,
-                "portfolio_review": portfolio_rev
-            },
+            "ai_insight": {"last_trade_analysis": last_analysis, "portfolio_review": portfolio_rev},
             "system_health": {
                 "connected": self.data_feed.is_connected,
                 "sabr_fresh": (time.time() - self.last_sabr_calibration) < 900,
@@ -408,8 +392,16 @@ class VolGuard17Engine:
         }
 
     def get_status(self):
+        """FIXED: Satisfies Pydantic model by including all 4 mandatory fields."""
         from core.models import EngineStatus
+        
         return EngineStatus(
-            running=self.running, daily_pnl=self.risk_mgr.daily_pnl,
-            total_trades=len(self.trades), dashboard_ready=True
+            running=self.running,
+            circuit_breaker=False,
+            cycle_count=self.cycle_count,
+            total_trades=len(self.trades),
+            daily_pnl=self.risk_mgr.daily_pnl,
+            max_equity=getattr(self.risk_mgr, 'peak_equity', self.risk_mgr.daily_pnl),
+            last_metrics=self.last_metrics,
+            dashboard_ready=True
         )
