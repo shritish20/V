@@ -14,10 +14,10 @@ class MarketIntelligence:
     def __init__(self):
         # 1. Global Risk Proxies for Gap Prediction & Sentiment
         self.tickers = {
-            [span_0](start_span)"S&P500_FUT": "ES=F",       # US Markets (Leading indicator for Nifty Open)[span_0](end_span)
-            [span_1](start_span)"BITCOIN": "BTC-USD",       # Risk-On/Off Sentiment Proxy[span_1](end_span)
-            [span_2](start_span)"USDINR": "INR=X",          # Currency Risk (Critical for FII flows)[span_2](end_span)
-            [span_3](start_span)"INDIA_VIX": "^INDIAVIX"    # Fear Gauge[span_3](end_span)
+            "S&P500_FUT": "ES=F",       # US Markets (Leading indicator for Nifty Open)
+            "BITCOIN": "BTC-USD",       # Risk-On/Off Sentiment Proxy
+            "USDINR": "INR=X",          # Currency Risk (Critical for FII flows)
+            "INDIA_VIX": "^INDIAVIX"    # Fear Gauge
         }
         
         # 2. Institutional (FII) Data Source
@@ -53,7 +53,7 @@ class MarketIntelligence:
     def get_macro_sentiment(self):
         """
         Fetches live % change of global assets for gap prediction.
-        [span_4](start_span)Refactored for higher performance using the fast_info property.[span_4](end_span)
+        Refactored for higher performance using the fast_info property.
         """
         data = {}
         try:
@@ -68,7 +68,7 @@ class MarketIntelligence:
                     prev_close = info.previous_close
                     
                     if last_price and prev_close:
-                        [span_5](start_span)change_pct = ((last_price - prev_close) / prev_close) * 100[span_5](end_span)
+                        change_pct = ((last_price - prev_close) / prev_close) * 100
                         data[name] = f"{change_pct:+.2f}%"
                     else:
                         data[name] = "N/A"
@@ -81,12 +81,12 @@ class MarketIntelligence:
 
     def get_latest_headlines(self, limit=5, max_age_hours=24):
         """
-        [span_6](start_span)Fetches headlines filtered by time to ensure AI context is fresh.[span_6](end_span)
+        Fetches headlines filtered by time to ensure AI context is fresh.
         """
         headlines = []
         try:
             now = datetime.now()
-            [span_7](start_span)cutoff = now - timedelta(hours=max_age_hours)[span_7](end_span)
+            cutoff = now - timedelta(hours=max_age_hours)
 
             for url in self.news_feeds:
                 try:
@@ -98,7 +98,7 @@ class MarketIntelligence:
                         try:
                             pub_time = None
                             if hasattr(entry, 'published_parsed') and entry.published_parsed:
-                                [span_8](start_span)pub_time = datetime.fromtimestamp(time.mktime(entry.published_parsed))[span_8](end_span)
+                                pub_time = datetime.fromtimestamp(time.mktime(entry.published_parsed))
                             
                             # Filter outdated context
                             if pub_time and pub_time < cutoff:
@@ -107,11 +107,11 @@ class MarketIntelligence:
                             age_str = "FRESH"
                             if pub_time:
                                 age_hours = (now - pub_time).total_seconds() / 3600
-                                [span_9](start_span)age_str = f"{age_hours:.1f}h ago"[span_9](end_span)
+                                age_str = f"{age_hours:.1f}h ago"
                             
                             # Clean headline titles
                             clean_title = entry.title.split(' - ')[0]
-                            [span_10](start_span)headlines.append(f"[{age_str}] {clean_title}")[span_10](end_span)
+                            headlines.append(f"[{age_str}] {clean_title}")
                             
                         except Exception:
                             continue
