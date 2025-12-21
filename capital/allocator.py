@@ -1,97 +1,81 @@
-import logging
-import asyncio
-from typing import Dict, Optional
 from sqlalchemy import select, update
-from core.enums import CapitalBucket, StrategyType
-from core.config import settings
+from sqlalchemy.exc import IntegrityError
 from database.models import DbCapitalUsage
+from core.enums import CapitalBucket
+from core.config import settings
+import logging
 
-logger = logging.getLogger("SmartAllocator")
+logger = logging.getLogger("CapitalAllocator")
 
 class SmartCapitalAllocator:
-    def __init__(self, account_size: float, buckets: Dict, db_manager):
-        self.account_size = account_size
-        self.bucket_config = buckets
+    def __init__(self, total_account_size: float, allocation_config: dict, db_manager):
+        self.total_size = total_account_size
+        self.bucket_config = allocation_config
         self.db = db_manager
 
-    def get_bucket_limit(self, bucket: str) -> float:
-        return self.account_size * self.bucket_config.get(bucket, 0.0)
-
-    def calculate_smart_lots(self, strategy: StrategyType, available_cap: float) -> int:
-        """
-        Calculates safe lot size based on Strategy Risk Profile.
-        """
-        # Estimated Margin per Lot
-        margin_map = {
-            StrategyType.IRON_CONDOR: 50000,
-            StrategyType.IRON_FLY: 50000,
-            StrategyType.JADE_LIZARD: 130000,
-            StrategyType.SHORT_STRANGLE: 160000,
-            StrategyType.RATIO_SPREAD_PUT: 180000
-        }
-        
-        est_margin = margin_map.get(strategy, 150000)
-        
-        # Risk Weighting (0.0 - 1.0)
-        risk_weight = 1.0
-        if strategy in [StrategyType.SHORT_STRANGLE, StrategyType.RATIO_SPREAD_PUT]:
-            risk_weight = 0.60 # Reduce size for undefined risk
-            
-        raw_lots = int(available_cap / est_margin)
-        safe_lots = int(raw_lots * risk_weight)
-        
-        return max(1, min(safe_lots, settings.MAX_LOTS))
-
-    async def allocate_capital(self, bucket: str, amount: float, trade_id: str) -> bool:
-        """Atomic DB Allocation"""
-        limit = self.get_bucket_limit(bucket)
-        
-        async with self.db.get_session() as session:
-            # Upsert row first to ensure it exists
-            # (Simplified for brevity, assuming row exists via ensure_bucket_exists in startup)
-            stmt = select(DbCapitalUsage).where(DbCapitalUsage.bucket == bucket).with_for_update()
-            result = await session.execute(stmt)
-            usage = result.scalar_one_or_none()
-            
-            if not usage:
-                # Create if missing
-                usage = DbCapitalUsage(bucket=bucket, used_amount=0.0)
-                session.add(usage)
-            
-            if (usage.used_amount + amount) > limit:
-                logger.warning(f"💰 Allocation Denied: {bucket} (Req {amount:,.0f} > Limit)")
-                return False
-                
-            usage.used_amount += amount
-            await self.db.safe_commit(session)
-            logger.info(f"💰 Allocated ₹{amount:,.0f} to {trade_id}")
-            return True
-
-    async def release_capital(self, bucket: str, trade_id: str, amount: float):
-        if amount <= 0: return
-        
-        async with self.db.get_session() as session:
-            stmt = select(DbCapitalUsage).where(DbCapitalUsage.bucket == bucket).with_for_update()
-            result = await session.execute(stmt)
-            usage = result.scalar_one_or_none()
-            
-            if usage:
-                usage.used_amount = max(0.0, usage.used_amount - amount)
-                await self.db.safe_commit(session)
-                logger.info(f"♻️ Released ₹{amount:,.0f} from {trade_id}")
-
-    async def get_status(self) -> Dict:
-        status = {"available": {}, "used": {}, "limit": {}}
+    async def get_status(self):
         async with self.db.get_session() as session:
             result = await session.execute(select(DbCapitalUsage))
-            rows = result.scalars().all()
+            usage = {row.bucket: row.used_amount for row in result.scalars().all()}
             
-            db_map = {r.bucket: r.used_amount for r in rows}
+            status = {"total": self.total_size, "buckets": {}, "used": {}}
+            for bucket, pct in self.bucket_config.items():
+                limit = self.total_size * pct
+                used = usage.get(bucket, 0.0)
+                status["buckets"][bucket] = limit
+                status["used"][bucket] = used
+            return status
+
+    async def allocate_capital(self, bucket: str, amount: float, trade_id: str) -> bool:
+        """
+        Thread-safe capital allocation using Row Locking.
+        """
+        limit = self.total_size * self.bucket_config.get(bucket, 0.0)
+        
+        async with self.db.get_session() as session:
+            try:
+                # 1. Ensure Row Exists (Atomic Insert if not exists)
+                # We try to fetch first
+                stmt = select(DbCapitalUsage).where(DbCapitalUsage.bucket == bucket).with_for_update()
+                result = await session.execute(stmt)
+                row = result.scalar_one_or_none()
+                
+                if not row:
+                    # Create row if missing
+                    try:
+                        new_row = DbCapitalUsage(bucket=bucket, used_amount=0.0)
+                        session.add(new_row)
+                        await session.flush() # Force ID generation/Insert
+                        row = new_row
+                    except IntegrityError:
+                        # Race condition caught: another thread inserted it. Retry select.
+                        await session.rollback()
+                        result = await session.execute(stmt)
+                        row = result.scalar_one()
+
+                # 2. Check & Allocate
+                if row.used_amount + amount <= limit:
+                    row.used_amount += amount
+                    row.last_updated = settings.datetime.now()
+                    await self.db.safe_commit(session)
+                    logger.info(f"💰 Allocated ₹{amount:,.0f} from {bucket} for {trade_id}")
+                    return True
+                else:
+                    logger.warning(f"🚫 Capital Reject: {bucket} (Req: {amount}, Avail: {limit - row.used_amount})")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Allocation Error: {e}")
+                await session.rollback()
+                return False
+
+    async def release_capital(self, bucket: str, amount: float):
+        async with self.db.get_session() as session:
+            stmt = select(DbCapitalUsage).where(DbCapitalUsage.bucket == bucket).with_for_update()
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
             
-            for b in self.bucket_config:
-                limit = self.get_bucket_limit(b)
-                used = db_map.get(b, 0.0)
-                status["limit"][b] = limit
-                status["used"][b] = used
-                status["available"][b] = limit - used
-        return status
+            if row:
+                row.used_amount = max(0.0, row.used_amount - amount)
+                await self.db.safe_commit(session)
+                logger.info(f"♻️ Released ₹{amount:,.0f} to {bucket}")
