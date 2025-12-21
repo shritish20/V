@@ -7,10 +7,10 @@ on:
     branches: [ "main" ]
 
 jobs:
-  # Job 1: Quality Check (Warnings Only)
+  # Job 1: Quality Check (Now set to not block the build)
   quality:
     runs-on: ubuntu-latest
-    continue-on-error: true  # <--- THIS IS THE KEY: DO NOT STOP ON STYLE ERRORS
+    continue-on-error: true  # This ensures the build continues even if Ruff/MyPy find errors
     steps:
       - uses: actions/checkout@v3
       - name: Set up Python 3.11
@@ -26,7 +26,7 @@ jobs:
       - name: Run Type Checking (MyPy)
         run: mypy . --ignore-missing-imports || true
 
-  # Job 2: Logic Verification (The "Exam")
+  # Job 2: Logic Verification (THE REAL EXAM)
   test_logic:
     needs: quality
     runs-on: ubuntu-latest
@@ -66,5 +66,5 @@ jobs:
           POSTGRES_DB: volguard_test_db
           ENV: test
         run: |
-          # This is the ONLY step that matters. If this is Green, your bot is safe.
+          # This is the only step that must pass for safety
           pytest tests/ -v
