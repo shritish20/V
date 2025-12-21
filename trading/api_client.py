@@ -3,6 +3,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote  # <--- CRITICAL IMPORT
 from core.config import settings, UPSTOX_API_ENDPOINTS
 from core.models import Order
 
@@ -46,8 +47,8 @@ class EnhancedUpstoxAPI:
         self._session_lock = asyncio.Lock()
         self.instrument_master = None
         
-        # New Rate Limiter
-        self.limiter = RateLimiter(rate_limit_per_sec=9) # Safety margin below 10
+        # Rate Limiter
+        self.limiter = RateLimiter(rate_limit_per_sec=9)
 
     def set_instrument_master(self, master):
         self.instrument_master = master
@@ -75,7 +76,6 @@ class EnhancedUpstoxAPI:
             
         for i in range(3):
             try:
-                # WAIT FOR RATE LIMIT
                 await self.limiter.wait()
                 
                 session = await self._get_session()
@@ -84,14 +84,16 @@ class EnhancedUpstoxAPI:
                         return await response.json()
                     if response.status == 401:
                         raise TokenExpiredError("Token Invalid")
-                    if response.status == 429: # Rate Limit Hit
+                    if response.status == 429:
                         logger.warning("⚠️ Rate Limit Hit (429). Backing off...")
                         await asyncio.sleep(2)
                         continue
                     
                     text = await response.text()
-                    logger.error(f"API Error {response.status}: {text}")
-                    return {"status": "error", "message": text}
+                    # Don't log error for 423 (Maintenance) as it's handled by MarginGuard
+                    if response.status != 423:
+                        logger.error(f"API Error {response.status}: {text}")
+                    return {"status": "error", "message": text, "code": response.status}
             except TokenExpiredError:
                 raise
             except Exception as e:
@@ -99,9 +101,6 @@ class EnhancedUpstoxAPI:
                 await asyncio.sleep(1)
         return {"status": "error"}
 
-    # ... [Keep your existing place_order, place_multi_order, get_history methods below] ...
-    # ... [Copy them from the previous correct version of api_client.py] ...
-    
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
             return True, f"SIM-{int(asyncio.get_event_loop().time())}"
@@ -141,12 +140,27 @@ class EnhancedUpstoxAPI:
     async def get_holidays(self) -> Dict:
         return await self._request_with_retry("GET", "holidays")
 
+    # --- FIXED URL ENCODING HERE ---
     async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict:
-        url = f"{settings.API_BASE_URL}/v3/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+        """
+        Fetches historical candles.
+        CRITICAL FIX: URL Encodes the instrument_key (e.g. 'NSE_INDEX|Nifty 50' -> 'NSE_INDEX%7CNifty%2050')
+        """
+        encoded_key = quote(instrument_key)
+        url = f"{settings.API_BASE_URL}/v3/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
         return await self._request_with_retry("GET", "history_v3", dynamic_url=url)
 
+    async def get_intraday_candles(self, instrument_key: str, interval: str) -> Dict:
+        encoded_key = quote(instrument_key)
+        url = f"{settings.API_BASE_URL}/v3/historical-candle/intraday/{encoded_key}/{interval}"
+        return await self._request_with_retry("GET", "intraday_v3", dynamic_url=url)
+
     async def get_market_quote_ohlc(self, instrument_key: str, interval: str) -> Dict:
-        return await self._request_with_retry("GET", "market_quote_ohlc", params={"instrument_key": instrument_key, "interval": interval})
+        return await self._request_with_retry(
+            "GET", 
+            "market_quote_ohlc", 
+            params={"instrument_key": instrument_key, "interval": interval}
+        )
 
     async def close(self):
         async with self._session_lock:
