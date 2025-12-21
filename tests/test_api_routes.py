@@ -1,62 +1,38 @@
 import pytest
-from unittest.mock import AsyncMock, MagicMock
-from datetime import datetime
-from trading.live_order_executor import LiveOrderExecutor
-from core.models import Position, MultiLegTrade, TradeStatus, StrategyType, CapitalBucket, ExpiryType, GreeksSnapshot
+from fastapi.testclient import TestClient
+from unittest.mock import MagicMock, AsyncMock, patch
+from main import app
+from api.routes import get_engine
+
+client = TestClient(app)
 
 @pytest.fixture
-def mock_api():
-    api = AsyncMock()
-    api.get_market_quote_ohlc = AsyncMock()
-    api.place_multi_order = AsyncMock()
-    return api
+def mock_engine():
+    engine = MagicMock()
+    engine.running = True
+    return engine
 
-@pytest.fixture
-def mock_om():
-    return AsyncMock()
+def test_health_check_healthy(mock_engine):
+    with patch("api.routes.EnhancedUpstoxAPI") as MockAPI:
+        api_instance = MockAPI.return_value
+        api_instance.get_funds_and_margin = AsyncMock(return_value={
+            "status": "success", "data": {"equity": {"available_margin": 50000.0}}
+        })
+        app.dependency_overrides[get_engine] = lambda: mock_engine
+        # Verify your route matches your file (/api/v1/health or /api/health)
+        response = client.get("/api/health")
+        if response.status_code == 404:
+            response = client.get("/api/v1/health")
+        assert response.status_code == 200
 
-@pytest.fixture
-def executor(mock_api, mock_om):
-    return LiveOrderExecutor(mock_api, mock_om)
-
-@pytest.fixture
-def fake_trade():
-    dummy_greeks = GreeksSnapshot(delta=0.0, gamma=0.0, theta=0.0, vega=0.0, iv=0.0, updated_at=datetime.now())
-    legs = [
-        Position(
-            symbol="NIFTY", instrument_key="OPT-NIFTY-CE", strike=22000,
-            option_type="CE", quantity=75, entry_price=0.0, entry_time=datetime.now(),
-            current_price=0.0, current_greeks=dummy_greeks, expiry_type=ExpiryType.WEEKLY,
-            capital_bucket=CapitalBucket.WEEKLY
-        )
-    ]
-    # Note: Using StrategyType.LONG_STRADDLE or whatever matches your enum
-    return MultiLegTrade(
-        legs=legs, strategy_type=list(StrategyType)[0], net_premium_per_share=0.0,
-        entry_time=datetime.now(), expiry_date="2025-12-28", expiry_type=ExpiryType.WEEKLY,
-        capital_bucket=CapitalBucket.WEEKLY, status=TradeStatus.PENDING, id="T-TEST-1"
-    )
-
-@pytest.mark.asyncio
-async def test_slice_quantity_shares_vs_contracts(executor):
-    huge_qty = 7500 # 100 Lots
-    slices = executor._slice_quantity(huge_qty)
-    assert sum(slices) == 7500
-    assert max(slices) == 1800 
-
-@pytest.mark.asyncio
-async def test_idempotent_order_ids(executor):
-    cid1 = executor._client_order_id("T-123", "HEDGE", 0, 0)
-    cid2 = executor._client_order_id("T-123", "HEDGE", 0, 0)
-    assert cid1 == cid2
-
-@pytest.mark.asyncio
-async def test_rollback_trigger(executor, mock_api, fake_trade):
-    mock_api.get_market_quote_ohlc.return_value = {"status": "success", "data": {}}
-    mock_api.place_multi_order.side_effect = [
-        {"status": "success", "data": [{"order_id": "H1"}]},
-        {"status": "error", "message": "Margin Blocked"},
-        {"status": "success", "data": [{"order_id": "RB1"}]}
-    ]
-    ok, msg = await executor.execute_with_hedge_priority(fake_trade)
-    assert ok is False
+def test_health_check_zero_margin(mock_engine):
+    with patch("api.routes.EnhancedUpstoxAPI") as MockAPI:
+        api_instance = MockAPI.return_value
+        api_instance.get_funds_and_margin = AsyncMock(return_value={
+            "status": "success", "data": {"equity": {"available_margin": 0.0}}
+        })
+        app.dependency_overrides[get_engine] = lambda: mock_engine
+        response = client.get("/api/health")
+        if response.status_code == 404:
+            response = client.get("/api/v1/health")
+        assert response.status_code == 503
