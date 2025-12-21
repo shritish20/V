@@ -14,7 +14,6 @@ import time
 from core.engine import VolGuard17Engine
 from core.config import settings
 from core.enums import CapitalBucket, StrategyType, TradeStatus, ExpiryType, ExitReason
-# Importing models directly to match your existing structure
 from core.models import ManualTradeRequest, Position, GreeksSnapshot, MultiLegTrade
 from api.security import get_admin_key
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
@@ -100,16 +99,15 @@ async def root():
 @app.get("/health")
 async def health_check(engine: VolGuard17Engine = Depends(get_engine)):
     try:
-        health = engine.get_system_health()
-        ok = health["engine"]["running"] is not False
+        ok = engine.running
         return JSONResponse(
             status_code=200 if ok else 503,
             content={
                 "status": "healthy" if ok else "degraded",
                 "timestamp": datetime.now().isoformat(),
                 "version": "19.0.0",
-                "engine_running": health["engine"]["running"],
-                "active_trades": health["engine"]["active_trades"]
+                "engine_running": engine.running,
+                "cycle_count": engine.cycle_count
             }
         )
     except Exception as e:
@@ -127,28 +125,17 @@ async def get_dashboard_data(engine: VolGuard17Engine = Depends(get_engine)):
         if not data:
             return {"status": "initializing", "timestamp": datetime.now().isoformat()}
             
-        status_info = engine.get_status()
-        return {
-            **data,
-            "engine_status": {
-                "running": status_info.running,
-                "circuit_breaker": status_info.circuit_breaker,
-                "cycle_count": status_info.cycle_count,
-            },
-            "timestamp": datetime.now().isoformat()
-        }
+        return data
     except Exception as e:
         logger.error(f"Dashboard error: {e}")
         raise HTTPException(500, str(e))
 
-# --- NEW AI ENDPOINT ---
 @app.get("/api/cio/commentary")
 async def get_cio_commentary(engine: VolGuard17Engine = Depends(get_engine)):
     """
     Dedicated endpoint for the frontend 'Risk Advisor' widget.
     Connects to the REAL AI Architect in the engine.
     """
-    # Safety check if architect isn't ready
     trade_analysis = getattr(engine.architect, 'last_trade_analysis', {})
     portfolio_review = getattr(engine.architect, 'last_portfolio_review', {})
     
@@ -157,10 +144,6 @@ async def get_cio_commentary(engine: VolGuard17Engine = Depends(get_engine)):
         "portfolio_review": portfolio_review,
         "timestamp": datetime.now().isoformat()
     }
-
-@app.get("/api/status")
-async def get_status(engine: VolGuard17Engine = Depends(get_engine)):
-    return engine.get_status().to_dict()
 
 @app.get("/api/metrics")
 async def metrics():
@@ -224,24 +207,6 @@ async def adjust_capital(
         
         status_info = await engine.capital_allocator.get_status()
         
-        violations = []
-        for bucket, pct in new_alloc.items():
-            new_limit = settings.ACCOUNT_SIZE * pct
-            used = status_info["used"].get(bucket, 0)
-            if used > new_limit:
-                violations.append({
-                    "bucket": bucket,
-                    "used": used,
-                    "new_limit": new_limit,
-                    "shortfall": used - new_limit
-                })
-                
-        if violations:
-            msg = "New limits below current usage. Close positions first."
-            if not dry_run:
-                raise HTTPException(400, {"error": msg, "violations": violations})
-            return {"status": "blocked", "violations": violations}
-
         if dry_run:
             return {"status": "safe", "allocation": new_alloc}
             
@@ -270,7 +235,7 @@ async def place_manual_trade(req: ManualTradeRequest, engine: VolGuard17Engine =
     try:
         real_legs = []
         for l in req.legs:
-            # Note: Assuming 'ManualLegRequest' schema from core.models matches
+            # l is now a ManualLegRequest object, so we use dot notation
             expiry_dt = datetime.strptime(l.expiry_date, "%Y-%m-%d").date()
             token = engine.instruments_master.get_option_token(
                 l.symbol, l.strike, l.option_type, expiry_dt
@@ -305,13 +270,15 @@ async def place_manual_trade(req: ManualTradeRequest, engine: VolGuard17Engine =
         )
         
         logger.info(f"Manual Trade Request Received: {len(real_legs)} legs")
-        success = await engine.trade_mgr.execute_strategy(new_trade)
+        # Use Hardened Executor for Manual Trades too
+        success, msg = await engine.hardened_executor.execute_with_hedge_priority(new_trade)
         
         if success:
+            new_trade.status = TradeStatus.OPEN
             engine.trades.append(new_trade)
-            return {"status": "success", "trade_id": new_trade.id, "message": "Trade Executed"}
+            return {"status": "success", "trade_id": new_trade.id, "message": "Trade Executed Atomically"}
         else:
-            raise HTTPException(400, "Execution Failed: Check Logs for Margin/Risk reasons")
+            raise HTTPException(400, f"Execution Failed: {msg}")
 
     except HTTPException as he:
         raise he
