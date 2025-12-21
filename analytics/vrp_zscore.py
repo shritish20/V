@@ -15,7 +15,6 @@ class VRPZScoreAnalyzer:
     
     def __init__(self, data_fetcher):
         self.data_fetcher = data_fetcher
-        self.lookback_window = 252  # 1 year for Z-score calc
         
     def calculate_vrp_zscore(self, current_iv: float, current_vix: float) -> Tuple[float, str, dict]:
         """
@@ -27,8 +26,7 @@ class VRPZScoreAnalyzer:
             vix_df = self.data_fetcher.vix_data
             
             if nifty_df.empty or vix_df.empty:
-                logger.warning("Insufficient data for Z-Score calculation")
-                return 0.0, "UNKNOWN", {}
+                return 0.0, "NO_DATA", {}
             
             # 2. Calculate Realized Vol (7-day EWMA)
             if 'Log_Returns' not in nifty_df.columns:
@@ -36,10 +34,12 @@ class VRPZScoreAnalyzer:
             
             nifty_df['RV_7D'] = nifty_df['Log_Returns'].ewm(span=7).std() * np.sqrt(252) * 100
             
-            # 3. Align indices (dates must match)
+            # 3. Align indices (dates must match exactly)
             common_idx = nifty_df.index.intersection(vix_df.index)
-            if len(common_idx) < self.lookback_window:
-                logger.warning(f"Only {len(common_idx)} days available (need {self.lookback_window})")
+            
+            # Check length - we need at least some history, but don't hardcode 252
+            if len(common_idx) < 30:
+                logger.warning(f"Insufficient common history: {len(common_idx)} days")
                 return 0.0, "INSUFFICIENT_DATA", {}
             
             aligned_rv = nifty_df.loc[common_idx, 'RV_7D'].dropna()
@@ -48,52 +48,50 @@ class VRPZScoreAnalyzer:
             # 4. Calculate VRP spread history (IV - RV)
             spread_hist = aligned_vix - aligned_rv
             
-            # 5. Rolling statistics (1-year window)
-            roll_mean = spread_hist.rolling(window=self.lookback_window).mean()
-            roll_std = spread_hist.rolling(window=self.lookback_window).std()
+            # 5. Rolling statistics (Use whatever window we have, up to 252)
+            window = min(252, len(spread_hist))
+            if window < 20: return 0.0, "DATA_TOO_SHORT", {}
+            
+            roll_mean = spread_hist.rolling(window=window).mean()
+            roll_std = spread_hist.rolling(window=window).std()
             
             # 6. Current Z-Score
             latest_rv = aligned_rv.iloc[-1]
-            current_spread = current_vix - latest_rv  # Using VIX as proxy for IV
+            current_spread = current_vix - latest_rv 
             
             z_mean = roll_mean.iloc[-1]
             z_std = roll_std.iloc[-1]
             
-            if z_std == 0 or np.isnan(z_std):
-                logger.warning("Zero standard deviation in VRP history")
-                return 0.0, "FLAT_HISTORY", {}
+            # Avoid division by zero
+            if z_std == 0 or np.isnan(z_std) or np.isnan(z_mean):
+                return 0.0, "MATH_ERROR", {}
             
             z_score = (current_spread - z_mean) / z_std
             
             # 7. Generate signal
+            signal = "NEUTRAL"
+            action = "Fair value"
             if z_score > 2.0:
                 signal = "EXTREME_SELL"
-                action = "Maximum premium selling opportunity"
+                action = "Options Expensive"
             elif z_score > 1.0:
                 signal = "SELL"
-                action = "Favorable for premium selling"
             elif z_score < -2.0:
                 signal = "EXTREME_BUY"
-                action = "Options extremely cheap - consider buying"
+                action = "Options Cheap"
             elif z_score < -1.0:
                 signal = "BUY"
-                action = "Options underpriced"
-            else:
-                signal = "NEUTRAL"
-                action = "Fair value - no statistical edge"
             
-            # 8. Build details dict
+            # 8. Build details
             details = {
                 "z_score": round(z_score, 2),
                 "current_spread": round(current_spread, 2),
                 "mean_spread": round(z_mean, 2),
                 "std_spread": round(z_std, 2),
                 "current_rv": round(latest_rv, 2),
-                "current_vix": round(current_vix, 2),
                 "action": action
             }
             
-            logger.info(f"📊 VRP Z-Score: {z_score:.2f}σ | Signal: {signal}")
             return z_score, signal, details
             
         except Exception as e:
