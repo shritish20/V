@@ -60,27 +60,47 @@ class AdvancedMetrics(BaseModel):
     spot_price: float
     vix: float
     ivp: float
+    
+    # Volatility Models
     realized_vol_7d: float
+    realized_vol_28d: float = 0.0 # NEW
     garch_vol_7d: float
+    egarch_vol_1d: float = 0.0 # NEW
+    
+    # Term Structure & Skew
     atm_iv: float
-    vrp_score: float
+    monthly_iv: float = 0.0 # NEW
+    vrp_score: float # Composite
+    vrp_zscore: float = 0.0 # NEW (Statistical)
     iv_rv_spread: float
     term_structure_slope: float
     volatility_skew: float
+    
+    # Execution Context
     straddle_price: float
+    straddle_price_monthly: float = 0.0 # NEW
     structure_confidence: float
+    
+    # Regime
     regime: str
     event_risk_score: float
     top_event: str
     trend_status: str
+    
+    # Expiry Data
     days_to_expiry: float
     expiry_date: str
     pcr: float
     max_pain: float
+    
+    # SABR
     sabr_alpha: float = 0.0
     sabr_beta: float = 0.0
     sabr_rho: float = 0.0
     sabr_nu: float = 0.0
+    
+    # Extras
+    efficiency_table: List[Dict] = [] # NEW
 
 class Order(BaseModel):
     instrument_key: str
