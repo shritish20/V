@@ -31,8 +31,8 @@ from utils.data_fetcher import DashboardDataFetcher
 from utils.logger import setup_logger
 
 from core.safety_layer import MasterSafetyLayer
-# FIX: Import the correct LiveOrderExecutor from the new file
-from trading.live_order_executor import LiveOrderExecutor 
+# FIX: Ensure this imports LiveOrderExecutor correctly
+from trading.live_order_executor import LiveOrderExecutor
 from trading.position_lifecycle import PositionLifecycleManager
 from analytics.vrp_zscore import VRPZScoreAnalyzer
 
@@ -89,8 +89,8 @@ class VolGuard17Engine:
         self.vrp_zscore = VRPZScoreAnalyzer(self.data_fetcher)
         self.lifecycle_mgr = PositionLifecycleManager(self.trade_mgr)
         
-        # FIX: Instantiate LiveOrderExecutor with BOTH API and OrderManager
-        # This fixes the "missing 1 required positional argument: 'order_manager'" error
+        # --- CRITICAL FIX HERE ---
+        # Must pass BOTH self.api AND self.om
         self.hardened_executor = LiveOrderExecutor(self.api, self.om)
         
         self.safety_layer = MasterSafetyLayer(
@@ -419,11 +419,13 @@ class VolGuard17Engine:
         return {
             "timestamp": m.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "spot_price": round(m.spot_price, 2),
+            
             "system_status": {
                 "running": self.running,
                 "safety_halt": self.safety_layer.is_halted,
                 "trades_today": self.safety_layer.trades_today
             },
+            
             "atm_metrics": {
                 "straddle_cost_weekly": round(m.straddle_price, 2),
                 "straddle_cost_monthly": round(m.straddle_price_monthly, 2),
@@ -432,6 +434,7 @@ class VolGuard17Engine:
                     round(m.spot_price + m.straddle_price)
                 ]
             },
+            
             "weekly_option_metrics": {
                 "theta": round(m.atm_theta, 2),
                 "vega": round(m.atm_vega, 2),
@@ -441,18 +444,21 @@ class VolGuard17Engine:
                 "skew": round(m.volatility_skew, 2),
                 "skew_tag": tag(m.volatility_skew, 'skew')
             },
+            
             "iv_term_structure": {
                 "weekly_iv": round(m.atm_iv, 2),
                 "monthly_iv": round(m.monthly_iv, 2),
                 "spread": round(m.term_structure_spread, 2),
                 "tag": tag(m.term_structure_spread, 'term')
             },
+            
             "quant_models": {
                 "rv_7d": round(m.realized_vol_7d, 2),
                 "rv_28d": round(m.realized_vol_28d, 2),
                 "garch": round(m.garch_vol_7d, 2),
                 "egarch": round(m.egarch_vol_1d, 2)
             },
+            
             "regime_signals": {
                 "vix": round(m.vix, 2),
                 "ivp": round(m.ivp, 0),
@@ -464,12 +470,14 @@ class VolGuard17Engine:
                 "vrp_zscore": round(m.vrp_zscore, 2),
                 "zscore_tag": tag(m.vrp_zscore, 'zscore')
             },
+            
             "chain_metrics": {
                 "max_pain": m.max_pain,
                 "pcr": m.pcr,
                 "pcr_tag": tag(m.pcr, 'pcr'),
                 "efficiency_table": m.efficiency_table
             },
+            
             "active_trades": [
                 {
                     "id": t.id,
