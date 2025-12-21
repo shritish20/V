@@ -109,18 +109,15 @@ class VolGuard17Engine:
 
     async def initialize(self):
         logger.info("🚀 VolGuard 19.0 Booting (Hardened Edition)...")
-        
-        # 1. Holiday Check (Log warning but don't stop strictly yet, allow dashboard to load)
         try:
             holidays_res = await self.api.get_holidays()
             if holidays_res.get("status") == "success":
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 for h in holidays_res.get("data", []):
                     if h.get("date") == today_str and "TRADING_HOLIDAY" in h.get("holiday_type", ""):
-                        logger.warning(f"😴 TODAY IS A HOLIDAY: {h.get('description')}. Trading will be disabled.")
+                        logger.warning(f"😴 TODAY IS A HOLIDAY: {h.get('description')}.")
         except: pass
 
-        # 2. Load Core Data
         await self.instruments_master.download_and_load()
         await self.data_fetcher.load_all_data()
         await self.db.init_db()
@@ -128,7 +125,6 @@ class VolGuard17Engine:
         await self._restore_from_snapshot()
         await self._reconcile_broker_positions()
 
-        # 3. Start Feeds
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_VIX)
         asyncio.create_task(self.data_feed.start())
@@ -136,14 +132,12 @@ class VolGuard17Engine:
         if settings.GREEK_VALIDATION:
             asyncio.create_task(self.greek_validator.start())
 
-        # 4. Force Initial Metrics (So Dashboard works on weekends)
         await self._hydrate_offline_state()
-        
         logger.info("🛡️ Safety Layer Armed")
         logger.info("❤️ Engine Heartbeat Online.")
 
     async def _hydrate_offline_state(self):
-        """Calculates metrics using last known closing price so dashboard isn't empty."""
+        """Calculates metrics using last known closing price."""
         try:
             logger.info("📊 Hydrating Offline State...")
             if not self.data_fetcher.nifty_data.empty:
@@ -158,7 +152,6 @@ class VolGuard17Engine:
 
     async def run(self):
         await self.initialize()
-        
         self.running = True
         last_reset_date = None
         
@@ -166,55 +159,39 @@ class VolGuard17Engine:
             try:
                 current_time = time.time()
                 self.cycle_count += 1
-                
                 now = datetime.now(IST)
                 today = now.date()
                 
-                # === DAILY RESET (9:15 AM) ===
+                # Daily Reset
                 if now.time() >= settings.MARKET_OPEN_TIME and today != last_reset_date:
                     self.safety_layer.reset_daily_counters()
                     last_reset_date = today
 
-                # === AI CHECK (Hourly) ===
+                # AI Check
                 if current_time - self.last_ai_check > 3600:
                     asyncio.create_task(self._run_ai_portfolio_check())
                     self.last_ai_check = current_time
                 
-                # === DETERMINE SPOT PRICE ===
-                # Use live feed if available, else fallback to last known (for weekend dashboard)
+                # Determine Spot
                 live_spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
-                if live_spot > 0:
-                    self.last_known_spot = live_spot
-                
+                if live_spot > 0: self.last_known_spot = live_spot
                 spot_to_use = self.last_known_spot
                 
-                # === ALWAYS UPDATE METRICS (Thinking Mode - 24/7) ===
+                # Always Update Context (24/7)
                 if spot_to_use > 0:
-                    # Update Greeks & Risk (Mark-to-Market)
                     await self._update_greeks_and_risk(spot_to_use)
-                    
-                    # Update Lifecycle (T-1 Checks)
                     await self.lifecycle_mgr.monitor_lifecycle(self.trades)
-                    
-                    # Update Regime & VRP Models
                     await self._update_market_context(spot_to_use)
                 
-                # === TRADING LOGIC (Action Mode - Market Hours Only) ===
+                # Action Mode (Market Hours)
                 is_market_live = settings.MARKET_OPEN_TIME <= now.time() <= settings.MARKET_CLOSE_TIME
-                
                 if is_market_live and live_spot > 0:
-                    # Calibration
                     if current_time - self.last_sabr_calibration > 900:
                         asyncio.create_task(self._run_sabr_calibration())
-
-                    # Trade Execution Logic
                     await self._attempt_trading_logic(live_spot)
                     await self.trade_mgr.monitor_active_trades(self.trades)
 
-                if current_time - self.last_error_time > 60:
-                    self.error_count = 0
-                
-                # Loop delay
+                if current_time - self.last_error_time > 60: self.error_count = 0
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
 
             except TokenExpiredError:
@@ -231,20 +208,14 @@ class VolGuard17Engine:
                 await asyncio.sleep(1)
 
     async def _update_market_context(self, spot: float):
-        """
-        Calculates all models, regimes, and metrics.
-        Runs 24/7 so dashboard is always alive.
-        """
         try:
-            # VIX handling - fallback if live VIX is 0 (weekend)
             live_vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 0.0)
             if live_vix == 0 and not self.data_fetcher.vix_data.empty:
                  live_vix = self.data_fetcher.vix_data['close'].iloc[-1]
+            vix = max(live_vix, 10.0)
             
-            vix = max(live_vix, 10.0) # Safety floor
-            
-            # 1. Vol Metrics
-            rv7, rv28, garch, egarch, iv_rank = self.vol_analytics.get_volatility_metrics(vix)
+            # 1. Vol Metrics (Now returns 6 values)
+            rv7, rv28, garch, egarch, ivp, iv_rank = self.vol_analytics.get_volatility_metrics(vix)
             
             # 2. Market Structure
             market_structure = await self.pricing.get_market_structure(spot)
@@ -253,13 +224,14 @@ class VolGuard17Engine:
             # 3. Z-Score
             z_score, _, _ = self.vrp_zscore.calculate_vrp_zscore(atm_iv_pct, vix)
             
-            # 4. Regime
+            # 4. Regime (Uses IV Rank now)
             risk_state_event, event_score, top_event = self.event_intel.get_market_risk_state()
             vol_regime = self.vol_analytics.calculate_volatility_regime(vix, iv_rank)
             final_regime = "BINARY_EVENT" if risk_state_event == "BINARY_EVENT" else vol_regime
 
             self.last_metrics = AdvancedMetrics(
-                timestamp=datetime.now(IST), spot_price=spot, vix=vix, ivp=iv_rank,
+                timestamp=datetime.now(IST), spot_price=spot, vix=vix, 
+                ivp=ivp, iv_rank=iv_rank, # Added iv_rank
                 realized_vol_7d=rv7, realized_vol_28d=rv28,
                 garch_vol_7d=garch, egarch_vol_1d=egarch,
                 atm_iv=atm_iv_pct,
@@ -286,9 +258,6 @@ class VolGuard17Engine:
             logger.error(f"Context Update Failed: {e}")
 
     async def _attempt_trading_logic(self, spot: float):
-        """
-        Executes trading decisions. Runs ONLY during market hours.
-        """
         if not self.last_metrics: return
         metrics = self.last_metrics
         
@@ -347,6 +316,8 @@ class VolGuard17Engine:
             else:
                 logger.error(f"❌ EXECUTION FAILED: {msg}")
                 self.safety_layer.post_trade_update(False)
+
+    # ... [Keep other helper methods: _log_ai_trade_opinion, _run_ai_portfolio_check, etc.] ...
 
     async def _log_ai_trade_opinion(self, trade_ctx):
         try:
@@ -502,7 +473,7 @@ class VolGuard17Engine:
         m = self.last_metrics
         if not m: return {"status": "Initializing", "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
         
-        # Tags Logic (Replicating User Script)
+        # Tags Logic
         def tag(val, type_):
             if val is None: return "N/A"
             if type_ == 'pcr': return "Bullish (>1)" if val > 1 else "Bearish (<0.7)" if val < 0.7 else "Neutral"
@@ -550,6 +521,7 @@ class VolGuard17Engine:
                 "vix": m.vix,
                 "ivp": m.ivp,
                 "ivp_tag": tag(m.ivp, 'ivp'),
+                "iv_rank": round(m.iv_rank, 2),
                 "vrp_score": round(m.vrp_score, 2),
                 "vrp_tag": tag(m.vrp_score, 'vrp'),
                 "vrp_zscore": round(m.vrp_zscore, 2),
