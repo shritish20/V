@@ -1,53 +1,15 @@
-# File: core/models.py
+from datetime import datetime, date
+from typing import List, Optional, Any, Dict
+from pydantic import BaseModel, Field
+from core.enums import StrategyType, TradeStatus, CapitalBucket, ExpiryType, ExitReason
 
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
-from datetime import datetime
-from pydantic import BaseModel, Field, validator
-from enum import Enum
-from core.config import settings, IST
-from core.enums import *
-
-# --- ORDER MODELS ---
-class Order(BaseModel):
-    instrument_key: str
-    transaction_type: str
-    quantity: int = Field(..., gt=0)
-    order_type: str
-    product: str
-    price: float = 0.0
-    trigger_price: float = 0.0
-    validity: str = "DAY"
-    is_amo: bool = False
-    tag: Optional[str] = None
-    order_id: Optional[str] = None
-    status: Optional[str] = None
-    average_price: Optional[float] = None
-    filled_quantity: Optional[int] = None
-
-# --- TRADING DATA MODELS ---
-
-@dataclass
-class GreeksSnapshot:
-    timestamp: datetime
+class GreeksSnapshot(BaseModel):
     delta: float = 0.0
     gamma: float = 0.0
     theta: float = 0.0
     vega: float = 0.0
     iv: float = 0.0
-    pop: float = 0.5
-    confidence_score: float = 1.0
-
-    def is_stale(self, max_age: float = 30.0) -> bool:
-        return (datetime.now(IST) - self.timestamp).total_seconds() > max_age
-
-    def to_dict(self) -> Dict[str, float]:
-        return {
-            'delta': self.delta, 'gamma': self.gamma, 'theta': self.theta,
-            'vega': self.vega, 'iv': self.iv, 'pop': self.pop,
-            'confidence': self.confidence_score,
-            'timestamp': self.timestamp.isoformat()
-        }
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
 
 class Position(BaseModel):
     symbol: str
@@ -56,133 +18,87 @@ class Position(BaseModel):
     option_type: str
     quantity: int
     entry_price: float
-    entry_time: datetime
     current_price: float
+    entry_time: datetime
     current_greeks: GreeksSnapshot
-    transaction_costs: float = 0.0
-    expiry_type: ExpiryType = ExpiryType.WEEKLY
-    capital_bucket: CapitalBucket = CapitalBucket.WEEKLY
-    tags: List[str] = Field(default_factory=list)
-
-    @validator('option_type')
-    def validate_option_type(cls, v):
-        if v not in ['CE', 'PE']:
-            raise ValueError('option_type must be either "CE" or "PE"')
-        return v
-
-    def unrealized_pnl(self) -> float:
-        return (self.current_price - self.entry_price) * self.quantity
-
-    def update_price(self, new_price: float):
-        self.current_price = new_price
+    expiry_type: ExpiryType
+    capital_bucket: CapitalBucket
 
 class MultiLegTrade(BaseModel):
+    id: str
     legs: List[Position]
     strategy_type: StrategyType
-    net_premium_per_share: float
+    status: TradeStatus
     entry_time: datetime
+    exit_time: Optional[datetime] = None
+    net_premium_per_share: float = 0.0
+    pnl: float = 0.0
     lots: int = 1
-    status: TradeStatus = TradeStatus.OPEN
     expiry_date: str
     expiry_type: ExpiryType
     capital_bucket: CapitalBucket
-    
-    # Risk Limits
-    max_loss_per_lot: float = 0.0
-    max_profit_per_lot: float = 0.0
-    breakeven_lower: float = 0.0
-    breakeven_upper: float = 0.0
-    transaction_costs: float = 0.0
-
-    # Execution Details
     basket_order_id: Optional[str] = None
-    gtt_order_ids: List[str] = Field(default_factory=list)
-    id: Optional[str] = None
     exit_reason: Optional[ExitReason] = None
 
-    # Portfolio Greeks
-    trade_vega: float = 0.0
-    trade_delta: float = 0.0
-    trade_theta: float = 0.0
-    trade_gamma: float = 0.0
+    @property
+    def trade_vega(self) -> float:
+        return sum(l.current_greeks.vega * l.quantity for l in self.legs)
+
+    @property
+    def trade_delta(self) -> float:
+        return sum(l.current_greeks.delta * l.quantity for l in self.legs)
+    
+    @property
+    def trade_gamma(self) -> float:
+        return sum(l.current_greeks.gamma * l.quantity for l in self.legs)
 
     def total_unrealized_pnl(self) -> float:
-        return sum(leg.unrealized_pnl() for leg in self.legs) - self.transaction_costs
+        return sum((l.current_price - l.entry_price) * l.quantity for l in self.legs)
 
-    def calculate_trade_greeks(self):
-        self.trade_delta = sum((leg.current_greeks.delta or 0.0) * leg.quantity for leg in self.legs)
-        self.trade_gamma = sum((leg.current_greeks.gamma or 0.0) * leg.quantity for leg in self.legs)
-        self.trade_theta = sum((leg.current_greeks.theta or 0.0) * leg.quantity for leg in self.legs)
-        self.trade_vega = sum((leg.current_greeks.vega or 0.0) * leg.quantity for leg in self.legs)
-
-# --- MANUAL REQUEST MODELS ---
-class ManualLegRequest(BaseModel):
-    symbol: str = "NIFTY"
-    strike: float = Field(..., gt=0)
-    option_type: str = Field(..., pattern="^(CE|PE)$")
-    side: str = Field(..., pattern="^(BUY|SELL)$")
-    expiry_date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
-    quantity: int = Field(..., gt=0, le=1800)
-
-class ManualTradeRequest(BaseModel):
-    strategy_name: str = "MANUAL"
-    legs: List[ManualLegRequest]
-    capital_bucket: CapitalBucket = CapitalBucket.INTRADAY
-    tag: str = "Discretionary"
-
-# --- METRICS MODELS (DASHBOARD) ---
-@dataclass
-class AdvancedMetrics:
+class AdvancedMetrics(BaseModel):
     timestamp: datetime
     spot_price: float
     vix: float
-    ivp: float  # IV Percentile (0-100)
-
-    # PRO METRICS
+    ivp: float
     realized_vol_7d: float
     garch_vol_7d: float
     atm_iv: float
-    vrp_score: float  # IV - GARCH
-    iv_rv_spread: float  # IV - Realized Vol (NEW FIELD)
-    
+    vrp_score: float
+    iv_rv_spread: float
     term_structure_slope: float
     volatility_skew: float
-
-    # CONTEXT
-    trend_status: str
-    event_risk_score: float
-    regime: str  # e.g., PANIC, NORMAL
-
-    # EXECUTION
     straddle_price: float
+    structure_confidence: float
+    regime: str
+    event_risk_score: float
+    top_event: str
+    trend_status: str
+    days_to_expiry: float
+    expiry_date: str
     pcr: float
     max_pain: float
-    expiry_date: str
-    days_to_expiry: float
-
-    # OPTIONAL
-    structure_confidence: float = 1.0
-    top_event: str = "None"
     sabr_alpha: float = 0.0
     sabr_beta: float = 0.0
     sabr_rho: float = 0.0
     sabr_nu: float = 0.0
 
-    def dict(self):
-        return {k: str(v) if isinstance(v, datetime) else v for k, v in self.__dict__.items()}
+class Order(BaseModel):
+    instrument_key: str
+    quantity: int
+    transaction_type: str
+    order_type: str
+    product: str
+    price: float
+    trigger_price: float
+    validity: str
+    is_amo: bool = False
 
-@dataclass
-class DashboardData:
-    spot_price: float
-    vix: float
-    pnl: float
-    capital: Dict[str, Dict[str, float]]
-    trades: List[Dict]
-    metrics: Dict[str, Any]
-    ai_insight: Dict[str, Any]
+class ManualTradeRequest(BaseModel):
+    legs: List[Any]
+    capital_bucket: CapitalBucket
+    note: str = ""
 
-@dataclass
-class EngineStatus:
+class EngineStatus(BaseModel):
     running: bool
     circuit_breaker: bool
     cycle_count: int
@@ -191,11 +107,3 @@ class EngineStatus:
     max_equity: float
     last_metrics: Optional[AdvancedMetrics]
     dashboard_ready: bool
-
-    def to_dict(self):
-        return {
-            "running": self.running,
-            "circuit_breaker": self.circuit_breaker,
-            "total_trades": self.total_trades,
-            "daily_pnl": self.daily_pnl
-        }
