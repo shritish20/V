@@ -23,15 +23,16 @@ class HybridPricingEngine:
 
         try:
             expiries = self.instrument_master.get_all_expiries("NIFTY")
-            if len(expiries) < 3: return {"confidence": 0.0}
+            if len(expiries) < 3: 
+                return {"confidence": 0.0}
 
             now = datetime.now(IST)
             today_date = now.date()
             
-            # Logic: Match Lite Script's Intelligent Expiry Selection
+            # Intelligent Expiry Selection
             near_expiry = expiries[0]
             if near_expiry == today_date and now.time() > time(15, 15):
-                near_expiry = expiries[1]
+                near_expiry = expiries[1] if len(expiries) > 1 else expiries[0]
                 
             far_expiry = expiries[-1]
             for e in expiries:
@@ -39,42 +40,42 @@ class HybridPricingEngine:
                     far_expiry = e
                     break
             
-            dte = max(0.01, (near_expiry - today_date).days)
+            # CRITICAL FIX: 0DTE Time-to-Expiry Calculation
+            dte = self._calculate_dte(near_expiry, now)
 
             # Parallel Fetch
             task_w = self.api.get_option_chain(settings.MARKET_KEY_INDEX, near_expiry.strftime("%Y-%m-%d"))
             task_m = self.api.get_option_chain(settings.MARKET_KEY_INDEX, far_expiry.strftime("%Y-%m-%d"))
             res_w, res_m = await asyncio.gather(task_w, task_m)
             
-            if not res_w.get("data"): return {"confidence": 0.0}
+            if not res_w.get("data"): 
+                return {"confidence": 0.0}
             
             chain_w = res_w["data"]
             chain_m = res_m.get("data", [])
             atm_strike = round(spot / 50) * 50
             
-            # --- 1. ATM STRADDLE ANALYSIS (LITE SCRIPT LOGIC) ---
+            # ATM STRADDLE ANALYSIS
             atm_row = next((x for x in chain_w if x['strike_price'] == atm_strike), None)
             
             atm_metrics = {
-                "theta": 0.0, "vega": 0.0, "delta": 0.0, "gamma": 0.0, "pop": 0.0, "iv": 0.0, "ltp": 0.0
+                "theta": 0.0, "vega": 0.0, "delta": 0.0, "gamma": 0.0, 
+                "pop": 0.0, "iv": 0.0, "ltp": 0.0
             }
             
             if atm_row:
                 ce = atm_row['call_options']
                 pe = atm_row['put_options']
                 
-                # Summing Greeks (Total Theta, Total Vega)
                 atm_metrics["theta"] = ce['option_greeks'].get('theta', 0) + pe['option_greeks'].get('theta', 0)
                 atm_metrics["vega"] = ce['option_greeks'].get('vega', 0) + pe['option_greeks'].get('vega', 0)
                 atm_metrics["delta"] = ce['option_greeks'].get('delta', 0) + pe['option_greeks'].get('delta', 0)
                 atm_metrics["gamma"] = ce['option_greeks'].get('gamma', 0) + pe['option_greeks'].get('gamma', 0)
                 
-                # Avg POP
                 pop_c = ce['option_greeks'].get('pop', 0)
                 pop_p = pe['option_greeks'].get('pop', 0)
                 atm_metrics["pop"] = (pop_c + pop_p) / 2
                 
-                # Avg IV
                 iv_c = ce['option_greeks'].get('iv', 0)
                 iv_p = pe['option_greeks'].get('iv', 0)
                 # Sanitize IV (0.15 -> 15.0)
@@ -84,7 +85,7 @@ class HybridPricingEngine:
                 
                 atm_metrics["ltp"] = ce['market_data']['ltp'] + pe['market_data']['ltp']
 
-            # --- 2. MONTHLY COMPARISON ---
+            # MONTHLY COMPARISON
             m_atm_iv = 0.0
             m_straddle = 0.0
             if chain_m:
@@ -97,11 +98,10 @@ class HybridPricingEngine:
                     m_atm_iv = (iv_c + iv_p) / 2
                     m_straddle = row_m['call_options']['market_data']['ltp'] + row_m['put_options']['market_data']['ltp']
 
-            # --- 3. SKEW & EFFICIENCY TABLE ---
+            # SKEW & EFFICIENCY TABLE
             eff_table = []
             skew = 0.0
             
-            # Skew calc: OTM Put IV - OTM Call IV
             row_otm_p = next((x for x in chain_w if x['strike_price'] == atm_strike - 200), None)
             row_otm_c = next((x for x in chain_w if x['strike_price'] == atm_strike + 200), None)
             
@@ -110,12 +110,11 @@ class HybridPricingEngine:
                 c_iv = row_otm_c['call_options']['option_greeks'].get('iv', 0)
                 if p_iv < 2.0: p_iv *= 100
                 if c_iv < 2.0: c_iv *= 100
-                skew = p_iv - c_iv # Positive = Put Skew (Fear)
+                skew = p_iv - c_iv
 
-            # Efficiency Loop
             for item in chain_w:
                 strike = item['strike_price']
-                if abs(strike - spot) > 500: continue # Filter far strikes
+                if abs(strike - spot) > 500: continue
                 
                 ce_g = item['call_options']['option_greeks']
                 pe_g = item['put_options']['option_greeks']
@@ -134,7 +133,7 @@ class HybridPricingEngine:
             
             eff_table.sort(key=lambda x: x['ratio'], reverse=True)
             
-            # --- 4. MAX PAIN & PCR ---
+            # MAX PAIN & PCR
             pain_map = {}
             pcr_num, pcr_den = 0, 0
             for item in chain_w:
@@ -143,7 +142,6 @@ class HybridPricingEngine:
                 pe_oi = item['put_options']['market_data']['oi']
                 pcr_num += pe_oi
                 pcr_den += ce_oi
-                # Simplified Max Pain (Approximation for speed)
                 pain_map[strike] = ce_oi + pe_oi 
                 
             max_pain = max(pain_map, key=pain_map.get) if pain_map else spot
@@ -166,9 +164,46 @@ class HybridPricingEngine:
                 "confidence": 1.0 if atm_metrics["iv"] > 0 else 0.0,
                 "pcr": round(pcr, 2),
                 "max_pain": max_pain,
-                "efficiency_table": eff_table[:5] # Top 5
+                "efficiency_table": eff_table[:5]
             }
 
         except Exception as e:
             logger.error(f"Pricing Engine Error: {e}")
             return {"confidence": 0.0}
+
+    def _calculate_dte(self, expiry_date, now: datetime) -> float:
+        """
+        CRITICAL FIX: Proper 0DTE time-to-expiry calculation.
+        Uses HOURS on expiry day, not days.
+        """
+        today = now.date()
+        
+        # Case 1: Future expiry
+        if expiry_date > today:
+            return (expiry_date - today).days
+        
+        # Case 2: Expiry is today (0DTE)
+        elif expiry_date == today:
+            market_close = time(15, 30)  # 3:30 PM IST
+            current_time = now.time()
+            
+            # Calculate remaining hours until market close
+            close_dt = datetime.combine(today, market_close)
+            current_dt = datetime.combine(today, current_time)
+            
+            hours_remaining = (close_dt - current_dt).total_seconds() / 3600
+            
+            # Convert hours to fraction of a day
+            # Minimum 0.01 days (14.4 minutes) to prevent division by zero
+            dte_fraction = max(0.01, hours_remaining / 24)
+            
+            logger.info(
+                f"0DTE Calculation: {hours_remaining:.1f}h remaining = {dte_fraction:.4f} days"
+            )
+            
+            return dte_fraction
+        
+        # Case 3: Expired (should not happen in production)
+        else:
+            logger.warning(f"Expired contract detected: {expiry_date} < {today}")
+            return 0.01  # Minimum safety value
