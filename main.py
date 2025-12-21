@@ -1,59 +1,106 @@
 #!/usr/bin/env python3
-import asyncio
-import signal
+"""
+VolGuard 20.0 – Main Entry Point
+- Initializes the Hardened VolGuard20Engine
+- Mounts the Unified API Router
+- Manages Lifecycle (Startup/Shutdown) via FastAPI
+"""
 import uvicorn
-import sys
-import os
+import logging
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
+# Import Hardened Components
+from core.engine import VolGuard20Engine
 from core.config import settings
-from core.engine import VolGuard17Engine
-from database.manager import HybridDatabaseManager
 from utils.logger import setup_logger
-from api.routes import app
+from api.routes import router as api_router
 
+# Setup Logging
 logger = setup_logger("Main")
+
+# Global Engine Instance
 engine_instance = None
 
-async def startup_sequence():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manages the lifecycle of the Engine (Startup/Shutdown).
+    This replaces your old signal handlers and startup_sequence.
+    """
     global engine_instance
-    logger.info("🚀 STARTING VOLGUARD 19.0 (PROP EDITION)")
+    logger.info("🚀 VolGuard 20.0 System Initializing...")
     
-    db_manager = HybridDatabaseManager()
-    await db_manager.init_db()
+    # 1. Initialize Engine
+    # This automatically connects to DB, Broker, and sets up the Allocator
+    engine_instance = VolGuard20Engine()
     
-    engine_instance = VolGuard17Engine()
-    
+    # 2. Inject into App State so API endpoints can access it
     app.state.engine = engine_instance
-    return engine_instance
-
-async def shutdown_sequence(sig=None):
-    if engine_instance:
-        logger.info("🛑 Shutting down Trading Engine...")
-        await engine_instance.shutdown()
-    logger.info("✅ System Shutdown Complete.")
-
-async def main():
-    loop = asyncio.get_running_loop()
-    for s in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(s, lambda sig=s: asyncio.create_task(shutdown_sequence(sig)))
-
+    
+    # 3. Boot Engine Components
     try:
-        active_engine = await startup_sequence()
-        await asyncio.gather(
-            active_engine.run(),
-            uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=settings.PORT)).serve(),
-        )
-    except asyncio.CancelledError:
-        pass
+        await engine_instance.initialize()
+        
+        # Optional: Auto-start the loop if configured, otherwise wait for /api/start
+        if settings.ENV == "production":
+            logger.info("⚡ Auto-starting Engine Loop...")
+            import asyncio
+            asyncio.create_task(engine_instance.run())
+            
     except Exception as e:
-        logger.critical(f"🔥 FATAL ERROR: {e}")
-    finally:
-        await shutdown_sequence()
+        logger.critical(f"🔥 Startup Failed: {e}")
+        raise e
+    
+    yield
+    
+    # 4. Cleanup on Shutdown
+    logger.info("🛑 System Shutdown Initiated...")
+    if engine_instance and engine_instance.running:
+        await engine_instance.shutdown()
+    logger.info("✅ System Shutdown Complete")
+
+# ==========================================
+# FASTAPI APP DEFINITION
+# ==========================================
+app = FastAPI(
+    title="VolGuard 20.0 (Hardened)",
+    description="Institutional-Grade Algorithmic Trading System",
+    version="20.0.0",
+    lifespan=lifespan
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Static Files (Dashboard)
+static_path = Path("./static_dashboard")
+static_path.mkdir(exist_ok=True)
+app.mount("/dashboard/static", StaticFiles(directory=static_path), name="static")
+
+# Include the Unified Router
+app.include_router(api_router)
+
+# Root Redirect
+@app.get("/")
+async def root():
+    return {"message": "VolGuard 20.0 Active", "docs": "/docs"}
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
+    logger.info(f"🔥 Starting VolGuard Server on Port {settings.PORT} [ENV: {settings.ENV}]")
+    uvicorn.run(
+        "main:app", 
+        host="0.0.0.0", 
+        port=settings.PORT, 
+        log_level="info",
+        reload=False # False for production stability
+    )
