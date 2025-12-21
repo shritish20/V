@@ -63,22 +63,22 @@ class AdvancedMetrics(BaseModel):
     
     # Volatility Models
     realized_vol_7d: float
-    realized_vol_28d: float = 0.0 # NEW
+    realized_vol_28d: float = 0.0
     garch_vol_7d: float
-    egarch_vol_1d: float = 0.0 # NEW
+    egarch_vol_1d: float = 0.0
     
     # Term Structure & Skew
     atm_iv: float
-    monthly_iv: float = 0.0 # NEW
-    vrp_score: float # Composite
-    vrp_zscore: float = 0.0 # NEW (Statistical)
+    monthly_iv: float = 0.0
+    vrp_score: float
+    vrp_zscore: float = 0.0
     iv_rv_spread: float
     term_structure_slope: float
     volatility_skew: float
     
     # Execution Context
     straddle_price: float
-    straddle_price_monthly: float = 0.0 # NEW
+    straddle_price_monthly: float = 0.0
     structure_confidence: float
     
     # Regime
@@ -100,7 +100,7 @@ class AdvancedMetrics(BaseModel):
     sabr_nu: float = 0.0
     
     # Extras
-    efficiency_table: List[Dict] = [] # NEW
+    efficiency_table: List[Dict] = []
 
 class Order(BaseModel):
     instrument_key: str
@@ -113,8 +113,17 @@ class Order(BaseModel):
     validity: str
     is_amo: bool = False
 
+# --- NEW: Manual Trade Models ---
+class ManualLegRequest(BaseModel):
+    symbol: str = "NIFTY"
+    strike: float
+    option_type: str  # CE or PE
+    expiry_date: str  # YYYY-MM-DD
+    side: str         # BUY or SELL
+    quantity: int
+
 class ManualTradeRequest(BaseModel):
-    legs: List[Any]
+    legs: List[ManualLegRequest]
     capital_bucket: CapitalBucket
     note: str = ""
 
