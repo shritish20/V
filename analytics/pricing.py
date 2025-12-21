@@ -28,6 +28,7 @@ class HybridPricingEngine:
             now = datetime.now(IST)
             today_date = now.date()
             
+            # Logic: Match Lite Script's Intelligent Expiry Selection
             near_expiry = expiries[0]
             if near_expiry == today_date and now.time() > time(15, 15):
                 near_expiry = expiries[1]
@@ -40,7 +41,7 @@ class HybridPricingEngine:
             
             dte = max(0.01, (near_expiry - today_date).days)
 
-            # Fetch Option Chains
+            # Parallel Fetch
             task_w = self.api.get_option_chain(settings.MARKET_KEY_INDEX, near_expiry.strftime("%Y-%m-%d"))
             task_m = self.api.get_option_chain(settings.MARKET_KEY_INDEX, far_expiry.strftime("%Y-%m-%d"))
             res_w, res_m = await asyncio.gather(task_w, task_m)
@@ -49,64 +50,91 @@ class HybridPricingEngine:
             
             chain_w = res_w["data"]
             chain_m = res_m.get("data", [])
-            
             atm_strike = round(spot / 50) * 50
             
-            # --- HELPER FUNCTIONS ---
-            def get_iv(chain, strike, type_):
-                row = next((x for x in chain if x['strike_price'] == strike), None)
-                if not row: return 0.0
-                opt = row['call_options'] if type_ == 'CE' else row['put_options']
-                return opt.get('option_greeks', {}).get('iv', 0.0)
-
-            def get_straddle(chain, strike):
-                row = next((x for x in chain if x['strike_price'] == strike), None)
-                if not row: return 0.0
-                return row['call_options']['market_data']['ltp'] + row['put_options']['market_data']['ltp']
-
-            # --- METRICS CALCULATION ---
-            # 1. IVs
-            w_atm_iv = (get_iv(chain_w, atm_strike, 'CE') + get_iv(chain_w, atm_strike, 'PE')) / 2
-            m_atm_iv = (get_iv(chain_m, atm_strike, 'CE') + get_iv(chain_m, atm_strike, 'PE')) / 2 if chain_m else w_atm_iv
+            # --- 1. ATM STRADDLE ANALYSIS (LITE SCRIPT LOGIC) ---
+            atm_row = next((x for x in chain_w if x['strike_price'] == atm_strike), None)
             
-            # 2. Skew
-            otm_put_iv = get_iv(chain_w, atm_strike - 200, 'PE')
-            otm_call_iv = get_iv(chain_w, atm_strike + 200, 'CE')
-            skew = otm_put_iv - otm_call_iv if (otm_put_iv and otm_call_iv) else 0.0
+            atm_metrics = {
+                "theta": 0.0, "vega": 0.0, "delta": 0.0, "gamma": 0.0, "pop": 0.0, "iv": 0.0, "ltp": 0.0
+            }
+            
+            if atm_row:
+                ce = atm_row['call_options']
+                pe = atm_row['put_options']
+                
+                # Summing Greeks (Total Theta, Total Vega)
+                atm_metrics["theta"] = ce['option_greeks'].get('theta', 0) + pe['option_greeks'].get('theta', 0)
+                atm_metrics["vega"] = ce['option_greeks'].get('vega', 0) + pe['option_greeks'].get('vega', 0)
+                atm_metrics["delta"] = ce['option_greeks'].get('delta', 0) + pe['option_greeks'].get('delta', 0)
+                atm_metrics["gamma"] = ce['option_greeks'].get('gamma', 0) + pe['option_greeks'].get('gamma', 0)
+                
+                # Avg POP
+                pop_c = ce['option_greeks'].get('pop', 0)
+                pop_p = pe['option_greeks'].get('pop', 0)
+                atm_metrics["pop"] = (pop_c + pop_p) / 2
+                
+                # Avg IV
+                iv_c = ce['option_greeks'].get('iv', 0)
+                iv_p = pe['option_greeks'].get('iv', 0)
+                # Sanitize IV (0.15 -> 15.0)
+                if iv_c < 2.0: iv_c *= 100
+                if iv_p < 2.0: iv_p *= 100
+                atm_metrics["iv"] = (iv_c + iv_p) / 2
+                
+                atm_metrics["ltp"] = ce['market_data']['ltp'] + pe['market_data']['ltp']
 
-            # 3. Term Structure
-            term_structure = (w_atm_iv / m_atm_iv) if m_atm_iv > 0 else 1.0
+            # --- 2. MONTHLY COMPARISON ---
+            m_atm_iv = 0.0
+            m_straddle = 0.0
+            if chain_m:
+                row_m = next((x for x in chain_m if x['strike_price'] == atm_strike), None)
+                if row_m:
+                    iv_c = row_m['call_options']['option_greeks'].get('iv', 0)
+                    iv_p = row_m['put_options']['option_greeks'].get('iv', 0)
+                    if iv_c < 2.0: iv_c *= 100
+                    if iv_p < 2.0: iv_p *= 100
+                    m_atm_iv = (iv_c + iv_p) / 2
+                    m_straddle = row_m['call_options']['market_data']['ltp'] + row_m['put_options']['market_data']['ltp']
 
-            # 4. Straddles
-            straddle_w = get_straddle(chain_w, atm_strike)
-            straddle_m = get_straddle(chain_m, atm_strike)
-
-            # 5. Efficiency Table (Theta/Vega)
+            # --- 3. SKEW & EFFICIENCY TABLE ---
             eff_table = []
+            skew = 0.0
+            
+            # Skew calc: OTM Put IV - OTM Call IV
+            row_otm_p = next((x for x in chain_w if x['strike_price'] == atm_strike - 200), None)
+            row_otm_c = next((x for x in chain_w if x['strike_price'] == atm_strike + 200), None)
+            
+            if row_otm_p and row_otm_c:
+                p_iv = row_otm_p['put_options']['option_greeks'].get('iv', 0)
+                c_iv = row_otm_c['call_options']['option_greeks'].get('iv', 0)
+                if p_iv < 2.0: p_iv *= 100
+                if c_iv < 2.0: c_iv *= 100
+                skew = p_iv - c_iv # Positive = Put Skew (Fear)
+
+            # Efficiency Loop
             for item in chain_w:
                 strike = item['strike_price']
-                if abs(strike - spot) > 500: continue # Filter far OTM
+                if abs(strike - spot) > 500: continue # Filter far strikes
                 
-                ce = item['call_options']['option_greeks']
-                pe = item['put_options']['option_greeks']
+                ce_g = item['call_options']['option_greeks']
+                pe_g = item['put_options']['option_greeks']
                 
-                total_theta = ce.get('theta', 0) + pe.get('theta', 0)
-                total_vega = ce.get('vega', 0) + pe.get('vega', 0)
+                tot_theta = ce_g.get('theta', 0) + pe_g.get('theta', 0)
+                tot_vega = ce_g.get('vega', 0) + pe_g.get('vega', 0)
                 
-                if total_vega > 0.1:
-                    ratio = abs(total_theta) / total_vega
+                if tot_vega > 0.1:
+                    ratio = abs(tot_theta) / tot_vega
                     eff_table.append({
                         "strike": strike,
-                        "theta": total_theta,
-                        "vega": total_vega,
-                        "ratio": ratio
+                        "theta": round(tot_theta, 2),
+                        "vega": round(tot_vega, 2),
+                        "ratio": round(ratio, 2)
                     })
             
-            # Sort by ratio descending and take top 5
             eff_table.sort(key=lambda x: x['ratio'], reverse=True)
-            top_5_eff = eff_table[:5]
             
-            # 6. Max Pain & PCR
+            # --- 4. MAX PAIN & PCR ---
             pain_map = {}
             pcr_num, pcr_den = 0, 0
             for item in chain_w:
@@ -115,37 +143,32 @@ class HybridPricingEngine:
                 pe_oi = item['put_options']['market_data']['oi']
                 pcr_num += pe_oi
                 pcr_den += ce_oi
+                # Simplified Max Pain (Approximation for speed)
+                pain_map[strike] = ce_oi + pe_oi 
                 
-                # Simplified Max Pain
-                pain = 0
-                # Full pain calc is expensive O(N^2), doing local approximation or skip for speed
-                # For dashboard speed, let's use highest OI Put - Highest OI Call center point or just skip exact calculation
-                # Using Spot for now as placeholder or Max OI strike
-                pain_map[strike] = ce_oi + pe_oi # Just total OI map for now
-            
             max_pain = max(pain_map, key=pain_map.get) if pain_map else spot
             pcr = pcr_num / pcr_den if pcr_den > 0 else 1.0
 
-            # Sanitize
-            if w_atm_iv > 2.0: w_atm_iv /= 100.0
-            if m_atm_iv > 2.0: m_atm_iv /= 100.0
-            if skew > 2.0: skew /= 100.0
-
             return {
-                "atm_iv": w_atm_iv,
+                "atm_iv": atm_metrics["iv"],
                 "monthly_iv": m_atm_iv,
-                "term_structure": term_structure, 
-                "skew_index": skew * 100,
-                "straddle_price": straddle_w,
-                "straddle_price_monthly": straddle_m,
+                "term_structure_spread": atm_metrics["iv"] - m_atm_iv,
+                "skew_index": skew,
+                "straddle_price": atm_metrics["ltp"],
+                "straddle_price_monthly": m_straddle,
+                "atm_theta": atm_metrics["theta"],
+                "atm_vega": atm_metrics["vega"],
+                "atm_delta": atm_metrics["delta"],
+                "atm_gamma": atm_metrics["gamma"],
+                "atm_pop": atm_metrics["pop"],
                 "days_to_expiry": float(dte),
                 "near_expiry": near_expiry.strftime("%Y-%m-%d"),
-                "confidence": 1.0 if w_atm_iv > 0 else 0.0,
+                "confidence": 1.0 if atm_metrics["iv"] > 0 else 0.0,
                 "pcr": round(pcr, 2),
                 "max_pain": max_pain,
-                "efficiency_table": top_5_eff
+                "efficiency_table": eff_table[:5] # Top 5
             }
 
         except Exception as e:
-            logger.error(f"Structure Scan Error: {e}")
+            logger.error(f"Pricing Engine Error: {e}")
             return {"confidence": 0.0}
