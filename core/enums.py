@@ -2,33 +2,26 @@ from enum import Enum
 
 class StrategyType(Enum):
     WAIT = "WAIT"
-    
-    # --- INCOME (Defined Risk) ---
+    # INCOME (Defined Risk)
     IRON_CONDOR = "IRON_CONDOR"
     IRON_FLY = "IRON_FLY"
-    
-    # --- AGGRESSIVE INCOME (Undefined Risk) ---
+    # AGGRESSIVE INCOME (Undefined Risk)
     SHORT_STRANGLE = "SHORT_STRANGLE"
     SHORT_STRADDLE = "SHORT_STRADDLE"
-    
-    # --- SMART SKEW (Net Credit / No Upside Risk) ---
-    JADE_LIZARD = "JADE_LIZARD"             # Sell Put + Sell Call Spread
-    REVERSE_JADE_LIZARD = "REVERSE_JADE_LIZARD" # Sell Call + Sell Put Spread
-    
-    # --- CRASH DEFENSE (Financed Hedges) ---
-    RATIO_SPREAD_PUT = "RATIO_SPREAD_PUT"   # Sell 2 OTM, Buy 1 ATM
+    # SMART SKEW (Net Credit / No Upside Risk)
+    JADE_LIZARD = "JADE_LIZARD"
+    REVERSE_JADE_LIZARD = "REVERSE_JADE_LIZARD"
+    # CRASH DEFENSE
+    RATIO_SPREAD_PUT = "RATIO_SPREAD_PUT"
     RATIO_SPREAD_CALL = "RATIO_SPREAD_CALL"
-    
-    # --- DIRECTIONAL ---
+    # DIRECTIONAL CREDIT
     BULL_PUT_SPREAD = "BULL_PUT_SPREAD"
     BEAR_CALL_SPREAD = "BEAR_CALL_SPREAD"
     BULL_CALL_SPREAD = "BULL_CALL_SPREAD"
     BEAR_PUT_SPREAD = "BEAR_PUT_SPREAD"
-    
-    # --- VOLATILITY LONG ---
-    LONG_STRADDLE = "LONG_STRADDLE"
-    LONG_CALENDAR_CALL = "LONG_CALENDAR_CALL"
-    LONG_CALENDAR_PUT = "LONG_CALENDAR_PUT"
+    # VOLATILITY LONG (Debit) - Rare use
+    CALL_RATIO_SPREAD = "CALL_RATIO_SPREAD"
+    PUT_RATIO_SPREAD = "PUT_RATIO_SPREAD"
 
 class TradeStatus(Enum):
     PENDING = "PENDING"
@@ -63,10 +56,10 @@ class ExpiryType(Enum):
     INTRADAY = "INTRADAY"
 
 class MarketRegime(Enum):
-    EXTREME_FEAR = "EXTREME_FEAR"        # IV Rank > 90
-    HIGH_VOL = "HIGH_VOL"                # IV Rank > 60
+    EXTREME_FEAR = "EXTREME_FEAR" # IV Rank > 90
+    HIGH_VOL = "HIGH_VOL"         # IV Rank > 60
     NORMAL_VOL = "NORMAL_VOL"
-    LOW_VOL = "LOW_VOL"                  # IV Rank < 20
+    LOW_VOL = "LOW_VOL"           # IV Rank < 20
     BINARY_EVENT = "BINARY_EVENT"
     BULL_TREND = "BULL_TREND"
     BEAR_TREND = "BEAR_TREND"
