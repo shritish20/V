@@ -1,7 +1,8 @@
 import aiohttp
 import asyncio
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+import time
+from typing import Dict, List, Optional, Tuple
 from core.config import settings, UPSTOX_API_ENDPOINTS
 from core.models import Order
 
@@ -9,6 +10,28 @@ logger = logging.getLogger("UpstoxAPI")
 
 class TokenExpiredError(Exception):
     pass
+
+class RateLimiter:
+    """Token Bucket Rate Limiter"""
+    def __init__(self, rate_limit_per_sec=10):
+        self.rate = rate_limit_per_sec
+        self.tokens = rate_limit_per_sec
+        self.last_update = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def wait(self):
+        async with self.lock:
+            now = time.monotonic()
+            elapsed = now - self.last_update
+            self.tokens = min(self.rate, self.tokens + elapsed * self.rate)
+            self.last_update = now
+            
+            if self.tokens < 1:
+                wait_time = (1 - self.tokens) / self.rate
+                await asyncio.sleep(wait_time)
+                self.tokens = 0
+            else:
+                self.tokens -= 1
 
 class EnhancedUpstoxAPI:
     def __init__(self, token: str):
@@ -22,6 +45,9 @@ class EnhancedUpstoxAPI:
         self.session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
         self.instrument_master = None
+        
+        # New Rate Limiter
+        self.limiter = RateLimiter(rate_limit_per_sec=9) # Safety margin below 10
 
     def set_instrument_master(self, master):
         self.instrument_master = master
@@ -49,14 +75,18 @@ class EnhancedUpstoxAPI:
             
         for i in range(3):
             try:
+                # WAIT FOR RATE LIMIT
+                await self.limiter.wait()
+                
                 session = await self._get_session()
                 async with session.request(method, url, **kwargs) as response:
                     if response.status == 200:
                         return await response.json()
                     if response.status == 401:
                         raise TokenExpiredError("Token Invalid")
-                    if response.status == 429:
-                        await asyncio.sleep(1)
+                    if response.status == 429: # Rate Limit Hit
+                        logger.warning("⚠️ Rate Limit Hit (429). Backing off...")
+                        await asyncio.sleep(2)
                         continue
                     
                     text = await response.text()
@@ -69,6 +99,9 @@ class EnhancedUpstoxAPI:
                 await asyncio.sleep(1)
         return {"status": "error"}
 
+    # ... [Keep your existing place_order, place_multi_order, get_history methods below] ...
+    # ... [Copy them from the previous correct version of api_client.py] ...
+    
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
             return True, f"SIM-{int(asyncio.get_event_loop().time())}"
@@ -92,7 +125,6 @@ class EnhancedUpstoxAPI:
         return False, None
 
     async def place_multi_order(self, orders_payload: List[Dict]) -> Dict:
-        """Atomic Batch Execution (Schema Compliant)"""
         if settings.SAFETY_MODE != "live":
             return {"status": "success", "data": [{"order_id": f"SIM-BATCH-{i}"} for i in range(len(orders_payload))]}
         return await self._request_with_retry("POST", "place_multi_order", json=orders_payload)
@@ -110,16 +142,11 @@ class EnhancedUpstoxAPI:
         return await self._request_with_retry("GET", "holidays")
 
     async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict:
-        url = f"{settings.API_BASE_URL}/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
-        return await self._request_with_retry("GET", "history", dynamic_url=url)
+        url = f"{settings.API_BASE_URL}/v3/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+        return await self._request_with_retry("GET", "history_v3", dynamic_url=url)
 
     async def get_market_quote_ohlc(self, instrument_key: str, interval: str) -> Dict:
-        """For Live Stitching: Gets current day's OHLC"""
-        return await self._request_with_retry(
-            "GET", 
-            "market_quote_ohlc", 
-            params={"instrument_key": instrument_key, "interval": interval}
-        )
+        return await self._request_with_retry("GET", "market_quote_ohlc", params={"instrument_key": instrument_key, "interval": interval})
 
     async def close(self):
         async with self._session_lock:
