@@ -30,6 +30,12 @@ from analytics.journal import JournalManager
 from utils.data_fetcher import DashboardDataFetcher
 from utils.logger import setup_logger
 
+# NEW IMPORTS
+from core.safety_layer import MasterSafetyLayer
+from trading.execution_hardening import HardenedExecutor
+from trading.position_lifecycle import PositionLifecycleManager
+from analytics.vrp_zscore import VRPZScoreAnalyzer
+
 logger = setup_logger("Engine")
 
 class VolGuard17Engine:
@@ -79,6 +85,18 @@ class VolGuard17Engine:
         )
         self.trade_mgr.feed = self.data_feed
 
+        # === NEW: HARDENING LAYER ===
+        self.vrp_zscore = VRPZScoreAnalyzer(self.data_fetcher)
+        self.lifecycle_mgr = PositionLifecycleManager(self.trade_mgr)
+        self.hardened_executor = HardenedExecutor(self.api, self.om)
+        
+        self.safety_layer = MasterSafetyLayer(
+            self.risk_mgr,
+            getattr(self.trade_mgr, 'margin_guard', None),
+            self.lifecycle_mgr,
+            self.vrp_zscore
+        )
+
         self.running = False
         self.trades: list[MultiLegTrade] = []
         self.error_count = 0
@@ -90,7 +108,7 @@ class VolGuard17Engine:
         self._greek_update_lock = asyncio.Lock()
 
     async def initialize(self):
-        logger.info("🚀 VolGuard 19.0 Booting...")
+        logger.info("🚀 VolGuard 19.0 Booting (Hardened Edition)...")
         
         try:
             holidays_res = await self.api.get_holidays()
@@ -123,7 +141,8 @@ class VolGuard17Engine:
 
         if settings.GREEK_VALIDATION:
             asyncio.create_task(self.greek_validator.start())
-
+            
+        logger.info("🛡️ Safety Layer Armed")
         logger.info("❤️ Engine Heartbeat Online.")
 
     async def run(self):
@@ -134,16 +153,26 @@ class VolGuard17Engine:
              while True: await asyncio.sleep(60)
 
         self.running = True
+        last_reset_date = None
+        
         while self.running:
             try:
                 current_time = time.time()
                 self.cycle_count += 1
+                
+                now = datetime.now(IST)
+                today = now.date()
+                
+                # === DAILY RESET (9:15 AM) ===
+                if now.time() >= settings.MARKET_OPEN_TIME and today != last_reset_date:
+                    self.safety_layer.reset_daily_counters()
+                    last_reset_date = today
 
                 if current_time - self.last_ai_check > 3600:
                     asyncio.create_task(self._run_ai_portfolio_check())
                     self.last_ai_check = current_time
                 
-                now_time = datetime.now(IST).time()
+                now_time = now.time()
                 is_market_live = settings.MARKET_OPEN_TIME <= now_time <= settings.MARKET_CLOSE_TIME
                 
                 if is_market_live:
@@ -153,6 +182,10 @@ class VolGuard17Engine:
                     spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
                     if spot > 0:
                         await self._update_greeks_and_risk(spot)
+                        
+                        # === LIFECYCLE MONITORING (Every cycle) ===
+                        await self.lifecycle_mgr.monitor_lifecycle(self.trades)
+                        
                         await self._consider_new_trade(spot)
                         await self.trade_mgr.monitor_active_trades(self.trades)
 
@@ -215,7 +248,6 @@ class VolGuard17Engine:
         if market_structure.get("confidence", 0.0) < 0.5: return
 
         cap_status = await self.capital_allocator.get_status()
-        
         ai_context = getattr(self.architect, 'last_trade_analysis', {})
         
         strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(
@@ -225,18 +257,10 @@ class VolGuard17Engine:
         if strat != "WAIT":
             trade_ctx = {"strategy": strat, "spot": spot, "vix": vix, "event": top_event, "regime": final_regime}
             asyncio.create_task(self._log_ai_trade_opinion(trade_ctx))
-            await self._execute_new_strategy(strat, legs, etype, bucket)
-
-    async def _log_ai_trade_opinion(self, trade_ctx):
-        try:
-            analysis = await self.architect.analyze_trade_setup(trade_ctx)
-            logger.info(f"🤖 AI OBSERVER: {trade_ctx['strategy']} | Risk: {analysis.get('risk_level', 'UNKNOWN')}")
-        except: pass
-
-    async def _execute_new_strategy(self, strat_name, legs_spec, exp_type, bucket):
-        real_legs = []
-        try:
-            for leg in legs_spec:
+            
+            # Construct the trade object first
+            real_legs = []
+            for leg in legs:
                 expiry_dt = datetime.strptime(leg["expiry"], "%Y-%m-%d").date()
                 token = self.instruments_master.get_option_token("NIFTY", leg["strike"], leg["type"], expiry_dt)
                 if not token: return
@@ -248,33 +272,62 @@ class VolGuard17Engine:
                     entry_price=0.0, entry_time=datetime.now(settings.IST),
                     current_price=0.0,
                     current_greeks=GreeksSnapshot(timestamp=datetime.now(settings.IST)),
-                    expiry_type=exp_type, capital_bucket=bucket
+                    expiry_type=etype, capital_bucket=bucket
                 ))
 
             new_trade = MultiLegTrade(
-                legs=real_legs, strategy_type=StrategyType(strat_name),
+                legs=real_legs, strategy_type=StrategyType(strat),
                 net_premium_per_share=0.0, entry_time=datetime.now(settings.IST),
-                expiry_date=legs_spec[0]["expiry"], expiry_type=exp_type,
+                expiry_date=legs[0]["expiry"], expiry_type=etype,
                 capital_bucket=bucket, status=TradeStatus.PENDING,
                 id=f"T-{int(time.time())}"
             )
 
-            if await self.trade_mgr.execute_strategy(new_trade):
+            # === NEW: SAFETY GATE ===
+            current_metrics_dict = {
+                "vix": vix,
+                "atm_iv": atm_iv_pct,
+                "greeks_cache": self.greeks_cache
+            }
+            
+            approved, reason = await self.safety_layer.pre_trade_gate(new_trade, current_metrics_dict)
+            if not approved:
+                logger.warning(f"🚫 TRADE BLOCKED: {reason}")
+                self.safety_layer.post_trade_update(False)
+                return
+
+            # Execute with Hardened Executor
+            success, msg = await self.hardened_executor.execute_with_hedge_priority(new_trade)
+            
+            if success:
+                # Post-processing: Capital Lock & Logging
+                val = sum(abs(l.entry_price * l.quantity) for l in new_trade.legs)
+                await self.capital_allocator.allocate_capital(bucket.value, val, new_trade.id)
+                
+                new_trade.status = TradeStatus.OPEN
                 self.trades.append(new_trade)
-                logger.info(f"✅ ORDER COMPLETED: {strat_name}")
+                self.safety_layer.post_trade_update(True)
+                
+                logger.info(f"✅ ORDER COMPLETED: {strat}")
                 
                 ai_analysis = getattr(self.architect, 'last_trade_analysis', {})
                 asyncio.create_task(
                     self.journal.log_entry(
                         trade_id=new_trade.id,
-                        strategy=strat_name,
+                        strategy=strat,
                         metrics=self.last_metrics.dict() if self.last_metrics else {},
                         ai_analysis=ai_analysis
                     )
                 )
+            else:
+                logger.error(f"❌ EXECUTION FAILED: {msg}")
+                self.safety_layer.post_trade_update(False)
 
-        except Exception as e:
-            logger.error(f"Execution Error: {e}")
+    async def _log_ai_trade_opinion(self, trade_ctx):
+        try:
+            analysis = await self.architect.analyze_trade_setup(trade_ctx)
+            logger.info(f"🤖 AI OBSERVER: {trade_ctx['strategy']} | Risk: {analysis.get('risk_level', 'UNKNOWN')}")
+        except: pass
 
     async def _run_ai_portfolio_check(self):
         try:
@@ -306,6 +359,7 @@ class VolGuard17Engine:
         logger.critical("☢️ CIRCUIT BREAKER TRIGGERED")
         tasks = [self.trade_mgr.close_trade(t, ExitReason.CIRCUIT_BREAKER) for t in self.trades if t.status == TradeStatus.OPEN]
         if tasks: await asyncio.gather(*tasks)
+        self.safety_layer.is_halted = True
 
     async def save_final_snapshot(self):
         try:
