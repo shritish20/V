@@ -1,226 +1,132 @@
 import logging
-import math
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
-from core.config import settings, IST
+from typing import Dict, List, Tuple, Optional
+from core.enums import StrategyType, CapitalBucket, ExpiryType
 from core.models import AdvancedMetrics
-from core.enums import StrategyType, ExpiryType, CapitalBucket
+from trading.instruments_master import InstrumentMaster
 
-logger = logging.getLogger("SmartStrategyEngine")
+logger = logging.getLogger("StrategyEngine")
 
 class IntelligentStrategyEngine:
+    """
+    VolGuard 19.0 'Prop Desk' Engine.
+    Implements 6-Regime Matrix + AI Veto.
+    """
     def __init__(self, vol_analytics, event_intel, capital_allocator, pricing_engine):
-        self.vol_analytics = vol_analytics
-        self.event_intel = event_intel
-        self.capital_allocator = capital_allocator
-        self.pricing = pricing_engine
-        self.instruments_master = None
-        self.last_trade_time = None
-        self.cooldown_seconds = 300  # 5 Minute mandatory cooldown to prevent machine-gun ordering
+        self.vol = vol_analytics
+        self.events = event_intel
+        self.capital = capital_allocator
+        self.master = None
 
-    def set_instruments_master(self, master):
-        self.instruments_master = master
+    def set_instruments_master(self, master: InstrumentMaster):
+        self.master = master
 
-    def select_strategy_with_capital(self, metrics: AdvancedMetrics, spot: float, 
-                                   capital_status: Dict) -> Tuple[str, List[Dict], ExpiryType, CapitalBucket]:
-        """
-        INSTITUTIONAL STRATEGY MATRIX v2.2 (Strict Time & Spam Gates)
-        """
-        now = datetime.now(IST)
-        bucket = CapitalBucket.WEEKLY
+    def select_strategy_with_capital(
+        self, 
+        metrics: AdvancedMetrics, 
+        spot: float, 
+        cap_status: Dict,
+        ai_context: Dict = None 
+    ) -> Tuple[str, List[Dict], ExpiryType, CapitalBucket]:
         
-        # ------------------------------------------------------------------
-        # 1. MARKET HOURS CHECK (The "Care" Factor)
-        # ------------------------------------------------------------------
-        # We strictly strictly enforce trading only between 09:15 and 15:15
-        # This prevents "Night Trading" or "Post-Close" ghost orders.
-        if not (settings.MARKET_OPEN_TIME <= now.time() <= settings.SAFE_TRADE_END):
-            # Only log occasionally to avoid cluttering logs
-            if now.second < 10 and now.minute % 5 == 0: 
-                logger.info(f"💤 Market Closed (Time: {now.strftime('%H:%M')}). Strategy Sleeping.")
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
+        # 1. EVENT GUARD
+        if metrics.regime == "BINARY_EVENT" or metrics.event_risk_score > 80:
+            logger.warning(f"⚠️ Binary Event ({metrics.top_event}). Position: FLAT.")
+            return "WAIT", [], ExpiryType.WEEKLY, CapitalBucket.INTRADAY
 
-        # ------------------------------------------------------------------
-        # 2. SPAM PROTECTION (Cooldown Timer)
-        # ------------------------------------------------------------------
-        if self.last_trade_time:
-            time_since_trade = (now - self.last_trade_time).total_seconds()
-            if time_since_trade < self.cooldown_seconds:
-                # Silently wait. Do not log "WAIT" to keep logs clean.
-                return "WAIT", [], ExpiryType.WEEKLY, bucket
+        # 2. AI VETO
+        ai_risk = ai_context.get("risk_level", "NEUTRAL") if ai_context else "NEUTRAL"
+        if ai_risk == "DANGER":
+            logger.warning("🧠 AI Veto: DANGER Risk Level. Halting.")
+            return "WAIT", [], ExpiryType.WEEKLY, CapitalBucket.INTRADAY
 
-        # ------------------------------------------------------------------
-        # 3. CAPITAL & DATA INTEGRITY
-        # ------------------------------------------------------------------
-        available = capital_status.get("available", {}).get(bucket.value, 0)
-        # Minimum capital buffer (2 Lakhs) - Hard Stop
-        if available < 200000:
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
-            
-        if metrics.structure_confidence < 0.5:
-            # Only warn if we haven't warned recently
-            if not self.last_trade_time or (now - self.last_trade_time).total_seconds() > 600:
-                logger.warning(f"⛔ WAIT: Low Data Confidence ({metrics.structure_confidence:.2f})")
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
+        ai_sentiment = ai_context.get("market_sentiment", "NEUTRAL") if ai_context else "NEUTRAL"
 
-        if not metrics.expiry_date or metrics.expiry_date == "N/A":
-            return "WAIT", [], ExpiryType.WEEKLY, bucket
-
-        # ------------------------------------------------------------------
-        # 4. MARKET REGIME DIAGNOSIS
-        # ------------------------------------------------------------------
-        dte = metrics.days_to_expiry
-        iv_rank = metrics.ivp
-        is_event = metrics.regime == "BINARY_EVENT"
+        # 3. MATRIX SELECTION
+        strat_name, bucket = self._determine_matrix_strategy(metrics, ai_sentiment)
         
-        if metrics.vix > 30 or iv_rank > 90:
-            regime = "EXTREME_FEAR"
-        elif metrics.vix > 18 or iv_rank > 60:
-            regime = "HIGH_VOL"
-        elif metrics.vix < 12 or iv_rank < 20:
-            regime = "LOW_VOL"
-        else:
-            regime = "NORMAL"
+        if strat_name == "WAIT":
+            return "WAIT", [], ExpiryType.WEEKLY, CapitalBucket.INTRADAY
 
-        strategy = "WAIT"
+        # 4. CONSTRUCT LEGS
+        legs, expiry_type = self._construct_legs(strat_name, metrics, spot)
         
-        # ------------------------------------------------------------------
-        # 5. STRATEGY SELECTION
-        # ------------------------------------------------------------------
-        if is_event:
-            logger.info(f"⚡ EVENT MODE: {metrics.top_event}. Selling Iron Fly.")
-            strategy = "IRON_FLY"
-            
-        elif regime == "EXTREME_FEAR":
-            # Crash Defense: 1x2 Ratio Spread to finance protection
-            logger.info("☢️ EXTREME FEAR: Put Ratio Spread (1x2).")
-            strategy = "RATIO_SPREAD_PUT"
-            
-        elif regime == "HIGH_VOL":
-            if dte <= 2:
-                strategy = "SHORT_STRADDLE"
+        return strat_name, legs, expiry_type, bucket
+
+    def _determine_matrix_strategy(self, m: AdvancedMetrics, ai_sentiment: str) -> Tuple[str, CapitalBucket]:
+        
+        # REGIME 4: THE CRASH (Backwardation)
+        if m.term_structure_slope > 1.05:
+            if ai_sentiment == "BULLISH": return "WAIT", CapitalBucket.INTRADAY
+            return "BEAR_CALL_SPREAD", CapitalBucket.WEEKLY
+
+        # REGIME 5: THE RALLY (Bull Trend)
+        if m.trend_status == "BULL_TREND" and m.ivp < 60:
+            if ai_sentiment == "BEARISH": return "WAIT", CapitalBucket.INTRADAY
+            return "BULL_PUT_SPREAD", CapitalBucket.WEEKLY
+
+        # REGIME 1: THE GRIND (Low Vol + Skew)
+        if m.ivp < 35:
+            if m.ivp < 20 and m.vrp_score < 0: return "WAIT", CapitalBucket.INTRADAY
+            if ai_sentiment == "BEARISH": return "WAIT", CapitalBucket.INTRADAY
+            return "JADE_LIZARD", CapitalBucket.WEEKLY
+
+        # REGIME 3: THE HARVEST (High Vol)
+        if m.ivp > 50:
+            if m.structure_confidence > 0.8 and ai_sentiment == "NEUTRAL":
+                return "SHORT_STRANGLE", CapitalBucket.WEEKLY
             else:
-                strategy = "SHORT_STRANGLE"
+                return "IRON_CONDOR", CapitalBucket.WEEKLY
 
-        elif regime == "LOW_VOL":
-            # Smart Skew: Jade Lizard (Zero Upside Risk)
-            # This is better than Iron Condor in low vol because call premiums are trash
-            if metrics.trend_status == "BEAR_TREND":
-                strategy = "REVERSE_JADE_LIZARD"
-            else:
-                strategy = "JADE_LIZARD"
+        # REGIME 6: THE SQUEEZE (Call Skew)
+        if m.volatility_skew > 5.0:
+             return "CALL_RATIO_SPREAD", CapitalBucket.WEEKLY
 
-        else: # NORMAL
-            if metrics.trend_status == "BULL_TREND":
-                strategy = "BULL_PUT_SPREAD"
-            elif metrics.trend_status == "BEAR_TREND":
-                strategy = "BEAR_CALL_SPREAD"
-            else:
-                strategy = "IRON_CONDOR"
+        return "IRON_CONDOR", CapitalBucket.WEEKLY
 
-        # ------------------------------------------------------------------
-        # 6. LEG GENERATION
-        # ------------------------------------------------------------------
-        if strategy != "WAIT":
-            legs = self._generate_pro_legs(strategy, spot, metrics.expiry_date, metrics)
-            if legs:
-                # Update last trade time ONLY if we successfully generate a trade
-                self.last_trade_time = now
-                logger.info(f"✨ Signal Generated: {strategy} (Regime: {regime}, VIX: {metrics.vix:.1f})")
-                return strategy, legs, ExpiryType.WEEKLY, bucket
-
-        return "WAIT", [], ExpiryType.WEEKLY, bucket
-
-    def _generate_pro_legs(self, strategy: str, spot: float, expiry: str, metrics: AdvancedMetrics) -> List[Dict]:
+    def _construct_legs(self, strat: str, m: AdvancedMetrics, spot: float) -> Tuple[List[Dict], ExpiryType]:
+        expiries = self.master.get_all_expiries("NIFTY")
+        if not expiries: return [], ExpiryType.WEEKLY
+        near_exp = expiries[0].strftime("%Y-%m-%d")
+        
+        atm = round(spot / 50) * 50
+        wing_width = 100 if m.vix < 15 else 200
+        short_dist = 200 if m.vix < 15 else 400
+        
         legs = []
-        try:
-            dte = max(1.0, metrics.days_to_expiry)
-            iv = metrics.atm_iv if metrics.atm_iv > 0 else 15.0
-            # Expected Move (1 Standard Deviation)
-            implied_move = spot * (iv / 100.0) * math.sqrt(dte / 365.0)
+
+        if strat == "JADE_LIZARD":
+            legs = [
+                {"type": "PE", "strike": atm - short_dist, "side": "SELL", "expiry": near_exp},
+                {"type": "CE", "strike": atm + short_dist, "side": "SELL", "expiry": near_exp},
+                {"type": "CE", "strike": atm + short_dist + 100, "side": "BUY", "expiry": near_exp}
+            ]
+        elif strat == "SHORT_STRANGLE":
+            legs = [
+                {"type": "PE", "strike": atm - short_dist, "side": "SELL", "expiry": near_exp},
+                {"type": "CE", "strike": atm + short_dist, "side": "SELL", "expiry": near_exp}
+            ]
+        elif strat == "IRON_CONDOR":
+            legs = [
+                {"type": "CE", "strike": atm + short_dist, "side": "SELL", "expiry": near_exp},
+                {"type": "PE", "strike": atm - short_dist, "side": "SELL", "expiry": near_exp},
+                {"type": "CE", "strike": atm + short_dist + wing_width, "side": "BUY", "expiry": near_exp},
+                {"type": "PE", "strike": atm - short_dist - wing_width, "side": "BUY", "expiry": near_exp}
+            ]
+        elif strat == "BEAR_CALL_SPREAD":
+             legs = [
+                {"type": "CE", "strike": atm, "side": "SELL", "expiry": near_exp},
+                {"type": "CE", "strike": atm + 200, "side": "BUY", "expiry": near_exp}
+            ]
+        elif strat == "BULL_PUT_SPREAD":
+             legs = [
+                {"type": "PE", "strike": atm - short_dist, "side": "SELL", "expiry": near_exp},
+                {"type": "PE", "strike": atm - short_dist - 100, "side": "BUY", "expiry": near_exp}
+            ]
+        elif strat == "CALL_RATIO_SPREAD":
+             legs = [
+                {"type": "CE", "strike": atm, "side": "BUY", "expiry": near_exp},
+                {"type": "CE", "strike": atm + 200, "side": "SELL", "expiry": near_exp},
+                {"type": "CE", "strike": atm + 200, "side": "SELL", "expiry": near_exp}
+            ]
             
-            # Round to nearest 50 for NIFTY
-            def r50(price): return round(price / 50) * 50
-            
-            width = max(50, r50(implied_move))
-            
-            # --- STRATEGY BUILDER ---
-
-            if strategy == "RATIO_SPREAD_PUT":
-                # Buy 1 ATM Put, Sell 2 OTM Puts
-                strike_long = r50(spot - (implied_move * 0.5))
-                strike_short = r50(spot - (implied_move * 1.5))
-                legs = [
-                    {"strike": strike_long, "type": "PE", "side": "BUY", "expiry": expiry, "qty_mult": 1},
-                    {"strike": strike_short, "type": "PE", "side": "SELL", "expiry": expiry, "qty_mult": 2}
-                ]
-            
-            elif strategy == "JADE_LIZARD":
-                # Sell OTM Put, Sell OTM Call Spread
-                # Goal: Net Credit > Call Spread Width (Zero Risk Upside)
-                put_strike = r50(spot - implied_move)
-                call_short = r50(spot + implied_move)
-                call_long = call_short + 100 # Wider wing to ensure credit covers width
-                
-                legs = [
-                    {"strike": put_strike, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": call_short, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": call_long, "type": "CE", "side": "BUY", "expiry": expiry}
-                ]
-
-            elif strategy == "REVERSE_JADE_LIZARD":
-                call_strike = r50(spot + implied_move)
-                put_short = r50(spot - implied_move)
-                put_long = put_short - 100
-                legs = [
-                    {"strike": call_strike, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": put_short, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": put_long, "type": "PE", "side": "BUY", "expiry": expiry}
-                ]
-
-            elif strategy == "IRON_FLY":
-                atm = r50(spot)
-                legs = [
-                    {"strike": atm, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": atm + width, "type": "CE", "side": "BUY", "expiry": expiry},
-                    {"strike": atm - width, "type": "PE", "side": "BUY", "expiry": expiry}
-                ]
-
-            elif strategy == "SHORT_STRANGLE":
-                call_strike = r50(spot + implied_move)
-                put_strike = r50(spot - implied_move)
-                legs = [
-                    {"strike": call_strike, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": put_strike, "type": "PE", "side": "SELL", "expiry": expiry}
-                ]
-
-            elif strategy == "IRON_CONDOR":
-                call_short = r50(spot + implied_move)
-                put_short = r50(spot - implied_move)
-                legs = [
-                    {"strike": call_short, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": call_short + width, "type": "CE", "side": "BUY", "expiry": expiry},
-                    {"strike": put_short, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": put_short - width, "type": "PE", "side": "BUY", "expiry": expiry}
-                ]
-            
-            elif strategy == "BULL_PUT_SPREAD":
-                sell_strike = r50(spot - (implied_move * 0.5))
-                legs = [
-                    {"strike": sell_strike, "type": "PE", "side": "SELL", "expiry": expiry},
-                    {"strike": sell_strike - width, "type": "PE", "side": "BUY", "expiry": expiry}
-                ]
-                
-            elif strategy == "BEAR_CALL_SPREAD":
-                sell_strike = r50(spot + (implied_move * 0.5))
-                legs = [
-                    {"strike": sell_strike, "type": "CE", "side": "SELL", "expiry": expiry},
-                    {"strike": sell_strike + width, "type": "CE", "side": "BUY", "expiry": expiry}
-                ]
-
-        except Exception as e:
-            logger.error(f"Leg Generation Failed: {e}")
-            return []
-
-        return legs
+        return legs, ExpiryType.WEEKLY
