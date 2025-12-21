@@ -2,12 +2,17 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from capital.allocator import SmartCapitalAllocator
 from database.models import DbCapitalLedger
-from sqlalchemy import select
 
 @pytest.fixture
 def mock_db():
     db = MagicMock()
     session = AsyncMock()
+    # Ensure session.execute returns a mock that can be awaited
+    mock_result = MagicMock()
+    mock_result.scalars.return_value = []
+    session.execute = AsyncMock(return_value=mock_result)
+    session.scalar = AsyncMock(return_value=None)
+    
     db.get_session.return_value.__aenter__.return_value = session
     db.safe_commit = AsyncMock()
     return db
@@ -23,19 +28,18 @@ def allocator(mock_db):
 @pytest.mark.asyncio
 async def test_idempotent_allocate(allocator, mock_db):
     session = mock_db.get_session.return_value.__aenter__.return_value
-    session.scalar.side_effect = [None, None] 
-    
     with patch.object(allocator, "_get_real_margin", return_value=100000.0):
+        # Should execute without error
         await allocator.allocate_capital("intraday", 5000, "T-123")
-        assert session.add.called 
+        assert session.add.called
 
 @pytest.mark.asyncio
 async def test_draw_down_brake(allocator, mock_db):
     session = mock_db.get_session.return_value.__aenter__.return_value
-    # SOD entry showing 10L
+    # Mock Start of Day Balance as 1,000,000
     session.scalar.return_value = DbCapitalLedger(amount=1000000.0, trade_id="SOD")
     
-    # Current margin 9.5L (5% drop)
-    with patch.object(allocator, "_get_real_margin", return_value=950000.0):
+    # Current margin 900,000 (10% drop - exceeds 3% limit)
+    with patch.object(allocator, "_get_real_margin", return_value=900000.0):
         result = await allocator.allocate_capital("intraday", 5000, "T-NEW")
-        assert result is False 
+        assert result is False
