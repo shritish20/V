@@ -1,22 +1,25 @@
 import numpy as np
+import pandas as pd
 import logging
 from datetime import datetime
 from typing import Tuple, Dict
 from arch import arch_model
 from scipy.stats import percentileofscore
 from core.config import settings, IST
-from utils.data_fetcher import DashboardDataFetcher # Existing dependency
 
 logger = logging.getLogger("VolAnalytics")
 
 class HybridVolatilityAnalytics:
-    def __init__(self):
-        self.data_fetcher = DashboardDataFetcher()
+    def __init__(self, data_fetcher):
+        self.data_fetcher = data_fetcher
         self.vol_cache: Dict[str, Tuple[float, datetime]] = {}
 
     def get_volatility_metrics(self, current_vix: float) -> Tuple[float, float, float]:
-        """Returns: RealizedVol, GarchForecast, IVRank"""
+        """
+        Returns: RealizedVol (Stitched), GarchForecast (Stitched), IVRank
+        """
         try:
+            # Data Fetcher now has live data stitched in self.nifty_data
             realized_vol = self._calculate_realized_volatility()
             garch_vol = self._calculate_garch_forecast()
             iv_rank = self._calculate_iv_rank(current_vix)
@@ -37,9 +40,10 @@ class HybridVolatilityAnalytics:
     def get_trend_status(self, spot: float) -> str:
         try:
             df = self.data_fetcher.nifty_data
-            if df.empty or 'Close' not in df.columns: return "NEUTRAL"
+            if df.empty or 'close' not in df.columns: return "NEUTRAL"
             
-            ma20 = df['Close'].tail(20).mean()
+            ma20 = df['close'].tail(20).mean()
+            
             if spot > ma20 * 1.01: return "BULL_TREND"
             if spot < ma20 * 0.99: return "BEAR_TREND"
             return "NEUTRAL"
@@ -48,9 +52,8 @@ class HybridVolatilityAnalytics:
     def _calculate_iv_rank(self, current_vix: float) -> float:
         try:
             if self.data_fetcher.vix_data.empty: return 50.0
-            history = self.data_fetcher.vix_data['Close'].tail(252).values
+            history = self.data_fetcher.vix_data['close'].tail(252).values
             if len(history) < 10: return 50.0
-            
             return float(percentileofscore(history, current_vix, kind='weak'))
         except: return 50.0
 
@@ -70,11 +73,13 @@ class HybridVolatilityAnalytics:
 
             returns = self.data_fetcher.nifty_data['Log_Returns'].dropna() * 100
             if len(returns) < 126: return 15.0
-            
+
+            # GARCH(1,1)
             model = arch_model(returns, vol='Garch', p=1, q=1)
             res = model.fit(disp='off')
-            fc = np.sqrt(res.forecast(horizon=1).variance.values[-1, -1]) * np.sqrt(252)
             
+            fc = np.sqrt(res.forecast(horizon=1).variance.values[-1, -1]) * np.sqrt(252)
+
             self.vol_cache[cache_key] = (fc, datetime.now(IST))
             return fc
         except: return 15.0
