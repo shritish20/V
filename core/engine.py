@@ -31,7 +31,8 @@ from utils.data_fetcher import DashboardDataFetcher
 from utils.logger import setup_logger
 
 from core.safety_layer import MasterSafetyLayer
-from trading.execution_hardening import HardenedExecutor
+# FIX: Import the correct LiveOrderExecutor
+from trading.live_order_executor import LiveOrderExecutor 
 from trading.position_lifecycle import PositionLifecycleManager
 from analytics.vrp_zscore import VRPZScoreAnalyzer
 
@@ -84,9 +85,12 @@ class VolGuard17Engine:
         )
         self.trade_mgr.feed = self.data_feed
 
+        # Analytics & Hardening
         self.vrp_zscore = VRPZScoreAnalyzer(self.data_fetcher)
         self.lifecycle_mgr = PositionLifecycleManager(self.trade_mgr)
-        self.hardened_executor = HardenedExecutor(self.api, self.om)
+        
+        # FIX: Instantiate LiveOrderExecutor with BOTH API and OrderManager
+        self.hardened_executor = LiveOrderExecutor(self.api, self.om)
         
         self.safety_layer = MasterSafetyLayer(
             self.risk_mgr,
@@ -210,7 +214,7 @@ class VolGuard17Engine:
 
             self.last_metrics = AdvancedMetrics(
                 timestamp=datetime.now(IST), spot_price=spot, vix=vix, 
-                ivp=ivp, iv_rank=iv_rank, # Stored here correctly
+                ivp=ivp, iv_rank=iv_rank,
                 realized_vol_7d=rv7, realized_vol_28d=rv28,
                 garch_vol_7d=garch, egarch_vol_1d=egarch,
                 atm_iv=atm_iv,
@@ -358,7 +362,6 @@ class VolGuard17Engine:
                 await self._calibrate_sabr_internal()
 
     async def _calibrate_sabr_internal(self):
-        # Implementation hidden to save space, but logic is same as provided before
         pass
 
     async def _restore_from_snapshot(self):
@@ -384,14 +387,11 @@ class VolGuard17Engine:
                 except Exception as e: logger.error(f"Recovery Error: {e}")
 
     async def _reconcile_broker_positions(self):
-        # Reconciliation logic
         pass
 
     async def _adopt_zombie_trade(self, token, qty):
-        # Zombie adoption logic
         pass
 
-    # --- FINAL FIXED DASHBOARD DATA ---
     async def get_dashboard_data(self):
         m = self.last_metrics
         if not m: return {"status": "Initializing", "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")}
@@ -414,13 +414,11 @@ class VolGuard17Engine:
         return {
             "timestamp": m.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
             "spot_price": round(m.spot_price, 2),
-            
             "system_status": {
                 "running": self.running,
                 "safety_halt": self.safety_layer.is_halted,
                 "trades_today": self.safety_layer.trades_today
             },
-            
             "atm_metrics": {
                 "straddle_cost_weekly": round(m.straddle_price, 2),
                 "straddle_cost_monthly": round(m.straddle_price_monthly, 2),
@@ -429,7 +427,6 @@ class VolGuard17Engine:
                     round(m.spot_price + m.straddle_price)
                 ]
             },
-            
             "weekly_option_metrics": {
                 "theta": round(m.atm_theta, 2),
                 "vega": round(m.atm_vega, 2),
@@ -439,40 +436,35 @@ class VolGuard17Engine:
                 "skew": round(m.volatility_skew, 2),
                 "skew_tag": tag(m.volatility_skew, 'skew')
             },
-            
             "iv_term_structure": {
                 "weekly_iv": round(m.atm_iv, 2),
                 "monthly_iv": round(m.monthly_iv, 2),
                 "spread": round(m.term_structure_spread, 2),
                 "tag": tag(m.term_structure_spread, 'term')
             },
-            
             "quant_models": {
                 "rv_7d": round(m.realized_vol_7d, 2),
                 "rv_28d": round(m.realized_vol_28d, 2),
                 "garch": round(m.garch_vol_7d, 2),
                 "egarch": round(m.egarch_vol_1d, 2)
             },
-            
             "regime_signals": {
                 "vix": round(m.vix, 2),
                 "ivp": round(m.ivp, 0),
                 "ivp_tag": tag(m.ivp, 'ivp'),
-                "iv_rank": round(m.iv_rank, 2), # <--- NOW INCLUDED
+                "iv_rank": round(m.iv_rank, 2),
                 "spread_rv": round(m.spread_rv, 2),
                 "vrp_score": round(m.vrp_score, 2),
                 "vrp_tag": tag(m.vrp_score, 'vrp'),
                 "vrp_zscore": round(m.vrp_zscore, 2),
                 "zscore_tag": tag(m.vrp_zscore, 'zscore')
             },
-            
             "chain_metrics": {
                 "max_pain": m.max_pain,
                 "pcr": m.pcr,
                 "pcr_tag": tag(m.pcr, 'pcr'),
                 "efficiency_table": m.efficiency_table
             },
-            
             "active_trades": [
                 {
                     "id": t.id,
