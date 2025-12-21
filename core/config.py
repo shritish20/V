@@ -122,6 +122,10 @@ class Settings(BaseSettings):
     GREEK_REFRESH_SEC: int = 15
     GREEK_TOLERANCE_PCT: float = 15.0
 
+    # Market Keys & Symbols
+    # NEW: Added for Kimi's Hardened Engine Compatibility
+    UNDERLYING_SYMBOL: str = Field(default="NIFTY", env="UNDERLYING_SYMBOL")
+    
     MARKET_KEY_INDEX: str = "NSE_INDEX|Nifty 50"
     MARKET_KEY_VIX: str = "NSE_INDEX|India VIX"
     MARKET_OPEN_TIME: dtime = dtime(9, 15)
