@@ -59,9 +59,11 @@ class AdvancedMetrics(BaseModel):
     timestamp: datetime
     spot_price: float
     vix: float
-    ivp: float
     
-    # Volatility Models
+    # Volatility Metrics
+    ivp: float       # Frequency (Percentile)
+    iv_rank: float   # Relative Range (Rank)
+    
     realized_vol_7d: float
     realized_vol_28d: float = 0.0
     garch_vol_7d: float
@@ -113,13 +115,13 @@ class Order(BaseModel):
     validity: str
     is_amo: bool = False
 
-# --- NEW: Manual Trade Models ---
+# --- Manual Trade Models ---
 class ManualLegRequest(BaseModel):
     symbol: str = "NIFTY"
     strike: float
-    option_type: str  # CE or PE
-    expiry_date: str  # YYYY-MM-DD
-    side: str         # BUY or SELL
+    option_type: str
+    expiry_date: str
+    side: str
     quantity: int
 
 class ManualTradeRequest(BaseModel):
