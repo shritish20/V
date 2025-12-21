@@ -1,4 +1,4 @@
-from datetime import datetime, date
+from datetime import datetime
 from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
 from core.enums import StrategyType, TradeStatus, CapitalBucket, ExpiryType, ExitReason
@@ -40,18 +40,6 @@ class MultiLegTrade(BaseModel):
     basket_order_id: Optional[str] = None
     exit_reason: Optional[ExitReason] = None
 
-    @property
-    def trade_vega(self) -> float:
-        return sum(l.current_greeks.vega * l.quantity for l in self.legs)
-
-    @property
-    def trade_delta(self) -> float:
-        return sum(l.current_greeks.delta * l.quantity for l in self.legs)
-    
-    @property
-    def trade_gamma(self) -> float:
-        return sum(l.current_greeks.gamma * l.quantity for l in self.legs)
-
     def total_unrealized_pnl(self) -> float:
         return sum((l.current_price - l.entry_price) * l.quantity for l in self.legs)
 
@@ -61,29 +49,33 @@ class AdvancedMetrics(BaseModel):
     vix: float
     
     # Volatility Metrics
-    ivp: float       # Frequency (Percentile)
-    iv_rank: float   # Relative Range (Rank)
-    
+    ivp: float
+    iv_rank: float
     realized_vol_7d: float
-    realized_vol_28d: float = 0.0
+    realized_vol_28d: float
     garch_vol_7d: float
-    egarch_vol_1d: float = 0.0
+    egarch_vol_1d: float
     
     # Term Structure & Skew
     atm_iv: float
-    monthly_iv: float = 0.0
-    vrp_score: float
-    vrp_zscore: float = 0.0
-    iv_rv_spread: float
-    term_structure_slope: float
+    monthly_iv: float
+    vrp_score: float      # Uses Lite Formula: IV - RV - GARCH
+    spread_rv: float      # Uses Lite Formula: IV - RV
+    vrp_zscore: float
+    term_structure_spread: float # Weekly - Monthly
     volatility_skew: float
     
-    # Execution Context
+    # Execution Context (ATM Straddle)
     straddle_price: float
-    straddle_price_monthly: float = 0.0
-    structure_confidence: float
+    straddle_price_monthly: float
+    atm_theta: float = 0.0  # NEW
+    atm_vega: float = 0.0   # NEW
+    atm_delta: float = 0.0  # NEW
+    atm_gamma: float = 0.0  # NEW
+    atm_pop: float = 0.0    # NEW
     
     # Regime
+    structure_confidence: float
     regime: str
     event_risk_score: float
     top_event: str
