@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Date
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Date, Boolean
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from database.manager import Base
@@ -13,15 +13,11 @@ class DbStrategy(Base):
     exit_time = Column(DateTime, nullable=True)
     capital_bucket = Column(String)
     pnl = Column(Float, default=0.0)
-
-    # Hydration-critical fields
     expiry_date = Column(Date, nullable=True)
     broker_ref_id = Column(String, nullable=True)
     metadata_json = Column(JSON)
 
-    orders = relationship(
-        "DbOrder", back_populates="strategy", cascade="all, delete-orphan"
-    )
+    orders = relationship("DbOrder", back_populates="strategy", cascade="all, delete-orphan")
 
 class DbOrder(Base):
     __tablename__ = "orders"
@@ -40,10 +36,34 @@ class DbOrder(Base):
 
     strategy = relationship("DbStrategy", back_populates="orders")
 
-# --- NEW: Institutional Capital Tracking Table ---
 class DbCapitalUsage(Base):
     __tablename__ = "capital_usage"
-
+    
     bucket = Column(String, primary_key=True)
     used_amount = Column(Float, default=0.0)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class DbTradeJournal(Base):
+    __tablename__ = "trade_journal"
+
+    id = Column(String, primary_key=True)
+    date = Column(DateTime, default=datetime.utcnow)
+    
+    # Context
+    strategy_name = Column(String)
+    regime_at_entry = Column(String)
+    vix_at_entry = Column(Float)
+    spot_at_entry = Column(Float)
+    
+    # Intelligence
+    ai_analysis_json = Column(JSON)
+    entry_rationale = Column(String)
+    
+    # Financials
+    gross_pnl = Column(Float, default=0.0)
+    total_charges = Column(Float, default=0.0)
+    net_pnl = Column(Float, default=0.0)
+    
+    # Status
+    is_reconciled = Column(Boolean, default=False)
+    slippage = Column(Float, default=0.0)
