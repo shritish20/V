@@ -20,8 +20,7 @@ class HybridPricingEngine:
 
     async def get_market_structure(self, spot: float) -> Dict:
         """
-        Determines Term Structure (Backwardation/Contango) and Skew.
-        Handles Expiry Day Rollover.
+        Sensory Cortex: Determines Term Structure and Skew.
         """
         if not self.api or not self.instrument_master:
             return {"confidence": 0.0}
@@ -33,6 +32,7 @@ class HybridPricingEngine:
             now = datetime.now(IST)
             today_date = now.date()
             
+            # Auto-Roll Logic: If today is expiry and past 3:15 PM, look at next week
             near_expiry = expiries[0]
             if near_expiry == today_date and now.time() > time(15, 15):
                 near_expiry = expiries[1]
@@ -45,6 +45,7 @@ class HybridPricingEngine:
             
             dte = max(0.01, (near_expiry - today_date).days)
 
+            # Parallel Data Fetch
             task_w = self.api.get_option_chain(settings.MARKET_KEY_INDEX, near_expiry.strftime("%Y-%m-%d"))
             task_m = self.api.get_option_chain(settings.MARKET_KEY_INDEX, far_expiry.strftime("%Y-%m-%d"))
             res_w, res_m = await asyncio.gather(task_w, task_m)
@@ -61,17 +62,29 @@ class HybridPricingEngine:
                 opt = row['call_options'] if type_ == 'CE' else row['put_options']
                 return opt.get('option_greeks', {}).get('iv', 0.0)
 
+            # 1. ATM Volatility
             w_atm_iv = (get_iv(chain_w, atm_strike, 'CE') + get_iv(chain_w, atm_strike, 'PE')) / 2
             m_atm_iv = (get_iv(chain_m, atm_strike, 'CE') + get_iv(chain_m, atm_strike, 'PE')) / 2 if chain_m else w_atm_iv
             
+            # 2. Skew Calculation (Fear Index)
+            # Compare OTM Puts (Downside) vs OTM Calls (Upside)
+            # Positive Skew = Puts are expensive = Bearish Fear
             otm_put_iv = get_iv(chain_w, atm_strike - 200, 'PE')
             otm_call_iv = get_iv(chain_w, atm_strike + 200, 'CE')
             skew = otm_put_iv - otm_call_iv if (otm_put_iv and otm_call_iv) else 0.0
 
+            # 3. Term Structure (Crisis Index)
+            # Ratio of Weekly IV to Monthly IV. 
+            # > 1.0 (Backwardation) = Near term panic.
+            # < 1.0 (Contango) = Normal.
+            term_structure = (w_atm_iv / m_atm_iv) if m_atm_iv > 0 else 1.0
+
+            # Sanitize Data (Handle API anomalies like 15.0 vs 0.15)
             if w_atm_iv > 2.0: w_atm_iv /= 100.0
             if m_atm_iv > 2.0: m_atm_iv /= 100.0
             if skew > 2.0: skew /= 100.0
 
+            # Get Straddle Price (Execution context)
             row_atm = next((x for x in chain_w if x['strike_price'] == atm_strike), None)
             straddle = 0.0
             if row_atm:
@@ -80,12 +93,12 @@ class HybridPricingEngine:
             return {
                 "atm_iv": w_atm_iv,
                 "monthly_iv": m_atm_iv,
-                "term_structure": (w_atm_iv / m_atm_iv) if m_atm_iv > 0 else 1.0, 
-                "skew_index": skew * 100,
+                "term_structure": term_structure, 
+                "skew_index": skew * 100, # Convert to percentage points
                 "straddle_price": straddle,
                 "days_to_expiry": float(dte),
                 "near_expiry": near_expiry.strftime("%Y-%m-%d"),
-                "confidence": 1.0,
+                "confidence": 1.0 if w_atm_iv > 0 else 0.0,
                 "pcr": 1.0,
                 "max_pain": spot
             }
