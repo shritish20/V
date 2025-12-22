@@ -9,20 +9,29 @@ async def test_atomic_allocation(mock_db):
     config = {"WEEKLY": 0.5}
     allocator = SmartCapitalAllocator(100000.0, config, mock_db)
     
-    # --- CRITICAL FIX: Bypass internal DB helpers ---
-    # We mock these to return safe floats/bools so the code reaches the INSERT statement
-    allocator._get_real_margin = AsyncMock(return_value=100000.0)
-    allocator._current_draw_down_pct = AsyncMock(return_value=0.0) # 0% Drawdown
-    allocator._check_limit = AsyncMock(return_value=True)          # Limit Check Passes
+    # --- MOCKING THE INTERNAL HELPERS ---
+    # We mock these to return safe values so the code reaches the INSERT statement.
+    # If we don't mock these, they return MagicMocks which crash math comparisons.
     
-    # Mock the DB session for the INSERT command
+    # 1. Margin is 100k
+    allocator._get_real_margin = AsyncMock(return_value=100000.0)
+    
+    # 2. Drawdown is 0% (Safe) - THIS WAS MISSING BEFORE
+    allocator._current_draw_down_pct = AsyncMock(return_value=0.0)
+    
+    # 3. Bucket Limit Check Passes
+    allocator._check_limit = AsyncMock(return_value=True)
+    
+    # --- MOCKING THE DB SESSION ---
+    # We need a mock session to capture the final INSERT command
     mock_session = AsyncMock()
     mock_db.get_session.return_value.__aenter__.return_value = mock_session
     
-    # Call Allocate
+    # --- ACTION ---
+    # We allocate 10k. 
     result = await allocator.allocate_capital("WEEKLY", 10000.0, "TRADE-123")
     
-    # Assertions
+    # --- ASSERTIONS ---
     assert result is True
-    # Verify that an INSERT command was actually sent to the DB
+    # Verify that the session executed the INSERT command
     assert mock_session.execute.called
