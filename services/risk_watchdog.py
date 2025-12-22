@@ -5,6 +5,7 @@ VolGuard 20.0 – The Sheriff (Risk Watchdog)
 - Monitors Realized + Unrealized PnL via Broker API
 - Listens for "PANIC" signal from Frontend/DB
 - Auto-Flattens if Limits Breached
+- Fixed: Auto-creates log directory to prevent crashes
 """
 import asyncio
 import logging
@@ -20,6 +21,9 @@ from trading.api_client import EnhancedUpstoxAPI
 from database.manager import HybridDatabaseManager
 from database.models import DbRiskState
 from sqlalchemy import select
+
+# --- FIX: Create logs directory before configuring logger ---
+os.makedirs("logs", exist_ok=True)
 
 # Structured Logging
 logging.basicConfig(
