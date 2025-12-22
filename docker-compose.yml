@@ -1,37 +1,40 @@
 version: '3.8'
 
 services:
-  # 1. The Database (PostgreSQL)
   db:
     image: postgres:15-alpine
+    container_name: vg_postgres
     restart: always
     environment:
-      POSTGRES_USER: volguard_user
-      POSTGRES_PASSWORD: secure_password_123
-      POSTGRES_DB: volguard_db
+      POSTGRES_USER: ${POSTGRES_USER:-volguard_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
+      POSTGRES_DB: ${POSTGRES_DB:-volguard_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    networks:
+      - vg_net
 
-  # 2. The VolGuard Engine
   app:
     build: .
+    container_name: volguard_engine
     restart: always
     depends_on:
       - db
-    # Pass environment variables to the container
+    env_file:
+      - .env
     environment:
-      POSTGRES_SERVER: db
-      POSTGRES_USER: volguard_user
-      POSTGRES_PASSWORD: secure_password_123
-      POSTGRES_DB: volguard_db
-      UPSTOX_ACCESS_TOKEN: ${UPSTOX_ACCESS_TOKEN}
-      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      - POSTGRES_SERVER=db
     ports:
       - "8000:8000"
     volumes:
       - ./logs:/app/logs
+      - ./data:/app/data
+    networks:
+      - vg_net
+
+networks:
+  vg_net:
+    driver: bridge
 
 volumes:
   postgres_data:
