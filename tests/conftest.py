@@ -2,15 +2,14 @@
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
-from datetime import datetime
 from core.config import settings
 
-# 1. Force Test Environment
+# --- FIX: Only set mutable fields, don't touch properties like DATABASE_URL ---
+# These are likely standard Pydantic fields, so they are mutable.
 settings.SAFETY_MODE = "paper"
 settings.UPSTOX_ACCESS_TOKEN = "TEST_TOKEN"
 settings.POSTGRES_DB = "test_db"
-# Ensure we don't accidentally connect to prod DB
-settings.DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+# Removed: settings.DATABASE_URL = ... (This caused the crash)
 
 @pytest.fixture(scope="session")
 def event_loop():
@@ -21,7 +20,9 @@ def event_loop():
 
 @pytest.fixture
 def mock_db():
-    """Mocks the HybridDatabaseManager to prevent real DB connections."""
+    """Mocks the HybridDatabaseManager."""
+    # This mock completely replaces the real database connection logic.
+    # So it doesn't matter what the real DATABASE_URL is.
     db = MagicMock()
     session = AsyncMock()
     
@@ -29,7 +30,7 @@ def mock_db():
     db.get_session.return_value.__aenter__.return_value = session
     db.get_session.return_value.__aexit__.return_value = None
     
-    # Mock execute/scalars/first/all for SQLAlchemy queries
+    # Mock execute/scalars/first/all results
     mock_result = MagicMock()
     mock_result.scalars.return_value.first.return_value = None
     mock_result.scalars.return_value.all.return_value = []
@@ -39,10 +40,10 @@ def mock_db():
 
 @pytest.fixture
 def mock_upstox():
-    """Mocks EnhancedUpstoxAPI with Strict Schema Responses."""
+    """Mocks Upstox API with Strict Schema Responses."""
     api = AsyncMock()
     
-    # 1. Funds & Margin (Critical for Sheriff)
+    # 1. Funds & Margin
     api.get_funds_and_margin.return_value = {
         "status": "success",
         "data": {
@@ -56,7 +57,7 @@ def mock_upstox():
         }
     }
 
-    # 2. Positions (Critical for Zombie Check)
+    # 2. Positions
     api.get_short_term_positions.return_value = [
         {
             "instrument_token": "NSE_FO|12345",
