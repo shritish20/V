@@ -1,74 +1,37 @@
 version: '3.8'
 
 services:
-  volguard:
-    build: .
-    container_name: volguard_engine
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-      - ./dashboard_data:/app/dashboard_data
-      - ./logs:/app/logs
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - vg_net
-
-  postgres:
+  # 1. The Database (PostgreSQL)
+  db:
     image: postgres:15-alpine
-    container_name: vg_postgres
+    restart: always
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-volguard_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_trading_password}
-      POSTGRES_DB: ${POSTGRES_DB:-volguard_db}
+      POSTGRES_USER: volguard_user
+      POSTGRES_PASSWORD: secure_password_123
+      POSTGRES_DB: volguard_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-volguard_user}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - vg_net
 
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: vg_prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
-      - prometheus_data:/prometheus
-    restart: unless-stopped
-    networks:
-      - vg_net
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: vg_grafana
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-    volumes:
-      - grafana_data:/var/lib/grafana
+  # 2. The VolGuard Engine
+  app:
+    build: .
+    restart: always
     depends_on:
-      - prometheus
-    networks:
-      - vg_net
-
-networks:
-  vg_net:
-    driver: bridge
+      - db
+    # Pass environment variables to the container
+    environment:
+      POSTGRES_SERVER: db
+      POSTGRES_USER: volguard_user
+      POSTGRES_PASSWORD: secure_password_123
+      POSTGRES_DB: volguard_db
+      UPSTOX_ACCESS_TOKEN: ${UPSTOX_ACCESS_TOKEN}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
 
 volumes:
   postgres_data:
-  prometheus_data:
-  grafana_data:
