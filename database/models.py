@@ -147,6 +147,8 @@ class DbRiskState(Base):
     kill_switch_active: Mapped[bool] = mapped_column(Boolean, default=False)
     is_flattening: Mapped[bool] = mapped_column(Boolean, default=False) 
     flatten_order_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Added real_time_pnl for Dashboard compat (Optional)
+    real_time_pnl: Mapped[Optional[float]] = mapped_column(Float, default=0.0)
 
 class DbMarketContext(Base):
     """
