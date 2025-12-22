@@ -5,6 +5,7 @@ VolGuard 20.0 – Production-Hardened Engine (Fortress Architecture)
 - Safety: Checks 'Sheriff' Heartbeat constantly
 - Execution: Pure Strategy & Order Management
 - Continuous Reconciliation Loop
+- FIXED: Manual Dependency Injection for Pricing Engine
 """
 from __future__ import annotations
 
@@ -74,7 +75,8 @@ class VolGuard20Engine:
         self.sabr    = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
         self.pricing.set_api(self.api)
-        self.pricing.instrument_master = self.instruments_master
+        # FIXED: Explicitly set instrument_master here since we removed auto-wiring
+        self.pricing.instrument_master = self.instruments_master 
 
         # --- Greeks Cache (Memory-Safe) -----------------------------------------
         self._greeks_cache: Dict[str, GreeksSnapshot] = {}
