@@ -71,13 +71,14 @@ class EnhancedUpstoxAPI:
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
         self._limiter = RateLimiter()
-        self._instrument_master: Optional[Any] = None
+        # Removed self._instrument_master to prevent circular dependency issues
 
     # ---------------------------------------------------------------------
-    # Public Helpers
+    # Public Helpers (Required for Engine Safety)
     # ---------------------------------------------------------------------
     def set_instrument_master(self, master: Any) -> None:
-        self._instrument_master = master
+        """Optional: Can store master if needed for internal logic, but usually Engine handles this."""
+        pass # No-op to satisfy potential legacy calls, or implement if truly needed.
 
     async def update_token(self, new_token: str) -> None:
         async with self._session_lock:
@@ -87,6 +88,25 @@ class EnhancedUpstoxAPI:
                 await self._session.close()
                 self._session = None
         logger.info("🔄 Token rotated")
+
+    async def check_token_validity(self) -> bool:
+        """
+        Proactively checks if the token is valid by hitting a lightweight endpoint (User Profile).
+        Raises TokenExpiredError if 401.
+        """
+        # We manually construct the call to avoid infinite recursion with _request
+        url = settings.API_BASE_URL + "/v2/user/profile"
+        try:
+            session = await self._get_session()
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 401:
+                    raise TokenExpiredError("Token Invalid (Check Failed)")
+                return True
+        except TokenExpiredError:
+            raise
+        except Exception:
+            # Network error is not strictly a token error, so return True (innocent until proven guilty)
+            return True
 
     async def close(self) -> None:
         async with self._session_lock:
@@ -148,7 +168,6 @@ class EnhancedUpstoxAPI:
                     if resp.status == 401:
                         logger.warning("⚠️ Token expired – Refreshing once...")
                         await self._refresh_token_once()
-                        # Retry immediately with new token (if refresh logic implemented)
                         continue
 
                     if resp.status in (429, 503):
