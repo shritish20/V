@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Production-Grade Configuration (Corrected)
-- Real-time broker margin as ACCOUNT_SIZE
-- Corrected Freeze Limits (Shares)
-- Intraday draw-down on *ledger* balance
-- Env-driven circuit-breaker knobs
-- Secrets never leak into logs
+VolGuard 20.0 – Configuration (Hardened & Test-Ready)
+- Corrected Variable Names for Integration
+- Default Values for Safe Testing
 """
 from __future__ import annotations
 
@@ -19,7 +16,7 @@ from pydantic_core import MultiHostUrl
 
 
 # ---------------------------------------------------------------------------
-# Upstox route map – unchanged
+# Upstox route map
 # ---------------------------------------------------------------------------
 UPSTOX_API_ENDPOINTS: Dict[str, str] = {
     # Auth
@@ -52,7 +49,7 @@ UPSTOX_API_ENDPOINTS: Dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Base settings – with env override
+# Base settings
 # ---------------------------------------------------------------------------
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
@@ -60,24 +57,24 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Generic
     # ---------------------------------------------------------------------
-    ENV: str = Field(default="production", env="ENV")
-    PORT: int = Field(default=8000, env="PORT")
+    ENV: str = Field(default="production") # validation_alias="ENV" in v2
+    PORT: int = Field(default=8000)
     IST: Any = pytz.timezone("Asia/Kolkata")
 
     # ---------------------------------------------------------------------
     # Runtime flags
     # ---------------------------------------------------------------------
-    PAPER_TRADING: bool = Field(default=True, env="PAPER_TRADING")
-    SAFETY_MODE: str = Field(default="paper", env="SAFETY_MODE")  # paper / live
+    PAPER_TRADING: bool = Field(default=True)
+    SAFETY_MODE: str = Field(default="paper")  # paper / live
 
     # ---------------------------------------------------------------------
     # Database
     # ---------------------------------------------------------------------
-    POSTGRES_SERVER: str = Field(default="postgres", env="POSTGRES_SERVER")
-    POSTGRES_USER: str = Field(default="volguard_user", env="POSTGRES_USER")
-    POSTGRES_PASSWORD: str = Field(default="secure_trading_password", env="POSTGRES_PASSWORD")
-    POSTGRES_DB: str = Field(default="volguard_db", env="POSTGRES_DB")
-    POSTGRES_PORT: int = Field(default=5432, env="POSTGRES_PORT")
+    POSTGRES_SERVER: str = Field(default="localhost")
+    POSTGRES_USER: str = Field(default="volguard_user")
+    POSTGRES_PASSWORD: str = Field(default="secure_trading_password")
+    POSTGRES_DB: str = Field(default="volguard_db")
+    POSTGRES_PORT: int = Field(default=5432)
 
     @computed_field
     @property
@@ -96,70 +93,68 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Broker
     # ---------------------------------------------------------------------
-    UPSTOX_ACCESS_TOKEN: str = Field(..., env="UPSTOX_ACCESS_TOKEN")
+    UPSTOX_ACCESS_TOKEN: str = Field(default="")
     API_BASE_URL: str = "https://api-v2.upstox.com"
 
     # ---------------------------------------------------------------------
     # AI
     # ---------------------------------------------------------------------
-    GEMINI_API_KEY: str = Field(default="", env="GEMINI_API_KEY")
+    GEMINI_API_KEY: str = Field(default="")
 
     # ---------------------------------------------------------------------
     # Instrument universe
     # ---------------------------------------------------------------------
-    UNDERLYING_SYMBOL: str = Field(default="NIFTY", env="UNDERLYING_SYMBOL")
-    LOT_SIZE: int = Field(default=75, env="LOT_SIZE")
+    UNDERLYING_SYMBOL: str = Field(default="NIFTY")
+    LOT_SIZE: int = Field(default=75)
 
     # ---------------------------------------------------------------------
-    # Capital – **real margin** refreshed at runtime
+    # Capital
     # ---------------------------------------------------------------------
-    # Fallback only – real value is fetched from broker
-    ACCOUNT_SIZE_FALLBACK: float = Field(default=2_000_000.0, env="ACCOUNT_SIZE")
+    # RENAMED from ACCOUNT_SIZE_FALLBACK to ACCOUNT_SIZE to fix AttributeError
+    ACCOUNT_SIZE: float = Field(default=2_000_000.0)
 
     # Refresh interval seconds
-    MARGIN_REFRESH_SEC: int = Field(default=30, env="MARGIN_REFRESH_SEC")
+    MARGIN_REFRESH_SEC: int = Field(default=30)
 
     # ---------------------------------------------------------------------
-    # Freeze limits – Fixed Logic
+    # Freeze limits
     # ---------------------------------------------------------------------
-    # Nifty Freeze Limit is 1800 SHARES (Quantity), not contracts.
-    # We map this to the specific key used by LiveOrderExecutor
-    NIFTY_FREEZE_QTY: int = Field(default=1800, env="NIFTY_FREEZE_QTY")
-    BANKNIFTY_FREEZE_QTY: int = Field(default=900, env="BANKNIFTY_FREEZE_QTY")
+    NIFTY_FREEZE_QTY: int = Field(default=1800)
+    BANKNIFTY_FREEZE_QTY: int = Field(default=900)
 
     # ---------------------------------------------------------------------
     # Position sizing
     # ---------------------------------------------------------------------
-    MAX_LOTS: int = Field(default=10, env="MAX_LOTS")
+    MAX_LOTS: int = Field(default=10)
     CAPITAL_ALLOCATION: Dict[str, float] = {
-        "weekly_expiries": 0.40,
-        "monthly_expiries": 0.50,
-        "intraday_adjustments": 0.10,
+        "WEEKLY": 0.40,
+        "MONTHLY": 0.50,
+        "INTRADAY": 0.10,
     }
 
     # ---------------------------------------------------------------------
-    # Risk – draw-down on **ledger balance**
+    # Risk
     # ---------------------------------------------------------------------
-    DAILY_LOSS_LIMIT_PCT: float = Field(default=0.03, env="DAILY_LOSS_LIMIT_PCT")
+    DAILY_LOSS_LIMIT_PCT: float = Field(default=0.03)
     TAKE_PROFIT_PCT: float = 0.50
     STOP_LOSS_PCT: float = 1.0
 
-    WEEKLY_MAX_RISK: float = Field(default=8_000.0, env="WEEKLY_MAX_RISK")
-    MONTHLY_MAX_RISK: float = Field(default=10_000.0, env="MONTHLY_MAX_RISK")
-    INTRADAY_MAX_RISK: float = Field(default=4_000.0, env="INTRADAY_MAX_RISK")
+    WEEKLY_MAX_RISK: float = Field(default=8_000.0)
+    MONTHLY_MAX_RISK: float = Field(default=10_000.0)
+    INTRADAY_MAX_RISK: float = Field(default=4_000.0)
 
     # Greeks limits
-    MAX_PORTFOLIO_VEGA: float = Field(default=1_000.0, env="MAX_VEGA")
-    MAX_PORTFOLIO_DELTA: float = Field(default=300.0, env="MAX_DELTA")
-    MAX_PORTFOLIO_THETA: float = Field(default=-1_500.0, env="MAX_THETA")
-    MAX_PORTFOLIO_GAMMA: float = Field(default=50.0, env="MAX_GAMMA")
+    MAX_PORTFOLIO_VEGA: float = Field(default=1_000.0)
+    MAX_PORTFOLIO_DELTA: float = Field(default=300.0)
+    MAX_PORTFOLIO_THETA: float = Field(default=-1_500.0)
+    MAX_PORTFOLIO_GAMMA: float = Field(default=50.0)
 
     # ---------------------------------------------------------------------
     # Circuit-breaker knobs
     # ---------------------------------------------------------------------
-    MAX_ERROR_COUNT: int = Field(default=5, env="MAX_ERROR_COUNT")
-    MAX_SLIPPAGE_PCT: float = Field(default=0.05, env="MAX_SLIPPAGE_PCT")  # 5 %
-    SMART_BUFFER_PCT: float = Field(default=0.03, env="SMART_BUFFER_PCT")  # 3 %
+    MAX_ERROR_COUNT: int = Field(default=5)
+    MAX_SLIPPAGE_PCT: float = Field(default=0.05)
+    SMART_BUFFER_PCT: float = Field(default=0.03)
 
     # ---------------------------------------------------------------------
     # SABR
@@ -176,14 +171,14 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     PERSISTENT_DATA_DIR: str = "./data"
     DASHBOARD_DATA_DIR: str = "dashboard_data"
-    TRADING_LOOP_INTERVAL: int = Field(default=5, env="TRADING_LOOP_INTERVAL")
+    TRADING_LOOP_INTERVAL: int = Field(default=5)
 
-    GREEK_VALIDATION: bool = Field(default=True, env="GREEK_VALIDATION")
-    GREEK_REFRESH_SEC: int = Field(default=15, env="GREEK_REFRESH_SEC")
-    GREEK_TOLERANCE_PCT: float = Field(default=15.0, env="GREEK_TOLERANCE_PCT")
+    GREEK_VALIDATION: bool = Field(default=True)
+    GREEK_REFRESH_SEC: int = Field(default=15)
+    GREEK_TOLERANCE_PCT: float = Field(default=15.0)
 
-    MARKET_KEY_INDEX: str = Field(default="NSE_INDEX|Nifty 50", env="MARKET_KEY_INDEX")
-    MARKET_KEY_VIX: str = Field(default="NSE_INDEX|India VIX", env="MARKET_KEY_VIX")
+    MARKET_KEY_INDEX: str = Field(default="NSE_INDEX|Nifty 50")
+    MARKET_KEY_VIX: str = Field(default="NSE_INDEX|India VIX")
     MARKET_OPEN_TIME: dtime = dtime(9, 15)
     MARKET_CLOSE_TIME: dtime = dtime(15, 30)
     SAFE_TRADE_END: dtime = dtime(15, 15)
