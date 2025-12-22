@@ -24,6 +24,7 @@ services:
       - .env
     environment:
       - POSTGRES_SERVER=db
+      - PYTHONPATH=/app
     ports:
       - "8000:8000"
     volumes:
