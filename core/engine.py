@@ -4,6 +4,7 @@ VolGuard 20.0 – Production-Hardened Engine (Fortress Architecture)
 - Stripped of AI/Reporting (Moved to Sidecars)
 - Safety: Checks 'Sheriff' Heartbeat constantly
 - Execution: Pure Strategy & Order Management
+- Continuous Reconciliation Loop
 """
 from __future__ import annotations
 
@@ -49,6 +50,7 @@ logger = setup_logger("Engine")
 MAX_CACHE_SIZE      = 5_000
 CACHE_TTL_SEC       = 3_600
 SAFETY_CHECK_INT    = 5           # Check Sheriff every 5 seconds
+RECONCILE_INT       = 60          # Reconcile with Broker every 60 seconds
 # ---------------------------------------------------------------------------
 
 class EngineCircuitBreaker(Exception):
@@ -134,6 +136,7 @@ class VolGuard20Engine:
         self.error_count        = 0
         self.last_error_time    = 0.0
         self.last_safety_check  = 0.0
+        self.last_reconcile     = 0.0
         self.last_sabr_calib    = 0.0
         self.last_known_spot    = 0.0
         self.rt_quotes: Dict[str, float] = {}
@@ -141,7 +144,7 @@ class VolGuard20Engine:
 
         # --- Market Context Flags (Synced from DB) ---
         self.ai_verdict = "SAFE"
-        self.ai_narrative = ""
+        self.ai_is_fresh = False
 
         self._thread_pool = asyncio.get_running_loop().run_in_executor
         self._calibration_semaphore = asyncio.Lock()
@@ -159,6 +162,8 @@ class VolGuard20Engine:
             await self.db.init_db()
             await self.om.start()
             await self._restore_from_snapshot()
+            
+            # Initial Reconciliation
             await self._reconcile_broker_positions()
 
             self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
@@ -200,7 +205,21 @@ class VolGuard20Engine:
                     
                     # Sync AI View while we are at it
                     await self._sync_market_context()
+                    
+                    # Check Token Validity (Proactive)
+                    try:
+                        await self.api.check_token_validity()
+                    except TokenExpiredError:
+                         logger.critical("🔑 Token Expired in Loop - Halting")
+                         self.running = False
+                         break
+
                     self.last_safety_check = tick
+
+                # --- 2. CONTINUOUS RECONCILIATION ---
+                if tick - self.last_reconcile > RECONCILE_INT:
+                    await self._reconcile_broker_positions()
+                    self.last_reconcile = tick
 
                 # Spot Price Update
                 live_spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
@@ -219,11 +238,13 @@ class VolGuard20Engine:
                     if tick - self.last_sabr_calib > 900:
                         asyncio.create_task(self._sabr_calibrate())
                     
-                    # Only trade if AI says SAFE
-                    if self.ai_verdict != "DANGER":
-                        await self._trading_logic(live_spot)
+                    # FAIL-OPEN AI CHECK
+                    # Only block if AI explicitly says DANGER and is FRESH.
+                    if self.ai_verdict == "DANGER" and self.ai_is_fresh:
+                        if tick % 60 == 0: 
+                            logger.warning("⚠️ Trading Paused: AI actively sensing danger.")
                     else:
-                        if tick % 60 == 0: logger.info("⚠️ Trading Paused due to AI DANGER signal")
+                        await self._trading_logic(live_spot)
 
                     await self.trade_mgr.monitor_active_trades(self.trades)
 
@@ -272,7 +293,7 @@ class VolGuard20Engine:
                 state = res.scalars().first()
 
                 if not state:
-                    logger.warning("⚠️ No Sheriff Heartbeat found yet.")
+                    logger.warning("⚠️ No Sheriff Heartbeat found yet. (Waiting...)")
                     return True # Give it time to start
 
                 # 1. Check Dead Sheriff
@@ -301,7 +322,7 @@ class VolGuard20Engine:
                 ctx = res.scalars().first()
                 if ctx:
                     self.ai_verdict = ctx.regime
-                    self.ai_narrative = ctx.ai_narrative
+                    self.ai_is_fresh = ctx.is_fresh
         except Exception:
             pass
 
@@ -339,8 +360,8 @@ class VolGuard20Engine:
     async def _trading_logic(self, spot: float) -> None:
         if not self.last_metrics: return
         
-        # Pass dummy context since real context is now in self.ai_verdict
-        ai_ctx = {"verdict": self.ai_verdict, "narrative": self.ai_narrative}
+        # Pass dummy context since logic now relies on self.ai_verdict
+        ai_ctx = {"verdict": self.ai_verdict, "is_fresh": self.ai_is_fresh}
 
         strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(
             self.last_metrics, spot, await self.capital_allocator.get_status(), ai_ctx
@@ -380,10 +401,18 @@ class VolGuard20Engine:
             for idx, leg in enumerate(trade.legs):
                 leg.client_order_id = self._make_client_order_id(trade.id, idx, "BUY" if leg.quantity > 0 else "SELL")
 
+            # Safety Gate
+            # Note: We pass metrics, but AI check is already done in run()
+            approved, reason = await self.safety_layer.pre_trade_gate(trade, {"greeks_cache": self._greeks_cache})
+            if not approved:
+                logger.info(f"Trade blocked by safety: {reason}")
+                return
+
             # Execution
             ok, msg = await self.executor.execute_with_hedge_priority(trade)
             if ok:
                 val = sum(abs(l.entry_price * l.quantity) for l in trade.legs)
+                # Allocator now uses SQL INSERT ON CONFLICT (Implicit check)
                 await self.capital_allocator.allocate_capital(bucket.value, val, trade.id)
                 async with self._trade_lock:
                     trade.status = TradeStatus.OPEN
@@ -457,42 +486,14 @@ class VolGuard20Engine:
             await self._calibrate_sabr_internal()
 
     async def _calibrate_sabr_internal(self) -> None:
-        spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
-        if spot <= 0: return
-
-        expiries = self.instruments_master.get_all_expiries(settings.UNDERLYING_SYMBOL)
-        if not expiries: return
-        expiry = expiries[0]
-
+        # Note: Added timeout in pricing.py, but simplified here
         try:
-            chain = await self.api.get_option_chain(
-                settings.MARKET_KEY_INDEX, expiry.strftime("%Y-%m-%d")
-            )
-            if not chain or not chain.get("data"): return
+            spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
+            if spot <= 0: return
 
-            strikes, vols = [], []
-            for item in chain["data"]:
-                strike = item.get("strike_price")
-                iv = item.get("call_options", {}).get("option_greeks", {}).get("iv", 0.0)
-                if iv > 5.0: iv /= 100.0
-                if strike and iv > 0.01:
-                    strikes.append(strike)
-                    vols.append(iv)
-
-            if len(strikes) < 5: return
-
-            tte = max(0.001, (expiry - datetime.now(IST).date()).days / 365.0)
-            loop = asyncio.get_running_loop()
-            ok = await asyncio.wait_for(
-                loop.run_in_executor(
-                    None, self.sabr.calibrate_to_chain, strikes, vols, spot, tte
-                ), timeout=15.0,
-            )
-            if ok:
-                self.last_sabr_calib = time.time()
-                logger.info("SABR Calibrated")
-            else:
-                self.sabr.reset()
+            # Call pricing engine's calibrated method which now handles timeouts
+            await self.pricing.calibrate_sabr(spot)
+            self.last_sabr_calib = time.time()
         except Exception:
             self.sabr.reset()
 
@@ -543,6 +544,9 @@ class VolGuard20Engine:
             logger.exception("Restore Failed")
 
     async def _reconcile_broker_positions(self) -> None:
+        """
+        Runs every 60s. Detects Zombie positions and adopts them.
+        """
         try:
             broker_positions = await self.api.get_short_term_positions()
             if not broker_positions: return
