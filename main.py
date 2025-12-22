@@ -1,106 +1,87 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Main Entry Point
-- Initializes the Hardened VolGuard20Engine
-- Mounts the Unified API Router
-- Manages Lifecycle (Startup/Shutdown) via FastAPI
+VolGuard 20.0 – Web API Server (Microservice)
+- Roles: Serves Frontend API, Serves Static React Files
+- DOES NOT run the Trading Engine (Run core/engine.py for that)
 """
 import uvicorn
-import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
-# Import Hardened Components
-from core.engine import VolGuard20Engine
+# Core Imports
 from core.config import settings
 from utils.logger import setup_logger
 from api.routes import router as api_router
+from database.manager import HybridDatabaseManager
 
 # Setup Logging
-logger = setup_logger("Main")
-
-# Global Engine Instance
-engine_instance = None
+logger = setup_logger("API_Server")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Manages the lifecycle of the Engine (Startup/Shutdown).
-    This replaces your old signal handlers and startup_sequence.
+    Lifecycle Manager for the Web Server.
+    Initializes DB Connection Pool for the API.
     """
-    global engine_instance
-    logger.info("🚀 VolGuard 20.0 System Initializing...")
+    logger.info("🚀 VolGuard Web API Initializing...")
     
-    # 1. Initialize Engine
-    # This automatically connects to DB, Broker, and sets up the Allocator
-    engine_instance = VolGuard20Engine()
+    # 1. Initialize Database Manager (Shared Pool)
+    db = HybridDatabaseManager()
+    await db.init_db() # Ensure tables exist
     
-    # 2. Inject into App State so API endpoints can access it
-    app.state.engine = engine_instance
-    
-    # 3. Boot Engine Components
-    try:
-        await engine_instance.initialize()
-        
-        # Optional: Auto-start the loop if configured, otherwise wait for /api/start
-        if settings.ENV == "production":
-            logger.info("⚡ Auto-starting Engine Loop...")
-            import asyncio
-            asyncio.create_task(engine_instance.run())
-            
-    except Exception as e:
-        logger.critical(f"🔥 Startup Failed: {e}")
-        raise e
+    logger.info("✅ Database Connected")
     
     yield
     
-    # 4. Cleanup on Shutdown
-    logger.info("🛑 System Shutdown Initiated...")
-    if engine_instance and engine_instance.running:
-        await engine_instance.shutdown()
-    logger.info("✅ System Shutdown Complete")
+    logger.info("🛑 Web API Shutdown...")
 
 # ==========================================
 # FASTAPI APP DEFINITION
 # ==========================================
 app = FastAPI(
-    title="VolGuard 20.0 (Hardened)",
-    description="Institutional-Grade Algorithmic Trading System",
-    version="20.0.0",
+    title="VolGuard 20.0 (Command Center)",
+    description="API Layer for VolGuard Fortress Architecture",
+    version="20.0.1",
     lifespan=lifespan
 )
 
-# CORS
+# CORS (Allow Frontend to talk to Backend)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # In production, restrict this to your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Static Files (Dashboard)
+# Static Files (Placeholder for your React Build)
+# When you build React, put the 'build' folder contents in './static_dashboard'
 static_path = Path("./static_dashboard")
 static_path.mkdir(exist_ok=True)
-app.mount("/dashboard/static", StaticFiles(directory=static_path), name="static")
+app.mount("/dashboard", StaticFiles(directory=static_path, html=True), name="dashboard")
 
-# Include the Unified Router
+# Include the Unified Router (The Logic)
 app.include_router(api_router)
 
 # Root Redirect
 @app.get("/")
 async def root():
-    return {"message": "VolGuard 20.0 Active", "docs": "/docs"}
+    return {
+        "system": "VolGuard 20.0 Fortress",
+        "status": "API Online",
+        "dashboard_url": f"http://localhost:{settings.PORT}/dashboard"
+    }
 
 if __name__ == "__main__":
-    logger.info(f"🔥 Starting VolGuard Server on Port {settings.PORT} [ENV: {settings.ENV}]")
+    logger.info(f"🔥 Starting API Server on Port {settings.PORT}")
+    # We use reload=True for dev so you can see changes instantly
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=settings.PORT, 
         log_level="info",
-        reload=False # False for production stability
+        reload=True 
     )
