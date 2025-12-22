@@ -9,21 +9,23 @@ async def test_atomic_allocation(mock_db):
     config = {"WEEKLY": 0.5}
     allocator = SmartCapitalAllocator(100000.0, config, mock_db)
     
-    # --- FIX START ---
-    # Create a mock object representing a database row
+    # 1. Mock internal margin fetch so it returns a clean float
+    # This prevents the 'MagicMock > float' error
+    allocator._get_real_margin = AsyncMock(return_value=100000.0)
+
+    # 2. Mock the DB Limit Check
+    # When allocator checks existing usage, we return a Row with used_amount=0.0
     mock_row = MagicMock()
-    mock_row.used_amount = 0.0  # Set the attribute the code expects
+    mock_row.used_amount = 0.0 # Clean float
     
-    # Build the chain: session.execute() -> result
+    # Setup session.execute() -> result -> scalars() -> first() -> mock_row
     mock_result = MagicMock()
-    # result.scalars() -> iterator -> first() -> returns our mock_row
     mock_result.scalars.return_value.first.return_value = mock_row
-    
-    # Attach to the session context manager
     mock_db.get_session.return_value.__aenter__.return_value.execute.return_value = mock_result
-    # --- FIX END ---
     
-    # Call Allocate
+    # 3. Call Allocate
+    # We allocate 10k. Limit is 50k (0.5 * 100k). 
+    # 0 + 10k < 50k. Should pass.
     result = await allocator.allocate_capital("WEEKLY", 10000.0, "TRADE-123")
     
     assert result is True
