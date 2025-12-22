@@ -4,6 +4,7 @@ VolGuard 20.0 – Database Models (Hardened)
 - SQLAlchemy 2.0 Type-Safe Syntax
 - Unique Constraints for Allocation Idempotency
 - Indexed for High-Performance Queries
+- Includes Process Communication Tables (RiskState, MarketContext)
 """
 from __future__ import annotations
 
@@ -120,3 +121,47 @@ class DbTradeJournal(Base):
     net_pnl: Mapped[float] = mapped_column(Float, default=0.0)
     is_reconciled: Mapped[bool] = mapped_column(Boolean, default=False)
     slippage: Mapped[float] = mapped_column(Float, default=0.0)
+
+# ---------------------------------------------------------------------------
+# Process Communication (The Nervous System)
+# ---------------------------------------------------------------------------
+class DbRiskState(Base):
+    """
+    Shared memory between Sheriff (Process 3) and Core Engine (Process 1).
+    Tracks PnL, Equity, and Kill Switch status.
+    """
+    __tablename__ = "risk_state"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # HARDENING: Proof of Life (Engine checks this to ensure Sheriff is alive)
+    sheriff_heartbeat: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # HARDENING: Equity Tracking (Realized + Unrealized)
+    sod_equity: Mapped[float] = mapped_column(Float, default=0.0) # Start of Day
+    current_equity: Mapped[float] = mapped_column(Float, default=0.0)
+    drawdown_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    
+    # STATE FLAGS
+    kill_switch_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_flattening: Mapped[bool] = mapped_column(Boolean, default=False) 
+    flatten_order_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+
+class DbMarketContext(Base):
+    """
+    Shared memory between AI Analyst (Process 2) and Core Engine (Process 1).
+    Stores the 'Brain's' view of the market.
+    """
+    __tablename__ = "market_context"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # Analysis
+    regime: Mapped[str] = mapped_column(String) # "SAFE", "PANIC", "VOLATILE"
+    ai_narrative: Mapped[str] = mapped_column(String) 
+    is_high_risk: Mapped[bool] = mapped_column(Boolean, default=False)
+    
+    # HARDENING: Stale Data Protection (True if AI is online and fresh)
+    is_fresh: Mapped[bool] = mapped_column(Boolean, default=True)
