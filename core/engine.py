@@ -5,6 +5,7 @@ VolGuard 20.0 – Production-Hardened Engine (Fortress Architecture)
 - INTEGRATED: Sheriff PID Control (Graceful Kill)
 - FIXED: Position Reconciliation Race Conditions (Includes PENDING status)
 - FIXED: Async loop initialization for Fortress services
+- NEW: Market Snapshot Recording for Quant Dashboard
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ from core.models import (
     TradeStatus, StrategyType, CapitalBucket, ExpiryType, ExitReason,
 )
 from database.manager import HybridDatabaseManager
-from database.models import DbStrategy, DbRiskState, DbMarketContext
+from database.models import DbStrategy, DbRiskState, DbMarketContext, DbMarketSnapshot
 from trading.api_client import EnhancedUpstoxAPI, TokenExpiredError
 from trading.token_manager import setup_token_manager
 from trading.live_data_feed import LiveDataFeed
@@ -299,11 +300,16 @@ class VolGuard20Engine:
             self.risk_mgr.update_portfolio_state(self.trades, total_pnl)
 
     async def _calculate_metrics(self, spot: float) -> None:
+        """
+        Calculates Quant Metrics (VRP, Skew, etc.) and writes them to DB for the Dashboard.
+        """
         try:
             live_vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 0.0)
             vix = max(live_vix, 10.0)
             rv7, rv28, garch, egarch, ivp, iv_rank = self.vol_analytics.get_volatility_metrics(vix)
             struct = await self.pricing.get_market_structure(spot)
+            
+            # 1. Update Internal State
             self.last_metrics = AdvancedMetrics(
                 timestamp=datetime.now(IST), spot_price=spot, vix=vix, ivp=ivp, iv_rank=iv_rank,
                 realized_vol_7d=rv7, realized_vol_28d=rv28, garch_vol_7d=garch, egarch_vol_1d=egarch,
@@ -312,14 +318,57 @@ class VolGuard20Engine:
                 vrp_zscore=self.vrp_zscore.calculate_vrp_zscore(struct.get("atm_iv", 0.0), vix)[0],
                 term_structure_spread=struct.get("term_structure_spread", 0.0),
                 straddle_price=struct.get("straddle_price", 0.0),
+                straddle_price_monthly=struct.get("straddle_price_monthly", 0.0), # Ensure model supports this
                 volatility_skew=struct.get("skew_index", 0.0),
                 regime=self.vol_analytics.calculate_volatility_regime(vix, iv_rank),
                 trend_status=self.vol_analytics.get_trend_status(spot),
                 days_to_expiry=struct.get("days_to_expiry", 0.0),
                 sabr_alpha=self.sabr.alpha, sabr_beta=self.sabr.beta,
                 sabr_rho=self.sabr.rho, sabr_nu=self.sabr.nu,
+                efficiency_table=struct.get("efficiency_table", [])
             )
-        except Exception: pass
+
+            # 2. Write to DB for "Data Beast" Dashboard (Tab 1)
+            # Only write if we have meaningful data
+            if self.last_metrics.atm_iv > 0:
+                async with self.db.get_session() as session:
+                    snapshot = DbMarketSnapshot(
+                        timestamp=datetime.utcnow(),
+                        spot_price=spot,
+                        vix=vix,
+                        
+                        # Term Structure
+                        atm_iv_weekly=self.last_metrics.atm_iv,
+                        atm_iv_monthly=self.last_metrics.monthly_iv,
+                        iv_spread=self.last_metrics.term_structure_spread,
+                        term_structure_tag="Backwardation" if self.last_metrics.term_structure_spread > 0 else "Contango",
+                        
+                        # Quant Models
+                        rv_7d=self.last_metrics.realized_vol_7d,
+                        garch_vol_7d=self.last_metrics.garch_vol_7d,
+                        egarch_vol_1d=self.last_metrics.egarch_vol_1d,
+                        iv_percentile=self.last_metrics.ivp,
+                        
+                        # VRP Signals
+                        # spread_rv is IV - RV
+                        vrp_spread=self.last_metrics.atm_iv - self.last_metrics.realized_vol_7d, 
+                        vrp_zscore=self.last_metrics.vrp_zscore,
+                        vrp_verdict=self.last_metrics.regime, # Using regime as proxy for verdict for now
+                        
+                        # Execution Levels
+                        straddle_cost_weekly=self.last_metrics.straddle_price,
+                        straddle_cost_monthly=self.last_metrics.straddle_price_monthly,
+                        breakeven_lower=spot - self.last_metrics.straddle_price,
+                        breakeven_upper=spot + self.last_metrics.straddle_price,
+                        
+                        # The Full Option Chain Data
+                        chain_json=self.last_metrics.efficiency_table
+                    )
+                    session.add(snapshot)
+                    await self.db.safe_commit(session)
+
+        except Exception as e: 
+            logger.error(f"Metric Calculation Failed: {e}")
 
     async def _sabr_calibrate(self) -> None:
         if self._calibration_semaphore.locked(): return
@@ -399,10 +448,11 @@ class VolGuard20Engine:
 
     async def _reconcile_broker_positions(self) -> None:
         """
-        HARDENED v3.0: Checks PENDING status to prevent duplicate zombies.
+        HARDENED: Race-condition proof reconciliation.
         """
         try:
-            # Lock BEFORE fetch to ensure state consistency
+            # FIX: Lock BEFORE fetching broker positions
+            # This prevents us from adopting a position that belongs to a pending trade
             async with self._trade_lock:
                 broker_positions = await self.api.get_short_term_positions()
                 if not broker_positions: return
@@ -415,7 +465,6 @@ class VolGuard20Engine:
                 
                 internal_map = {}
                 for trade in self.trades:
-                    # PATCH: Include PENDING trades so we don't adopt their positions as zombies
                     if trade.status in (TradeStatus.OPEN, TradeStatus.PENDING):
                         for leg in trade.legs:
                             internal_map[leg.instrument_key] = internal_map.get(leg.instrument_key, 0) + leg.quantity
@@ -424,17 +473,18 @@ class VolGuard20Engine:
                 for token, b_qty in broker_map.items():
                     internal_qty = internal_map.get(token, 0)
                     if b_qty != internal_qty:
+                        # Only adopt if we have ZERO record of it
                         if internal_qty == 0:
                             logger.critical(f"🧟 ZOMBIE FOUND: {token} (Qty: {b_qty}) - Adopting...")
                             await self._adopt_zombie(token, b_qty)
                         else:
-                            # Just warn, don't auto-fix partial fills yet
-                            logger.error(f"⚠️ Mismatch: {token} (Broker {b_qty} vs Internal {internal_qty})")
+                            logger.error(f"⚠️ Quantity Mismatch for {token}: Broker {b_qty} vs Internal {internal_qty}")
 
         except Exception: logger.exception("Reconciliation Failed")
 
     async def _adopt_zombie(self, token: str, qty: int) -> None:
-        # No lock needed (already held by caller)
+        # Note: _trade_lock is already held by the caller (_reconcile_broker_positions)
+        # So we don't need to lock again here.
         price = self.rt_quotes.get(token, 1.0)
         dummy = Position(symbol=settings.UNDERLYING_SYMBOL, instrument_key=token, strike=0.0, option_type="CE",
                         quantity=qty, entry_price=price, entry_time=datetime.now(IST), current_price=price,
