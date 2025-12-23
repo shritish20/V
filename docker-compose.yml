@@ -7,7 +7,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-volguard_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_trading_password}
       POSTGRES_DB: ${POSTGRES_DB:-volguard_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
