@@ -3,6 +3,7 @@
 VolGuard 20.0 – Database Models (Fortress Edition)
 - Includes Token State for OAuth Management
 - Includes Margin History for Sanity Checks
+- Includes Market Snapshot for Quant Dashboard
 - Uses SQLAlchemy 2.0 Type-Safe Syntax
 """
 from __future__ import annotations
@@ -195,3 +196,47 @@ class DbMarketContext(Base):
     
     # HARDENING: Stale Data Protection (True if AI is online and fresh)
     is_fresh: Mapped[bool] = mapped_column(Boolean, default=True)
+
+# ---------------------------------------------------------------------------
+# NEW: Market Snapshot for Quant Dashboard
+# ---------------------------------------------------------------------------
+class DbMarketSnapshot(Base):
+    """
+    Stores the full 'Quant Matrix' from the Engine/Script.
+    The API reads this to populate the 'Live Feed' tab on the Dashboard.
+    """
+    __tablename__ = "market_snapshot"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # --- 1. CORE PRICES ---
+    spot_price: Mapped[float] = mapped_column(Float)
+    vix: Mapped[float] = mapped_column(Float)
+    
+    # --- 2. IV TERM STRUCTURE ---
+    atm_iv_weekly: Mapped[float] = mapped_column(Float)
+    atm_iv_monthly: Mapped[float] = mapped_column(Float)
+    iv_spread: Mapped[float] = mapped_column(Float)  # Weekly - Monthly
+    term_structure_tag: Mapped[str] = mapped_column(String) # "Backwardation" / "Contango"
+    
+    # --- 3. QUANT MODELS ---
+    rv_7d: Mapped[float] = mapped_column(Float)
+    garch_vol_7d: Mapped[float] = mapped_column(Float)
+    egarch_vol_1d: Mapped[float] = mapped_column(Float)
+    iv_percentile: Mapped[float] = mapped_column(Float)
+    
+    # --- 4. VRP SIGNALS ---
+    vrp_spread: Mapped[float] = mapped_column(Float) # IV - RV
+    vrp_zscore: Mapped[float] = mapped_column(Float)
+    vrp_verdict: Mapped[str] = mapped_column(String) # "STRONG SELL", "NEUTRAL", etc.
+    
+    # --- 5. EXECUTION CONTEXT ---
+    straddle_cost_weekly: Mapped[float] = mapped_column(Float)
+    straddle_cost_monthly: Mapped[float] = mapped_column(Float)
+    breakeven_lower: Mapped[float] = mapped_column(Float)
+    breakeven_upper: Mapped[float] = mapped_column(Float)
+    
+    # --- 6. THE MATRIX (Option Chain) ---
+    # Stores the full chain metrics (efficiency table or full chain) as JSON list
+    chain_json: Mapped[List[Dict[str, Any]]] = mapped_column(JSON)
