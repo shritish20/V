@@ -2,7 +2,7 @@
 """
 VolGuard 20.0 – Pricing Engine (Hardened)
 - Calculates Skew, Term Structure, and VRP
-- Safe SABR Calibration (15s Timeout)
+- Safe SABR Calibration (45s Timeout for High Vol)
 - Robust Error Handling
 """
 import asyncio
@@ -18,9 +18,9 @@ logger = logging.getLogger("PricingEngine")
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-MAX_IV_PCT        = 5.0          # 500% Max IV (Sanity Check)
-CALIB_TIMEOUT_SEC = 15           # Max time allowed for Math Optimization
-MIN_POINTS        = 5            # Min strikes required for a valid fit
+MAX_IV_PCT        = 5.0          
+CALIB_TIMEOUT_SEC = 45           # PATCH: Increased to 45s for stability
+MIN_POINTS        = 5            
 
 class DataIntegrityError(RuntimeError): pass
 class CalibrationError(RuntimeError): pass
@@ -38,10 +38,7 @@ class HybridPricingEngine:
         self.instrument_master: Any = None
 
     def set_api(self, api: Any) -> None:
-        """Injects API. Note: Instrument Master must be set separately by Engine."""
         self.api = api
-        # FIXED: Do NOT try to access api.instrument_master here.
-        # It creates a circular dependency or attribute error during testing.
 
     async def get_market_structure(self, spot: float) -> Dict[str, Any]:
         """Calculates Skew, Term Structure, and Efficiency for Strategy Engine."""
@@ -49,11 +46,8 @@ class HybridPricingEngine:
             return {"confidence": 0.0}
 
         try:
-            # 1. Fetch Expiries
             expiries = self.instrument_master.get_all_expiries(settings.UNDERLYING_SYMBOL)
             if len(expiries) < 2:
-                # Need at least 2 expiries to calculate term structure
-                # Fallback to single expiry logic if critical, but for now raise error
                 logger.warning("Not enough expiries for Term Structure analysis")
                 return {"confidence": 0.0}
 
@@ -61,8 +55,7 @@ class HybridPricingEngine:
             near_exp, far_exp = self._select_expiries(expiries, now)
             dte = max(0.001, self._calculate_dte(near_exp, now))
 
-            # 2. Parallel Data Fetch
-            # We fetch both weekly and monthly chains to compare IVs
+            # Fetch both chains
             chain_near, chain_far = await asyncio.gather(
                 self.api.get_option_chain(settings.MARKET_KEY_INDEX, near_exp.isoformat()),
                 self.api.get_option_chain(settings.MARKET_KEY_INDEX, far_exp.isoformat()),
@@ -73,31 +66,23 @@ class HybridPricingEngine:
                 logger.error("Failed to fetch Near Chain")
                 return {"confidence": 0.0}
             
-            # Far chain failure is non-critical (we just lose Term Structure slope)
             far_data = []
             if not isinstance(chain_far, Exception) and chain_far.get("data"):
                 far_data = chain_far["data"]
 
-            # 3. Process Metrics
             atm_strike = round(spot / 50) * 50
             near_metrics = self._extract_atm_metrics(chain_near["data"], atm_strike)
             far_metrics  = self._extract_atm_metrics(far_data, atm_strike)
 
-            # --- 🔥 QUANT UPGRADE: SKEW & TERM STRUCTURE ---
-            
-            # Skew: Difference between 5% OTM Put IV and 5% OTM Call IV
             skew_index = self._calculate_skew(chain_near["data"], spot)
             
-            # Term Structure Slope: % difference between near and far IV
             slope = 0.0
             if far_metrics["iv"] > 0:
                 slope = (near_metrics["iv"] - far_metrics["iv"]) / far_metrics["iv"]
 
-            # 4. Calibration & Efficiency
-            # SABR Calibration helps finding the theoretical fair value of OTM strikes
+            # Calibration
             await self._calibrate_if_needed(chain_near["data"], atm_strike, spot, dte)
             
-            # Efficiency Table helps finding strikes with best Theta/Vega ratio
             eff_table = self._build_efficiency_table(chain_near["data"], spot)
 
             return {
@@ -148,7 +133,6 @@ class HybridPricingEngine:
     # -------------------------------------------------------------------------
 
     def _calculate_skew(self, chain: List[Dict], spot: float) -> float:
-        """Calculates IV Skew: (OTM Put IV / OTM Call IV) - 1."""
         try:
             target_put = round((spot * 0.95) / 50) * 50
             target_call = round((spot * 1.05) / 50) * 50
@@ -171,11 +155,9 @@ class HybridPricingEngine:
     def _select_expiries(self, expiries: List[date], now: datetime) -> Tuple[date, date]:
         today = now.date()
         near = expiries[0]
-        # If today is expiry and it's late, switch to next
         if near == today and now.time() > dtime(15, 15):
             near = expiries[1] if len(expiries) > 1 else expiries[0]
             
-        # Find far expiry (monthly usually 25-45 days away)
         far = next((e for e in expiries if 25 <= (e - near).days <= 45), expiries[-1])
         return near, far
 
@@ -212,7 +194,6 @@ class HybridPricingEngine:
         }
 
     def _build_efficiency_table(self, chain: List[Dict[str, Any]], spot: float) -> List[Dict[str, float]]:
-        """Finds strikes with best decay vs volatility risk."""
         table = []
         for item in chain:
             strike = float(item.get("strike_price", 0))
@@ -241,12 +222,12 @@ class HybridPricingEngine:
         
         loop = asyncio.get_running_loop()
         try:
-            # FIX: Added strict 15-second timeout
+            # PATCH: Increased timeout to 45s
             await asyncio.wait_for(
                 loop.run_in_executor(None, self.sabr.calibrate_to_chain, strikes, ivs, spot, dte/365.25),
                 timeout=CALIB_TIMEOUT_SEC,
             )
         except asyncio.TimeoutError:
-            logger.warning("SABR Calibration Timed Out (15s)")
+            logger.warning(f"SABR Calibration Timed Out ({CALIB_TIMEOUT_SEC}s)")
         except Exception: 
             pass
