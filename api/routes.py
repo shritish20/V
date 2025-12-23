@@ -1,25 +1,41 @@
 #!/usr/bin/env python3
 """
 VolGuard 20.0 – API Routes (Fortress Edition)
-- Decoupled Architecture: API talks to DB, not Engine Memory
-- "Panic Button" writes to DB -> Sheriff picks it up
-- Dashboard reads DB state (fast & safe)
+- SERVES: All 5 Tabs of the "Data Beast" Dashboard
+- TAB 1: Live Quant (VRP, Skew, Option Chain from DbMarketSnapshot)
+- TAB 2: Strategies (Active execution from DbStrategy)
+- TAB 3: Risk Desk (Drawdown + Capital Locks)
+- TAB 4: System (Live Logs)
+- TAB 5: Journal (Trade History + Notes)
+- CONTROL: Panic Button (Kill Switch)
 """
 from __future__ import annotations
 
 import logging
 from datetime import datetime
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Depends, status
-from sqlalchemy import select
+from pydantic import BaseModel
+from sqlalchemy import select, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.manager import HybridDatabaseManager
-from database.models import DbRiskState, DbMarketContext, DbStrategy, DbTradeJournal
+from database.models import (
+    DbRiskState, DbMarketContext, DbStrategy, 
+    DbMarketSnapshot, DbCapitalUsage, DbTradeJournal
+)
 
 logger = logging.getLogger("API_Routes")
 router = APIRouter(prefix="/api", tags=["VolGuard Dashboard"])
+
+# ---------------------------------------------------------------------------
+# Pydantic Models (Validation)
+# ---------------------------------------------------------------------------
+class JournalNoteUpdate(BaseModel):
+    rationale: str
+    tags: Optional[str] = "Neutral"
 
 # ---------------------------------------------------------------------------
 # Dependency Injection
@@ -30,114 +46,194 @@ async def get_db_session() -> AsyncSession:
     async with db.get_session() as session:
         yield session
 
-# ---------------------------------------------------------------------------
-# Dashboard Endpoints (Read-Only)
-# ---------------------------------------------------------------------------
-
-@router.get("/health")
-async def health_check(session: AsyncSession = Depends(get_db_session)):
+# ===========================================================================
+# TAB 1: LIVE FEED (The "Matrix")
+# ===========================================================================
+@router.get("/market/live")
+async def get_live_quant_feed(session: AsyncSession = Depends(get_db_session)):
     """
-    Checks if the system is alive by reading the Sheriff's Heartbeat.
+    Returns the latest Quant Matrix (Option Chain, VRP, Skew) 
+    recorded by the Engine.
     """
     try:
-        # Get latest Sheriff Heartbeat
         res = await session.execute(
-            select(DbRiskState).order_by(DbRiskState.timestamp.desc()).limit(1)
+            select(DbMarketSnapshot).order_by(DbMarketSnapshot.timestamp.desc()).limit(1)
         )
-        state = res.scalars().first()
+        data = res.scalars().first()
         
-        sheriff_status = "offline"
-        kill_switch = False
+        if not data:
+            return {"status": "waiting_for_engine"}
         
-        if state:
-            # Check if Sheriff updated recently (within 10s)
-            lag = (datetime.utcnow() - state.sheriff_heartbeat).total_seconds()
-            if lag < 10:
-                sheriff_status = "online"
-            kill_switch = state.kill_switch_active
-            
         return {
-            "status": "healthy",
-            "sheriff": sheriff_status,
-            "kill_switch_active": kill_switch,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": data.timestamp,
+            "prices": {
+                "spot": data.spot_price,
+                "vix": data.vix
+            },
+            "term_structure": {
+                "weekly_iv": data.atm_iv_weekly,
+                "monthly_iv": data.atm_iv_monthly,
+                "spread": data.iv_spread,
+                "tag": data.term_structure_tag
+            },
+            "models": {
+                "rv_7d": data.rv_7d,
+                "garch": data.garch_vol_7d,
+                "egarch": data.egarch_vol_1d,
+                "ivp": data.iv_percentile
+            },
+            "vrp": {
+                "spread": data.vrp_spread,
+                "zscore": data.vrp_zscore,
+                "verdict": data.vrp_verdict
+            },
+            "levels": {
+                "straddle_wk": data.straddle_cost_weekly,
+                "straddle_mo": data.straddle_cost_monthly,
+                "be_lower": data.breakeven_lower,
+                "be_upper": data.breakeven_upper
+            },
+            "chain": data.chain_json  # The raw efficiency table / option chain
         }
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database Unreachable"
-        )
+        logger.error(f"Live Feed Error: {e}")
+        return {}
 
-@router.get("/dashboard/metrics")
-async def get_dashboard_metrics(session: AsyncSession = Depends(get_db_session)):
-    """
-    Aggregates data for the Main Dashboard UI.
-    - PnL (Realized + Unrealized)
-    - Drawdown
-    - AI Narrative
-    - Active Alerts
-    """
+# ===========================================================================
+# TAB 2: STRATEGIES (Execution)
+# ===========================================================================
+@router.get("/strategies/active")
+async def get_active_strategies(session: AsyncSession = Depends(get_db_session)):
+    """Returns detailed strategy info including raw LEGS."""
     try:
-        # 1. Get Risk State (PnL & Equity)
-        risk_res = await session.execute(
+        res = await session.execute(
+            select(DbStrategy)
+            .where(DbStrategy.status.in_(['OPEN', 'PENDING']))
+            .order_by(DbStrategy.entry_time.desc())
+        )
+        strategies = res.scalars().all()
+        
+        return [{
+            "id": s.id,
+            "type": s.type,
+            "pnl": s.pnl,
+            "status": s.status,
+            "capital_bucket": s.capital_bucket,
+            "entry_time": s.entry_time,
+            # Parse the JSON to give the frontend raw leg details
+            "legs": s.metadata_json.get("legs", []) if s.metadata_json else []
+        } for s in strategies]
+    except Exception as e:
+        logger.error(f"Strategy Fetch Error: {e}")
+        return []
+
+# ===========================================================================
+# TAB 3: RISK DESK (Sheriff)
+# ===========================================================================
+@router.get("/risk/detailed")
+async def get_risk_desk(session: AsyncSession = Depends(get_db_session)):
+    """Returns Drawdown + Atomic Capital Allocation Locks."""
+    try:
+        # 1. Main Risk State
+        r_res = await session.execute(
             select(DbRiskState).order_by(DbRiskState.timestamp.desc()).limit(1)
         )
-        risk = risk_res.scalars().first()
+        risk = r_res.scalars().first()
         
-        # 2. Get Market Context (AI View)
-        ctx_res = await session.execute(
-            select(DbMarketContext).order_by(DbMarketContext.timestamp.desc()).limit(1)
-        )
-        ctx = ctx_res.scalars().first()
+        # 2. Capital Locks
+        c_res = await session.execute(select(DbCapitalUsage))
+        locks = c_res.scalars().all()
         
-        # 3. Get Recent Trades
-        trades_res = await session.execute(
-            select(DbStrategy).order_by(DbStrategy.entry_time.desc()).limit(5)
-        )
-        trades = trades_res.scalars().all()
+        # Sheriff Heartbeat Check
+        sheriff_status = "OFFLINE"
+        if risk:
+             lag = (datetime.utcnow() - risk.sheriff_heartbeat).total_seconds()
+             if lag < 15: sheriff_status = "ONLINE"
 
         return {
-            "risk": {
-                "current_equity": risk.current_equity if risk else 0.0,
-                "sod_equity": risk.sod_equity if risk else 0.0,
-                "drawdown_pct": risk.drawdown_pct if risk else 0.0,
-                "kill_switch": risk.kill_switch_active if risk else False
+            "drawdown": {
+                "current_pct": risk.drawdown_pct if risk else 0.0,
+                "max_limit": 0.03, # 3% Hard Limit
+                "kill_switch": risk.kill_switch_active if risk else False,
+                "sheriff_status": sheriff_status
             },
-            "ai": {
-                "regime": ctx.regime if ctx else "UNKNOWN",
-                "narrative": ctx.ai_narrative if ctx else "Waiting for Analyst...",
-                "is_fresh": ctx.is_fresh if ctx else False,
-                "last_update": ctx.timestamp.isoformat() if ctx else None
-            },
-            "recent_trades": [
-                {
-                    "id": t.id,
-                    "strategy": t.type,
-                    "pnl": t.pnl,
-                    "status": t.status,
-                    "time": t.entry_time.isoformat()
-                } for t in trades
-            ]
+            "capital_locks": [{
+                "bucket": l.bucket,
+                "used": l.used_amount,
+                "updated": l.last_updated
+            } for l in locks]
         }
     except Exception as e:
-        logger.error(f"Dashboard data error: {e}")
-        return {"error": str(e)}
+        logger.error(f"Risk Desk Error: {e}")
+        return {}
 
-# ---------------------------------------------------------------------------
-# Control Endpoints (Writes to DB -> Picked up by Sheriff/Engine)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# TAB 4: SYSTEM (Logs)
+# ===========================================================================
+@router.get("/system/logs")
+async def get_system_logs(lines: int = 100):
+    """Reads the tail of the engine log file."""
+    # Try multiple common paths for Docker vs Local
+    possible_paths = [
+        Path("logs/volguard_engine.log"), 
+        Path("logs/volguard.log"),
+        Path("/var/log/volguard.log")
+    ]
+    
+    log_file = next((p for p in possible_paths if p.exists()), None)
+    
+    if not log_file:
+        return {"logs": ["[WARN] Log file not found in standard paths."]}
+    
+    try:
+        # Simple tail implementation
+        with open(log_file, "r") as f:
+            all_lines = f.readlines()
+            return {"logs": [line.strip() for line in all_lines[-lines:]]}
+    except Exception as e:
+        return {"logs": [f"[ERROR] Could not read logs: {str(e)}"]}
 
+# ===========================================================================
+# TAB 5: JOURNAL
+# ===========================================================================
+@router.get("/journal/entries")
+async def get_journal_entries(session: AsyncSession = Depends(get_db_session)):
+    """Fetch all trading journal entries."""
+    res = await session.execute(
+        select(DbTradeJournal).order_by(desc(DbTradeJournal.date)).limit(50)
+    )
+    return res.scalars().all()
+
+@router.patch("/journal/{trade_id}/note")
+async def update_journal_note(
+    trade_id: str, 
+    note: JournalNoteUpdate, 
+    session: AsyncSession = Depends(get_db_session)
+):
+    """Save manual psychology notes."""
+    res = await session.execute(
+        select(DbTradeJournal).where(DbTradeJournal.id == trade_id)
+    )
+    entry = res.scalars().first()
+    
+    if not entry:
+        raise HTTPException(status_code=404, detail="Trade entry not found")
+    
+    entry.entry_rationale = note.rationale
+    # If you add a 'tags' column to DbTradeJournal later, update it here too
+    # entry.tags = note.tags 
+    
+    await session.commit()
+    return {"status": "success", "message": "Journal updated"}
+
+# ===========================================================================
+# CONTROL: PANIC BUTTON
+# ===========================================================================
 @router.post("/emergency/flatten")
 async def trigger_emergency_flatten(session: AsyncSession = Depends(get_db_session)):
-    """
-    THE PANIC BUTTON.
-    Writes a 'Kill Switch' entry to the DB.
-    The Sheriff (Process 3) picks this up in < 2 seconds and flattens everything.
-    """
+    """THE PANIC BUTTON: Writes Kill Switch to DB."""
     logger.critical("🚨 API RECEIVED EMERGENCY FLATTEN COMMAND 🚨")
     try:
-        # 1. Fetch last state to preserve equity numbers
         last_res = await session.execute(
             select(DbRiskState).order_by(DbRiskState.timestamp.desc()).limit(1)
         )
@@ -146,31 +242,26 @@ async def trigger_emergency_flatten(session: AsyncSession = Depends(get_db_sessi
         sod = last_state.sod_equity if last_state else 0.0
         curr = last_state.current_equity if last_state else 0.0
         
-        # 2. Insert Kill Command
         kill_cmd = DbRiskState(
             timestamp=datetime.utcnow(),
             sheriff_heartbeat=datetime.utcnow(), 
             sod_equity=sod,
             current_equity=curr,
             drawdown_pct=0.0, 
-            kill_switch_active=True, # <--- THE TRIGGER
+            kill_switch_active=True, # <--- TRIGGER
             is_flattening=True
         )
         
         session.add(kill_cmd)
         await session.commit()
-        
-        return {"status": "success", "message": "KILL SWITCH ACTIVATED. Sheriff has been notified."}
-        
+        return {"status": "success", "message": "KILL SWITCH ACTIVATED"}
     except Exception as e:
-        logger.error(f"Failed to trigger kill switch: {e}")
-        raise HTTPException(status_code=500, detail="Failed to write to DB")
+        logger.error(f"Panic Failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to write Panic Command")
 
 @router.post("/emergency/reset")
 async def reset_kill_switch(session: AsyncSession = Depends(get_db_session)):
-    """
-    Disarms the Kill Switch. Use with extreme caution.
-    """
+    """Disarms the Kill Switch."""
     logger.warning("⚠️ API RESETTING KILL SWITCH")
     try:
         last_res = await session.execute(
@@ -192,9 +283,6 @@ async def reset_kill_switch(session: AsyncSession = Depends(get_db_session)):
         
         session.add(reset_cmd)
         await session.commit()
-        
-        return {"status": "success", "message": "Kill Switch Disarmed."}
-        
+        return {"status": "success", "message": "System Disarmed."}
     except Exception as e:
-        logger.error(f"Failed to reset kill switch: {e}")
-        raise HTTPException(status_code=500, detail="Failed to write to DB")
+        raise HTTPException(status_code=500, detail="Failed to Reset")
