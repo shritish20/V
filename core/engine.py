@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 VolGuard 20.0 – Production-Hardened Engine (Fortress Architecture)
+- INTEGRATED: OAuth Token Manager (Auto-Refresh)
+- INTEGRATED: Sheriff PID Control (Graceful Kill)
+- FIXED: Position Reconciliation Race Conditions
 - FIXED: Async loop initialization for Fortress services
-- FIXED: rt_quotes initialization order
 """
 from __future__ import annotations
 
@@ -10,6 +12,8 @@ import asyncio
 import time
 import hashlib
 import logging
+import os
+from pathlib import Path
 from datetime import datetime, time as dtime
 from typing import Dict, List, Optional
 
@@ -22,6 +26,7 @@ from core.models import (
 from database.manager import HybridDatabaseManager
 from database.models import DbStrategy, DbRiskState, DbMarketContext
 from trading.api_client import EnhancedUpstoxAPI, TokenExpiredError
+from trading.token_manager import setup_token_manager  # NEW: Token Manager
 from trading.live_data_feed import LiveDataFeed
 from trading.order_manager import EnhancedOrderManager
 from trading.risk_manager import AdvancedRiskManager
@@ -67,7 +72,9 @@ class VolGuard20Engine:
 
         # --- External Connectors ---
         self.db   = HybridDatabaseManager()
+        # API Client initialized with placeholder, will be updated by TokenManager
         self.api  = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
+        self.token_manager = None  # Will be set in initialize()
 
         # --- Instrument Master ---
         self.instruments_master = InstrumentMaster()
@@ -141,9 +148,25 @@ class VolGuard20Engine:
         logger.info("🚀  Initialising VolGuard-20 Fortress Services …")
         try:
             await self.setup_async_components()
+            
+            # --- NEW: Write PID for Sheriff Control ---
+            try:
+                pid_file = Path("data/engine.pid")
+                pid_file.parent.mkdir(parents=True, exist_ok=True)
+                pid_file.write_text(str(os.getpid()))
+                logger.info(f"📝 Engine PID Registered: {os.getpid()}")
+            except Exception as e:
+                logger.error(f"Failed to write PID file: {e}")
+
+            # --- NEW: Setup Token Manager ---
+            await self.db.init_db()  # Ensure DB is ready before Token Manager
+            self.token_manager = await setup_token_manager(self.db, self.api)
+            # Start background refresh loop
+            asyncio.create_task(self.token_manager.start_refresh_loop())
+            logger.info("🔐 Token Manager Active")
+
             await self.instruments_master.download_and_load()
             await self.data_fetcher.load_all_data()
-            await self.db.init_db()
             await self.om.start()
             await self._restore_from_snapshot()
             await self._reconcile_broker_positions()
@@ -182,7 +205,7 @@ class VolGuard20Engine:
                         await self.shutdown()
                         break
                     await self._sync_market_context()
-                    await self.api.check_token_validity()
+                    # Removed api.check_token_validity() as TokenManager handles this now
                     self.last_safety_check = tick
                 
                 if tick - self.last_reconcile > RECONCILE_INT:
@@ -217,8 +240,11 @@ class VolGuard20Engine:
                 
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
             except TokenExpiredError:
-                logger.error("🔑 Token Expired – Pausing 10s")
-                await asyncio.sleep(10)
+                logger.error("🔑 Token Expired – Triggering Manager Refresh")
+                # TokenManager loop will handle this, but we force a check
+                if self.token_manager:
+                    await self.token_manager.get_current_token()
+                await asyncio.sleep(5)
             except EngineCircuitBreaker:
                 logger.critical("❌ Circuit Breaker Open – Shutting Down")
                 await self.shutdown()
@@ -234,6 +260,14 @@ class VolGuard20Engine:
     async def shutdown(self) -> None:
         logger.info("🛑  Shutdown Started")
         self.running = False
+        if self.token_manager:
+            await self.token_manager.stop()
+        
+        # Remove PID file
+        try:
+            Path("data/engine.pid").unlink(missing_ok=True)
+        except Exception: pass
+        
         await self._emergency_flatten()
         await self._save_snapshot()
         await self.api.close()
@@ -366,23 +400,44 @@ class VolGuard20Engine:
         except Exception: logger.exception("Restore Failed")
 
     async def _reconcile_broker_positions(self) -> None:
+        """
+        HARDENED: Race-condition proof reconciliation.
+        """
         try:
-            broker_positions = await self.api.get_short_term_positions()
-            if not broker_positions: return
-            broker_map = {p["instrument_token"]: int(p["quantity"]) for p in broker_positions if int(p["quantity"]) != 0}
-            internal_map = {}
+            # FIX: Lock BEFORE fetching broker positions
+            # This prevents us from adopting a position that belongs to a pending trade
             async with self._trade_lock:
+                broker_positions = await self.api.get_short_term_positions()
+                if not broker_positions: return
+                
+                broker_map = {}
+                for p in broker_positions:
+                    qty = int(p.get("quantity", 0))
+                    if qty != 0:
+                        broker_map[p["instrument_token"]] = qty
+                
+                internal_map = {}
                 for trade in self.trades:
                     if trade.status == TradeStatus.OPEN:
                         for leg in trade.legs:
                             internal_map[leg.instrument_key] = internal_map.get(leg.instrument_key, 0) + leg.quantity
-            for token, b_qty in broker_map.items():
-                if b_qty != internal_map.get(token, 0) and internal_map.get(token, 0) == 0:
-                    await self._adopt_zombie(token, b_qty)
+                
+                # Check for zombies
+                for token, b_qty in broker_map.items():
+                    internal_qty = internal_map.get(token, 0)
+                    if b_qty != internal_qty:
+                        # Only adopt if we have ZERO record of it
+                        if internal_qty == 0:
+                            logger.critical(f"🧟 ZOMBIE FOUND: {token} (Qty: {b_qty}) - Adopting...")
+                            await self._adopt_zombie(token, b_qty)
+                        else:
+                            logger.error(f"⚠️ Quantity Mismatch for {token}: Broker {b_qty} vs Internal {internal_qty}")
+
         except Exception: logger.exception("Reconciliation Failed")
 
     async def _adopt_zombie(self, token: str, qty: int) -> None:
-        logger.critical(f"Adopting Zombie Position: {token}")
+        # Note: _trade_lock is already held by the caller (_reconcile_broker_positions)
+        # So we don't need to lock again here.
         price = self.rt_quotes.get(token, 1.0)
         dummy = Position(symbol=settings.UNDERLYING_SYMBOL, instrument_key=token, strike=0.0, option_type="CE",
                         quantity=qty, entry_price=price, entry_time=datetime.now(IST), current_price=price,
@@ -391,7 +446,7 @@ class VolGuard20Engine:
         trade = MultiLegTrade(legs=[dummy], strategy_type=StrategyType.WAIT, entry_time=datetime.now(IST),
                              expiry_date=datetime.now(IST).strftime("%Y-%m-%d"), status=TradeStatus.EXTERNAL,
                              id=f"ZOMBIE-{int(time.time()*1000)}", capital_bucket=CapitalBucket.INTRADAY, expiry_type=ExpiryType.INTRADAY)
-        async with self._trade_lock: self.trades.append(trade)
+        self.trades.append(trade)
         self.data_feed.subscribe_instrument(token)
 
     async def _emergency_flatten(self) -> None:
