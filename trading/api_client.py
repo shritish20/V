@@ -2,8 +2,9 @@
 """
 EnhancedUpstoxAPI 20.0 – V3 Production Hardened (Fortress Edition)
 - MIGRATED: All Market Data and Order calls to V3 Endpoints.
-- NO RECURSION: Validity checks are isolated from main request logic.
+- SMART RETRY: Retries on 401 only if token was just updated.
 - Hard 5-second timeout per call.
+- Margin sanity check.
 """
 from __future__ import annotations
 
@@ -65,7 +66,7 @@ class EnhancedUpstoxAPI:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            "Api-Version": "2.0", # Required by Upstox for V3 transitions
+            "Api-Version": "2.0",
         }
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
@@ -83,10 +84,9 @@ class EnhancedUpstoxAPI:
             if self._session and not self._session.closed:
                 await self._session.close()
                 self._session = None
-        logger.info("🔄 API Client Token Rotated Successfully (V3 Ready)")
+        logger.info("🔄 API Client Token Rotated Successfully (V3 Handshake Ready)")
 
     async def check_token_validity(self) -> bool:
-        """ISOLATED PROBE: Uses Profile V2 (stable) to check token status."""
         url = "https://api.upstox.com/v2/user/profile"
         try:
             async with aiohttp.ClientSession(headers=self._headers) as temp_session:
@@ -99,10 +99,6 @@ class EnhancedUpstoxAPI:
             return True
 
     async def get_v3_market_data_authorize(self) -> Dict[str, Any]:
-        """
-        CRITICAL V3 HANDSHAKE:
-        Retrieves the designated socket endpoint URI for Market updates.
-        """
         url = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
         return await self._request("GET", dynamic_url=url)
 
@@ -111,9 +107,6 @@ class EnhancedUpstoxAPI:
             if self._session and not self._session.closed:
                 await self._session.close()
 
-    # ---------------------------------------------------------------------
-    # Low-Level Request (Hardened)
-    # ---------------------------------------------------------------------
     async def _request(
         self,
         method: str,
@@ -124,14 +117,10 @@ class EnhancedUpstoxAPI:
         json_data: Optional[Dict] = None,
         retry: int = 3,
     ) -> Dict[str, Any]:
-        
-        # Determine URL - prioritizing V3 routes where possible
         if dynamic_url:
             url = dynamic_url
         else:
-            # Fallback to config endpoints, ensure we check for V3 mappings
-            path = UPSTOX_API_ENDPOINTS.get(endpoint_key, "")
-            url = f"https://api.upstox.com{path}"
+            url = "https://api.upstox.com" + UPSTOX_API_ENDPOINTS.get(endpoint_key, "")
 
         request_start_time = time.time()
 
@@ -157,8 +146,7 @@ class EnhancedUpstoxAPI:
 
                     if resp.status == 401:
                         if self._token_last_updated > request_start_time:
-                            logger.info("⚠️ 401 received, token rotated during flight. Retrying...")
-                            continue
+                            continue 
                         raise TokenExpiredError("Access Token Invalid")
 
                     if resp.status in (429, 503):
@@ -174,7 +162,7 @@ class EnhancedUpstoxAPI:
                     return {"status": "error", "message": str(exc)}
                 await asyncio.sleep(1)
 
-        return {"status": "error", "message": "Max retries reached"}
+        return {"status": "error", "message": "Max retries"}
 
     async def _get_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
@@ -190,7 +178,7 @@ class EnhancedUpstoxAPI:
                 segment = fund_data.get("SEC", fund_data)
                 avail = float(segment.get("available_margin", 0.0))
                 if avail <= 0:
-                    raise MarginInsaneError(f"Available margin {avail} – HALT TRADING")
+                    raise MarginInsaneError(f"Available margin {avail} – HALT")
         except MarginInsaneError:
             raise
         except:
@@ -198,23 +186,15 @@ class EnhancedUpstoxAPI:
 
     @staticmethod
     def _redact(text: str) -> str:
-        patterns = [
-            (r"Bearer\s+[a-zA-Z0-9\-._]+", "Bearer [REDACTED]"),
-            (r'"access_token"\s*:\s*"[^"]+"', '"access_token":"[REDACTED]"'),
-            (r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', "[JWT_REDACTED]"),
-        ]
+        patterns = [(r"Bearer\s+[a-zA-Z0-9\-._]+", "Bearer [REDACTED]"), (r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', "[JWT_REDACTED]")]
         for pat, repl in patterns:
             text = re.sub(pat, repl, text, flags=re.IGNORECASE)
         return text
 
-    # -------------------------------------------------------------------------
-    # High-level Helpers (V3 Order Execution)
-    # -------------------------------------------------------------------------
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
             return True, f"SIM-{int(time.time() * 1_000)}"
 
-        # Using HFT/V3 Optimized endpoint
         url = "https://api-hft.upstox.com/v3/order/place"
         payload = {
             "quantity": abs(order.quantity),
@@ -234,23 +214,14 @@ class EnhancedUpstoxAPI:
             return True, res["data"]["order_ids"][0]
         return False, None
 
+    async def get_short_term_positions(self) -> List[Dict[str, Any]]:
+        res = await self._request("GET", "positions")
+        return res.get("data", []) if res.get("status") == "success" else []
+
+    async def get_funds_and_margin(self) -> Dict[str, Any]:
+        return await self._request("GET", "funds_margin")
+
     async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict[str, Any]:
         encoded = quote(instrument_key)
-        # Migrated to V3 Candle API
         url = f"https://api.upstox.com/v3/historical-candle/{encoded}/{interval}/{to_date}/{from_date}"
         return await self._request("GET", dynamic_url=url)
-
-    async def get_intraday_candles(self, instrument_key: str, interval: str) -> Dict[str, Any]:
-        encoded = quote(instrument_key)
-        # Migrated to V3 Intraday API
-        url = f"https://api.upstox.com/v3/historical-candle/intraday/{encoded}/{interval}"
-        return await self._request("GET", dynamic_url=url)
-
-    async def get_market_quote_ohlc(self, instrument_key: str, interval: str) -> Dict[str, Any]:
-        # Upstox V3 Market Quote OHLC
-        url = "https://api.upstox.com/v3/market-quote/ohlc"
-        return await self._request(
-            "GET",
-            dynamic_url=url,
-            params={"instrument_key": instrument_key, "interval": interval},
-        )
