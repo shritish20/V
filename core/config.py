@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Configuration (Hardened & Test-Ready)
-- Corrected Variable Names for Integration
-- Default Values for Safe Testing
+VolGuard 20.0 – Configuration (Hardened & Integrated)
+- FIXED: Added UPSTOX_API_KEY and UPSTOX_API_SECRET to Settings class
+- FIXED: Set POSTGRES_SERVER default to 'db' for Docker networking
+- Corrected Variable Names for Pydantic Settings integration
 """
 from __future__ import annotations
 
@@ -19,30 +20,24 @@ from pydantic_core import MultiHostUrl
 # Upstox route map
 # ---------------------------------------------------------------------------
 UPSTOX_API_ENDPOINTS: Dict[str, str] = {
-    # Auth
     "authorization_token": "/v2/login/authorization/token",
-    # Orders
     "place_order": "/v2/order/place",
     "place_multi_order": "/v2/order/multi/place",
     "modify_order": "/v2/order/modify",
     "cancel_order": "/v2/order/cancel",
     "order_details": "/v2/order/details",
     "retrieve_orders": "/v2/order/retrieve-all",
-    # GTT (V3)
     "place_gtt": "/v3/order/gtt/place",
     "modify_gtt": "/v3/order/gtt/modify",
     "cancel_gtt": "/v3/order/gtt/cancel",
     "gtt_details": "/v3/order/gtt",
-    # Market Data
     "market_quote": "/v2/market-quote/quotes",
     "market_quote_ohlc": "/v2/market-quote/ohlc",
     "option_chain": "/v2/option/chain",
     "option_greek": "/v3/market-quote/option-greek",
-    # Funds & Portfolio
     "funds_margin": "/v2/user/get-funds-and-margin",
     "positions": "/v2/portfolio/short-term-positions",
     "margin_calc": "/v2/charges/margin",
-    # Accounting & Holidays
     "profit_loss_charges": "/v2/trade/profit-loss/charges",
     "holidays": "/v2/market/holidays",
 }
@@ -57,7 +52,7 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Generic
     # ---------------------------------------------------------------------
-    ENV: str = Field(default="production") # validation_alias="ENV" in v2
+    ENV: str = Field(default="production")
     PORT: int = Field(default=8000)
     IST: Any = pytz.timezone("Asia/Kolkata")
 
@@ -70,7 +65,8 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Database
     # ---------------------------------------------------------------------
-    POSTGRES_SERVER: str = Field(default="localhost")
+    # Default changed to 'db' for Docker internal networking
+    POSTGRES_SERVER: str = Field(default="db")
     POSTGRES_USER: str = Field(default="volguard_user")
     POSTGRES_PASSWORD: str = Field(default="secure_trading_password")
     POSTGRES_DB: str = Field(default="volguard_db")
@@ -91,9 +87,12 @@ class Settings(BaseSettings):
         )
 
     # ---------------------------------------------------------------------
-    # Broker
+    # Broker (FIXED: Added missing keys for TokenManager)
     # ---------------------------------------------------------------------
+    UPSTOX_API_KEY: str = Field(default="")
+    UPSTOX_API_SECRET: str = Field(default="")
     UPSTOX_ACCESS_TOKEN: str = Field(default="")
+    REDIRECT_URI: str = Field(default="http://localhost:8000/callback")
     API_BASE_URL: str = "https://api-v2.upstox.com"
 
     # ---------------------------------------------------------------------
@@ -110,10 +109,7 @@ class Settings(BaseSettings):
     # ---------------------------------------------------------------------
     # Capital
     # ---------------------------------------------------------------------
-    # RENAMED from ACCOUNT_SIZE_FALLBACK to ACCOUNT_SIZE to fix AttributeError
     ACCOUNT_SIZE: float = Field(default=2_000_000.0)
-
-    # Refresh interval seconds
     MARGIN_REFRESH_SEC: int = Field(default=30)
 
     # ---------------------------------------------------------------------
