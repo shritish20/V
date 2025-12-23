@@ -1,5 +1,7 @@
 import asyncio
 from copy import deepcopy
+from typing import Optional
+
 from core.models import MultiLegTrade
 from core.enums import TradeStatus, ExitReason, StrategyType
 from core.config import settings
@@ -10,6 +12,12 @@ from trading.margin_guard import MarginGuard
 logger = setup_logger("TradeMgr")
 
 class EnhancedTradeManager:
+    """
+    Orchestrates trade lifecycle, execution, and risk checks.
+    - Uses LiveOrderExecutor for safe execution (Hedge First).
+    - Uses MarginGuard (DB-Aware) for safety.
+    - Handles Capital Allocation locking.
+    """
     def __init__(self, api, db, om, pricing, risk, alerts, capital):
         self.api = api
         self.db = db
@@ -19,17 +27,23 @@ class EnhancedTradeManager:
         self.capital = capital
         self.feed = None
         
-        # FIX 1: Pass BOTH API and OrderManager
+        # --- COMPONENT LINKING ---
         self.executor = LiveOrderExecutor(self.api, self.om)
-        self.margin_guard = MarginGuard(self.api)
+        
+        # CRITICAL FIX: Pass DB to MarginGuard so it can run Sanity Checks
+        self.margin_guard = MarginGuard(self.api, self.db)
 
     async def execute_strategy(self, trade: MultiLegTrade) -> bool:
+        """
+        Validates and executes a new strategy.
+        Flow: Pre-Trade Risk -> Margin Check -> Capital Lock -> Execution
+        """
         # 1. Pre-Trade Risk
         if not self.risk.check_pre_trade(trade):
             logger.warning(f"🚫 Risk Check Failed: {trade.id}")
             return False
 
-        # 2. Margin Check
+        # 2. Margin Check (Now DB-Aware)
         current_vix = None
         if self.feed and hasattr(self.feed, 'rt_quotes'):
             current_vix = self.feed.rt_quotes.get(settings.MARKET_KEY_VIX)
@@ -39,7 +53,7 @@ class EnhancedTradeManager:
             logger.warning(f"🚫 Margin Block: Req {margin_req:,.0f} > Avail")
             return False
 
-        # 3. Allocate Capital (Locks DB Row)
+        # 3. Allocate Capital (Locks DB Row via Allocator)
         val = sum(abs(l.entry_price * l.quantity) for l in trade.legs)
         if not await self.capital.allocate_capital(trade.capital_bucket.value, val, trade.id):
             logger.warning(f"🚫 Capital Lock Failed: {trade.id}")
@@ -48,7 +62,6 @@ class EnhancedTradeManager:
         # 4. Execute (Using Hardened Executor)
         logger.info(f"🚀 Executing {trade.strategy_type.value} | ID: {trade.id}")
         
-        # FIX 2: Use correct method and unpack tuple result
         success, msg = await self.executor.execute_with_hedge_priority(trade)
 
         if success:
@@ -56,24 +69,25 @@ class EnhancedTradeManager:
             logger.info(f"✅ Trade {trade.id} OPENED ({msg})")
             return True
         else:
-            # Release capital on failure
+            # Release capital on failure (Rollback)
             await self.capital.release_capital(trade.capital_bucket.value, trade.id, amount=val)
             logger.error(f"❌ Execution Failed {trade.id}: {msg}")
             return False
 
     async def close_trade(self, trade: MultiLegTrade, reason: ExitReason):
+        """
+        Closes an open trade safely.
+        """
         logger.info(f"🔐 Closing Trade {trade.id} | Reason: {reason.value}")
         close_obj = deepcopy(trade)
         
-        # Reverse positions for closing
+        # Reverse positions for closing (Buy -> Sell, Sell -> Buy)
         for leg in close_obj.legs:
             leg.quantity = leg.quantity * -1 
-            # Note: LiveOrderExecutor will fetch fresh prices for Limits
+            # Note: Executor will re-fetch prices, so old prices here don't matter much.
             
-        # FIX 3: Re-use Hardened Executor for Closing
-        # This is safe because 'execute_with_hedge_priority' splits by quantity.
-        # When closing a short, we Buy (+Qty), so it treats the Buy-back as a Hedge (Priority 1).
-        # This correctly prioritizes buying back shorts before selling longs.
+        # Re-use Hardened Executor
+        # It handles 'Buy' legs first (Short Covering) automatically due to Hedge Priority logic
         success, msg = await self.executor.execute_with_hedge_priority(close_obj)
         
         if success:
@@ -88,18 +102,23 @@ class EnhancedTradeManager:
             logger.critical(f"⚠️ Trade {trade.id} Close Failed: {msg} - MANUAL INTERVENTION REQD")
 
     async def update_trade_prices(self, trade: MultiLegTrade, spot: float, quotes: dict):
+        """Updates internal state with live market data."""
         updated = False
         for leg in trade.legs:
             if leg.instrument_key in quotes:
                 if leg.current_price != quotes[leg.instrument_key]:
                     leg.current_price = quotes[leg.instrument_key]
                     updated = True
-        if updated:
-            # Assuming models.py has this method, otherwise skip
-            if hasattr(trade, 'calculate_trade_greeks'):
+        
+        # If prices changed, recalculate Greeks (if model available)
+        if updated and hasattr(trade, 'calculate_trade_greeks'):
+            try:
                 trade.calculate_trade_greeks()
+            except Exception:
+                pass
 
     async def monitor_active_trades(self, trades):
+        """Checks PnL limits for active trades."""
         for trade in trades:
             if trade.status != TradeStatus.OPEN: continue
             
@@ -118,9 +137,12 @@ class EnhancedTradeManager:
                 await self.close_trade(trade, ExitReason.STOP_LOSS)
 
     def _calculate_basis(self, trade: MultiLegTrade) -> float:
-        # Simplified Margin Basis for PnL % Calc
+        """
+        Estimates deployed margin for PnL % calculation.
+        Used only for logging/display, not for safety checks.
+        """
         if trade.strategy_type in [StrategyType.SHORT_STRANGLE, StrategyType.RATIO_SPREAD_PUT]:
             return 150000.0 * trade.lots
         elif trade.strategy_type == StrategyType.JADE_LIZARD:
             return 120000.0 * trade.lots
-        return 60000.0 * trade.lots 
+        return 60000.0 * trade.lots
