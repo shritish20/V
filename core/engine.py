@@ -3,7 +3,7 @@
 VolGuard 20.0 – Production-Hardened Engine (Fortress Architecture)
 - INTEGRATED: OAuth Token Manager (Auto-Refresh)
 - INTEGRATED: Sheriff PID Control (Graceful Kill)
-- FIXED: Position Reconciliation Race Conditions
+- FIXED: Position Reconciliation Race Conditions (Includes PENDING status)
 - FIXED: Async loop initialization for Fortress services
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ from core.models import (
 from database.manager import HybridDatabaseManager
 from database.models import DbStrategy, DbRiskState, DbMarketContext
 from trading.api_client import EnhancedUpstoxAPI, TokenExpiredError
-from trading.token_manager import setup_token_manager  # NEW: Token Manager
+from trading.token_manager import setup_token_manager
 from trading.live_data_feed import LiveDataFeed
 from trading.order_manager import EnhancedOrderManager
 from trading.risk_manager import AdvancedRiskManager
@@ -72,9 +72,8 @@ class VolGuard20Engine:
 
         # --- External Connectors ---
         self.db   = HybridDatabaseManager()
-        # API Client initialized with placeholder, will be updated by TokenManager
         self.api  = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
-        self.token_manager = None  # Will be set in initialize()
+        self.token_manager = None
 
         # --- Instrument Master ---
         self.instruments_master = InstrumentMaster()
@@ -84,6 +83,7 @@ class VolGuard20Engine:
         self.sabr    = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
         self.pricing.set_api(self.api)
+        # CRITICAL FIX: Link Master to Pricing Engine
         self.pricing.instrument_master = self.instruments_master
 
         # --- Analytics ---
@@ -149,7 +149,7 @@ class VolGuard20Engine:
         try:
             await self.setup_async_components()
             
-            # --- NEW: Write PID for Sheriff Control ---
+            # --- Write PID for Sheriff Control ---
             try:
                 pid_file = Path("data/engine.pid")
                 pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -158,10 +158,9 @@ class VolGuard20Engine:
             except Exception as e:
                 logger.error(f"Failed to write PID file: {e}")
 
-            # --- NEW: Setup Token Manager ---
-            await self.db.init_db()  # Ensure DB is ready before Token Manager
+            # --- Setup Token Manager ---
+            await self.db.init_db()
             self.token_manager = await setup_token_manager(self.db, self.api)
-            # Start background refresh loop
             asyncio.create_task(self.token_manager.start_refresh_loop())
             logger.info("🔐 Token Manager Active")
 
@@ -169,6 +168,8 @@ class VolGuard20Engine:
             await self.data_fetcher.load_all_data()
             await self.om.start()
             await self._restore_from_snapshot()
+            
+            # Startup Cleanup: Check for open positions and sync immediately
             await self._reconcile_broker_positions()
             
             self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
@@ -205,7 +206,6 @@ class VolGuard20Engine:
                         await self.shutdown()
                         break
                     await self._sync_market_context()
-                    # Removed api.check_token_validity() as TokenManager handles this now
                     self.last_safety_check = tick
                 
                 if tick - self.last_reconcile > RECONCILE_INT:
@@ -241,7 +241,6 @@ class VolGuard20Engine:
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
             except TokenExpiredError:
                 logger.error("🔑 Token Expired – Triggering Manager Refresh")
-                # TokenManager loop will handle this, but we force a check
                 if self.token_manager:
                     await self.token_manager.get_current_token()
                 await asyncio.sleep(5)
@@ -263,7 +262,6 @@ class VolGuard20Engine:
         if self.token_manager:
             await self.token_manager.stop()
         
-        # Remove PID file
         try:
             Path("data/engine.pid").unlink(missing_ok=True)
         except Exception: pass
@@ -401,11 +399,10 @@ class VolGuard20Engine:
 
     async def _reconcile_broker_positions(self) -> None:
         """
-        HARDENED: Race-condition proof reconciliation.
+        HARDENED v3.0: Checks PENDING status to prevent duplicate zombies.
         """
         try:
-            # FIX: Lock BEFORE fetching broker positions
-            # This prevents us from adopting a position that belongs to a pending trade
+            # Lock BEFORE fetch to ensure state consistency
             async with self._trade_lock:
                 broker_positions = await self.api.get_short_term_positions()
                 if not broker_positions: return
@@ -418,7 +415,8 @@ class VolGuard20Engine:
                 
                 internal_map = {}
                 for trade in self.trades:
-                    if trade.status == TradeStatus.OPEN:
+                    # PATCH: Include PENDING trades so we don't adopt their positions as zombies
+                    if trade.status in (TradeStatus.OPEN, TradeStatus.PENDING):
                         for leg in trade.legs:
                             internal_map[leg.instrument_key] = internal_map.get(leg.instrument_key, 0) + leg.quantity
                 
@@ -426,18 +424,17 @@ class VolGuard20Engine:
                 for token, b_qty in broker_map.items():
                     internal_qty = internal_map.get(token, 0)
                     if b_qty != internal_qty:
-                        # Only adopt if we have ZERO record of it
                         if internal_qty == 0:
                             logger.critical(f"🧟 ZOMBIE FOUND: {token} (Qty: {b_qty}) - Adopting...")
                             await self._adopt_zombie(token, b_qty)
                         else:
-                            logger.error(f"⚠️ Quantity Mismatch for {token}: Broker {b_qty} vs Internal {internal_qty}")
+                            # Just warn, don't auto-fix partial fills yet
+                            logger.error(f"⚠️ Mismatch: {token} (Broker {b_qty} vs Internal {internal_qty})")
 
         except Exception: logger.exception("Reconciliation Failed")
 
     async def _adopt_zombie(self, token: str, qty: int) -> None:
-        # Note: _trade_lock is already held by the caller (_reconcile_broker_positions)
-        # So we don't need to lock again here.
+        # No lock needed (already held by caller)
         price = self.rt_quotes.get(token, 1.0)
         dummy = Position(symbol=settings.UNDERLYING_SYMBOL, instrument_key=token, strike=0.0, option_type="CE",
                         quantity=qty, entry_price=price, entry_time=datetime.now(IST), current_price=price,
