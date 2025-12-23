@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Dict, Any, Union
-from datetime import datetime
+from datetime import datetime, time
 import aiohttp
 from core.config import settings, IST
 from analytics.sabr_model import EnhancedSABRModel
@@ -12,16 +12,15 @@ logger = logging.getLogger("GreekValidator")
 class GreekValidator:
     """
     HARDENED v4.0:
-    Now includes Confidence Scoring to prevent "Silent Risk".
-    Calculates a trust score (0.0 - 1.0) based on divergence between
-    Broker data and SABR model.
+    - Confidence Scoring with Morning Grace Period (09:15-09:30).
+    - Prevents false positives during market open volatility.
     """
     def __init__(self, validated_cache: Dict[str, dict], sabr_model: EnhancedSABRModel, refresh_sec: int = 15):
         self.cache = validated_cache
         self.sabr = sabr_model
         self.refresh_sec = refresh_sec
         
-        # Tolerance thresholds for confidence penalty
+        # Base Tolerance thresholds
         self.tolerance_map = {
             'delta': 8.0,
             'gamma': 15.0,
@@ -86,7 +85,7 @@ class GreekValidator:
                 
                 sabr = sabr_data.get(key)
                 
-                # Fallback if SABR unavailable (Score = 0.5 default for unverified)
+                # Fallback if SABR unavailable
                 if not sabr:
                     sanitized_broker = {}
                     for g in ("delta", "theta", "gamma", "vega", "iv"):
@@ -96,7 +95,7 @@ class GreekValidator:
                     self.cache[key] = sanitized_broker
                     continue
 
-                # HARDENED: Calculate Confidence Score
+                # Calculate Confidence Score
                 trusted = self._smart_greek_selection(key, broker, sabr)
                 trusted["timestamp"] = datetime.now(IST)
                 self.cache[key] = trusted
@@ -109,14 +108,19 @@ class GreekValidator:
         option_meta = self._get_option_metadata(instrument_key)
         liquidity_level = self._assess_liquidity(broker, option_meta)
         
+        # --- MORNING GRACE PERIOD LOGIC ---
+        now = datetime.now(IST).time()
+        is_morning = time(9, 15) <= now <= time(9, 30)
+        tolerance_multiplier = 2.0 if is_morning else 1.0
+        
         trusted = {}
         divergence_penalty = 0.0
-        checks_count = 0
 
         for g in ("delta", "theta", "gamma", "vega", "iv"):
             b = self._safe_float(broker.get(g))
             s = self._safe_float(sabr.get(g))
-            tolerance = self.tolerance_map.get(g, 15.0)
+            base_tol = self.tolerance_map.get(g, 15.0)
+            tolerance = base_tol * tolerance_multiplier
             
             denom = max(abs(s), 1e-6)
             disc = abs(b - s) * 100 / denom
@@ -126,7 +130,6 @@ class GreekValidator:
                 divergence_penalty += 0.2  # Heavy penalty
             elif disc > tolerance:
                 divergence_penalty += 0.1  # Moderate penalty
-            checks_count += 1
 
             # Selection Logic
             if liquidity_level == "HIGH":
@@ -139,15 +142,16 @@ class GreekValidator:
                 else:
                     trusted[g] = (0.6 * b) + (0.4 * s)
 
-        # Calculate Final Confidence Score (1.0 = Perfect, 0.0 = Untrustworthy)
+        # Calculate Final Confidence Score
         base_confidence = 1.0
         if liquidity_level == "LOW":
-            base_confidence = 0.8  # Illiquid is inherently riskier
+            base_confidence = 0.8
             
         final_score = max(0.0, base_confidence - divergence_penalty)
         trusted["confidence_score"] = round(final_score, 2)
 
-        if final_score < 0.5:
+        # Only warn if it's NOT morning (morning warnings are spam)
+        if final_score < 0.5 and not is_morning:
             logger.warning(f"⚠️ Low Greek Confidence ({final_score}) for {instrument_key}")
 
         return trusted
@@ -177,10 +181,6 @@ class GreekValidator:
             spread_pct = ((ask - bid) / bid) * 100
             if spread_pct > self.liquidity_thresholds['max_spread_pct']:
                 return "LOW"
-        
-        moneyness = option_meta.get('moneyness', 'UNKNOWN')
-        if moneyness == 'ATM': return "HIGH"
-        elif moneyness in ['DEEP_OTM', 'DEEP_ITM']: return "LOW"
         
         return "MEDIUM"
 
@@ -216,6 +216,7 @@ class GreekValidator:
         engine = HybridPricingEngine(self.sabr)
         out = {}
         # In production this should be passed in or fetched from rt_quotes
+        # Using a fallback here, but Engine updates cache with real spot
         spot = 25000.0 
         
         for key in keys:
