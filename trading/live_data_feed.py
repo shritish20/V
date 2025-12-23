@@ -14,7 +14,9 @@ logger = logging.getLogger("LiveFeed")
 
 class LiveDataFeed:
     """
-    HARDENED: Includes 'WebSocket Death Spiral' Prevention.
+    HARDENED v2.0: 
+    - Relaxed Circuit Breaker (15 errors / 30s lockout).
+    - Prevents getting banned during 9:15 AM connection storms.
     """
     def __init__(self, rt_quotes: Dict[str, float], greeks_cache: Dict, sabr_model):
         self.rt_quotes = rt_quotes
@@ -36,11 +38,11 @@ class LiveDataFeed:
         self._restart_lock = asyncio.Lock()
         self._thread_starting = False
         self._reconnect_attempts = 0
-        self._max_backoff = 300
+        self._max_backoff = 60 # Cap backoff at 1 min (was 300)
         
-        # HARDENING: Circuit Breaker State
+        # HARDENING: Relaxed Circuit Breaker State
         self._consecutive_errors = 0
-        self._max_consecutive_errors = 5
+        self._max_consecutive_errors = 15  # Increased from 5 to 15
         self._circuit_breaker_active = False
         self._circuit_breaker_until = 0
 
@@ -96,14 +98,14 @@ class LiveDataFeed:
         
         self.is_connected = False
         
-        # CIRCUIT BREAKER LOGIC
+        # RELAXED CIRCUIT BREAKER
         if self._consecutive_errors >= self._max_consecutive_errors:
             logger.critical(
-                f"❌ WebSocket failed {self._consecutive_errors} times consecutive. "
-                "Pausing for 5 minutes (CIRCUIT BREAKER ACTIVATED)."
+                f"❌ WebSocket failed {self._consecutive_errors} times consecutively. "
+                "Pausing for 30 seconds (Short Circuit Breaker)."
             )
             self._circuit_breaker_active = True
-            self._circuit_breaker_until = time.time() + 300
+            self._circuit_breaker_until = time.time() + 30 # Reduced from 300s to 30s
             self.disconnect()
 
     def _on_close(self, code, reason, *args):
