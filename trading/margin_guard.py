@@ -15,11 +15,10 @@ logger = setup_logger("MarginGuard")
 
 class MarginGuard:
     """
-    FORTRESS EDITION v3.0:
+    FORTRESS EDITION v3.1:
+    - Fixed Sanity Check Math (Per-Lot Comparison).
     - VIX-aware fallback with historical sanity checks.
-    - Records real margin data to DB for future safety.
-    - Handles Upstox Maintenance Mode (Error 423) gracefully.
-    - Prevents under-estimation during black swan events.
+    - Records real margin data to DB.
     """
     
     def __init__(self, api_client: EnhancedUpstoxAPI, db_manager: Optional[HybridDatabaseManager] = None): 
@@ -28,7 +27,7 @@ class MarginGuard:
         self.available_margin = None 
         self.default_vix_safety = 25.0
         
-        # ENHANCED: NSE margin lookup table (Hard floors per lot)
+        # Hard floors per lot
         self.nse_margin_table = {
             "IRON_CONDOR": 55000,
             "IRON_FLY": 52000,
@@ -113,7 +112,7 @@ class MarginGuard:
             margin_data = res_margin.get("data", {})
             required_margin = margin_data.get("required_margin", 0.0)
 
-            # --- NEW: Record Real Margin to DB for future Sanity Checks ---
+            # Record history
             if self.db and required_margin > 0:
                 try:
                     asyncio.create_task(self._record_margin_history(trade, required_margin, current_vix))
@@ -141,7 +140,6 @@ class MarginGuard:
                 )
                 logger.warning(f"Using estimated available funds: ₹{available:,.0f}")
 
-            # Step 4: Validation with buffer
             required_with_buffer = required_margin * 1.10  # 10% safety buffer
             is_sufficient = available >= required_with_buffer
 
@@ -178,38 +176,37 @@ class MarginGuard:
             elif vix < 30: vix_multiplier = 1.40
             else: vix_multiplier = 1.75
 
-            # Step 3: Calculate per-lot margin
-            per_lot_margin = base_margin * vix_multiplier
-            
-            # Step 4: Total margin for all legs
+            # Step 3: Calculate Total Estimate
             total_lots = max(1, abs(trade.legs[0].quantity) // settings.LOT_SIZE)
-            estimated_margin = per_lot_margin * total_lots
+            per_lot_estimate = base_margin * vix_multiplier
+            estimated_margin = per_lot_estimate * total_lots
             
-            # Step 5: Exchange buffer
+            # Step 4: Exchange buffer
             exchange_buffer = 1.30
             fallback_final = estimated_margin * exchange_buffer
             
-            # --- NEW: SANITY CHECK vs DB ---
-            # Compare against the last REAL margin we successfully got from Upstox
+            # --- PATCH: NORMALIZED SANITY CHECK vs DB ---
             if self.db:
-                last_real = await self._get_last_real_margin(strategy_name)
-                if last_real and last_real > 0:
-                    # Normalize last_real to current lot size
-                    # (Simplified: assumes last_real was for 1 lot, scales up)
-                    # Ideally, store margin-per-lot in DB. 
-                    # Here we use a conservative 50% check.
-                    if fallback_final < (last_real * total_lots * 0.5):
+                last_real_per_lot = await self._get_last_real_margin(strategy_name)
+                
+                if last_real_per_lot and last_real_per_lot > 0:
+                    # Calculate per-lot fallback for fair comparison
+                    fallback_per_lot = fallback_final / total_lots
+                    
+                    # If our fallback is < 70% of historical real margin, we are under-estimating
+                    if fallback_per_lot < (last_real_per_lot * 0.7):
                         logger.critical(
                             f"🚨 FALLBACK SANITY CHECK FAILED: "
-                            f"Calc=₹{fallback_final:,.0f} vs Hist=₹{last_real*total_lots:,.0f}"
+                            f"Calc/Lot=₹{fallback_per_lot:,.0f} vs "
+                            f"Hist/Lot=₹{last_real_per_lot:,.0f}"
                         )
-                        fallback_final = last_real * total_lots * 1.2  # Use history + 20%
+                        # Correct using historical + 20% safety
+                        fallback_final = (last_real_per_lot * 1.2) * total_lots
 
-            # Step 6: Absolute floor
-            absolute_floor = 100000 * total_lots # Never assume less than 1L/lot for complex strats
+            # Step 5: Absolute floor
+            absolute_floor = 100000 * total_lots
             final_margin = max(fallback_final, absolute_floor)
 
-            # Step 7: Check availability
             available = self.available_margin if self.available_margin else (
                 settings.ACCOUNT_SIZE * 0.40
             )
@@ -233,6 +230,8 @@ class MarginGuard:
         if not self.db: return
         try:
             total_lots = max(1, abs(trade.legs[0].quantity) // settings.LOT_SIZE)
+            if total_lots == 0: return
+            
             margin_per_lot = margin / total_lots
             
             async with self.db.get_session() as session:
