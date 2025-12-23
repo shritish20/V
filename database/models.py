@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Database Models (Hardened)
-- SQLAlchemy 2.0 Type-Safe Syntax
-- Unique Constraints for Allocation Idempotency
-- Indexed for High-Performance Queries
-- Includes Process Communication Tables (RiskState, MarketContext)
+VolGuard 20.0 – Database Models (Fortress Edition)
+- Includes Token State for OAuth Management
+- Includes Margin History for Sanity Checks
+- Uses SQLAlchemy 2.0 Type-Safe Syntax
 """
 from __future__ import annotations
 
@@ -103,8 +102,38 @@ class DbStartOfDayMargin(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 # ---------------------------------------------------------------------------
-# Journal & Analytics
+# Authentication & Token Management (NEW)
 # ---------------------------------------------------------------------------
+class DbTokenState(Base):
+    """
+    Stores the active Upstox access token and refresh token.
+    Used by the TokenManager to persist authentication across restarts.
+    """
+    __tablename__ = "token_state"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    access_token: Mapped[str] = mapped_column(String, nullable=False)
+    refresh_token: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_refreshed: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+# ---------------------------------------------------------------------------
+# Risk & Analytics Tables
+# ---------------------------------------------------------------------------
+class DbMarginHistory(Base):
+    """
+    Tracks real margin requirements from Upstox API.
+    Used by MarginGuard to 'Sanity Check' fallback calculations during high VIX.
+    """
+    __tablename__ = "margin_history"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_type: Mapped[str] = mapped_column(String, nullable=False)
+    lots: Mapped[int] = mapped_column(Integer, default=1)
+    required_margin: Mapped[float] = mapped_column(Float, nullable=False)
+    vix_at_calc: Mapped[float] = mapped_column(Float)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
 class DbTradeJournal(Base):
     __tablename__ = "trade_journal"
 
@@ -147,7 +176,6 @@ class DbRiskState(Base):
     kill_switch_active: Mapped[bool] = mapped_column(Boolean, default=False)
     is_flattening: Mapped[bool] = mapped_column(Boolean, default=False) 
     flatten_order_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
-    # Added real_time_pnl for Dashboard compat (Optional)
     real_time_pnl: Mapped[Optional[float]] = mapped_column(Float, default=0.0)
 
 class DbMarketContext(Base):
