@@ -1,37 +1,62 @@
 version: '3.8'
 
 services:
+  # ---------------------------------------------------------
+  # DATABASE (Use RDS in Production, but this is the local fallback)
+  # ---------------------------------------------------------
   db:
     image: postgres:15-alpine
     container_name: vg_postgres
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-volguard_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_trading_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
       POSTGRES_DB: ${POSTGRES_DB:-volguard_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - vg_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U volguard_user -d volguard_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # ---------------------------------------------------------
+  # VOLGUARD FORTRESS (Monolithic Container)
+  # Runs: Engine + API + Sheriff + Analyst via Supervisord
+  # ---------------------------------------------------------
   app:
     build: .
-    container_name: volguard_engine
-    restart: always
+    container_name: volguard_fortress
+    restart: unless-stopped
     depends_on:
-      - db
+      db:
+        condition: service_healthy
     env_file:
       - .env
     environment:
       - POSTGRES_SERVER=db
       - PYTHONPATH=/app
+      # 🚨 PRODUCTION OVERRIDES 🚨
+      - SAFETY_MODE=live
+      - ENV=production
     ports:
       - "8000:8000"
     volumes:
+      # Map logs out so you can read them on EC2 via 'tail -f'
       - ./logs:/app/logs
+      # Map data for persistence (Engine PID, SQLite caches)
       - ./data:/app/data
+      - ./dashboard_data:/app/dashboard_data
     networks:
       - vg_net
+    # AWS Health Check: Ensures API is responsive
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 networks:
   vg_net:
