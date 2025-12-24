@@ -5,22 +5,27 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install system tools needed for some Python libraries
+# Added 'procps' so the Sheriff can use 'kill' commands if needed
 RUN apt-get update && apt-get install -y \
     gcc \
     libpq-dev \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first (to cache them)
 COPY requirements.txt .
 
-# Install Python dependencies
+# Install Python dependencies including Supervisor
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of your code
 COPY . .
 
-# Create logs directory
-RUN mkdir -p logs
+# Create persistent directories for logs and data
+RUN mkdir -p logs data dashboard_data
 
-# Run BOTH the API and the Engine in one container (Saves RAM)
-CMD ["bash", "-c", "python main.py & python core/engine.py"]
+# EXPOSE the API Port
+EXPOSE 8000
+
+# SAFETY: Use Supervisord to run ALL processes (Engine, API, Sheriff)
+CMD ["supervisord", "-c", "/app/supervisord.conf"]
