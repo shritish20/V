@@ -1,4 +1,3 @@
-#
 # Modernized Core (AnyIO 4.x Compatible)
 fastapi>=0.109.0
 uvicorn[standard]==0.27.0
@@ -49,5 +48,5 @@ yfinance>=0.2.33
 feedparser==6.0.10
 textblob==0.17.1
 
-# --- AWS / PRODUCTION INFRASTRUCTURE (NEW)
+# --- AWS / PRODUCTION INFRASTRUCTURE
 supervisor==4.2.5
