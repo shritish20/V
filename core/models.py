@@ -3,6 +3,7 @@ from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
 from core.enums import StrategyType, TradeStatus, CapitalBucket, ExpiryType, ExitReason
 
+# --- SNAPSHOTS ---
 class GreeksSnapshot(BaseModel):
     delta: float = 0.0
     gamma: float = 0.0
@@ -43,49 +44,53 @@ class MultiLegTrade(BaseModel):
     def total_unrealized_pnl(self) -> float:
         return sum((l.current_price - l.entry_price) * l.quantity for l in self.legs)
 
+# --- METRICS (THE CRASH FIX) ---
 class AdvancedMetrics(BaseModel):
-    timestamp: datetime
-    spot_price: float
-    vix: float
+    """
+    Dashboard Metrics with Default Values to prevent startup crashes.
+    """
+    timestamp: datetime = Field(default_factory=datetime.now)
+    spot_price: float = 0.0
+    vix: float = 0.0
     
     # Volatility Metrics
-    ivp: float
-    iv_rank: float
-    realized_vol_7d: float
-    realized_vol_28d: float
-    garch_vol_7d: float
-    egarch_vol_1d: float
+    ivp: float = 0.0
+    iv_rank: float = 0.0
+    realized_vol_7d: float = 0.0
+    realized_vol_28d: float = 0.0
+    garch_vol_7d: float = 0.0
+    egarch_vol_1d: float = 0.0
     
     # Term Structure & Skew
-    atm_iv: float
-    monthly_iv: float
-    vrp_score: float      # Uses Lite Formula: IV - RV - GARCH
-    spread_rv: float      # Uses Lite Formula: IV - RV
-    vrp_zscore: float
-    term_structure_spread: float # Weekly - Monthly
-    volatility_skew: float
+    atm_iv: float = 0.0
+    monthly_iv: float = 0.0
+    vrp_score: float = 0.0      
+    spread_rv: float = 0.0      
+    vrp_zscore: float = 0.0
+    term_structure_spread: float = 0.0
+    volatility_skew: float = 0.0
     
-    # Execution Context (ATM Straddle)
-    straddle_price: float
-    straddle_price_monthly: float
-    atm_theta: float = 0.0  # NEW
-    atm_vega: float = 0.0   # NEW
-    atm_delta: float = 0.0  # NEW
-    atm_gamma: float = 0.0  # NEW
-    atm_pop: float = 0.0    # NEW
+    # Execution Context
+    straddle_price: float = 0.0
+    straddle_price_monthly: float = 0.0
+    atm_theta: float = 0.0
+    atm_vega: float = 0.0
+    atm_delta: float = 0.0
+    atm_gamma: float = 0.0
+    atm_pop: float = 0.0
     
-    # Regime
-    structure_confidence: float
-    regime: str
-    event_risk_score: float
-    top_event: str
-    trend_status: str
+    # Regime (Strings need defaults too!)
+    structure_confidence: float = 0.0
+    regime: str = "Neutral"
+    event_risk_score: float = 0.0
+    top_event: str = "None"
+    trend_status: str = "Flat"
     
     # Expiry Data
-    days_to_expiry: float
-    expiry_date: str
-    pcr: float
-    max_pain: float
+    days_to_expiry: float = 0.0
+    expiry_date: str = "Pending"
+    pcr: float = 0.0
+    max_pain: float = 0.0
     
     # SABR
     sabr_alpha: float = 0.0
