@@ -43,7 +43,8 @@ services:
       - PYTHONPATH=/app
       
       # 🚨 PRODUCTION SAFETY OVERRIDES 🚨
-      - SAFETY_MODE=live
+      # CHANGED TO 'paper' FOR SAFETY - CHANGE TO 'live' WHEN READY
+      - SAFETY_MODE=paper  
       - ENV=production
       
       # TELEGRAM ALERTS (Fill these in .env)
