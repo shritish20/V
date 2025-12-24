@@ -6,6 +6,7 @@ VolGuard 20.0 – Production-Hardened Engine (Fortress Architecture)
 - FIXED: Position Reconciliation Race Conditions (Includes PENDING status)
 - FIXED: Async loop initialization for Fortress services
 - NEW: Market Snapshot Recording for Quant Dashboard
+- FIXED: Auto-Healing Data Refresh loop
 """
 from __future__ import annotations
 
@@ -52,79 +53,61 @@ MAX_CACHE_SIZE      = 5_000
 CACHE_TTL_SEC       = 3_600
 SAFETY_CHECK_INT    = 5
 RECONCILE_INT       = 60
+DATA_REFRESH_INT    = 1800  # 30 Minutes
 
 class EngineCircuitBreaker(Exception): pass
 
 class VolGuard20Engine:
     def __init__(self) -> None:
-        """
-        Initializes non-async components only.
-        Async locks and loops are moved to 'setup_async_components'
-        """
+        """Initializes non-async components only."""
         logger.info("🛠️  VolGuard-20 FORTRESS ENGINE Initialising")
         self.rt_quotes: Dict[str, float] = {}
         self._greeks_cache: Dict[str, GreeksSnapshot] = {}
         
-        # Async placeholders (Initialized in setup_async_components)
+        # Async placeholders
         self._cache_lock: asyncio.Lock = None
         self._trade_lock: asyncio.Lock = None
         self._calibration_semaphore: asyncio.Lock = None
         self._thread_pool = None
 
-        # --- External Connectors ---
+        # Connectors & Master
         self.db   = HybridDatabaseManager()
         self.api  = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
         self.token_manager = None
-
-        # --- Instrument Master ---
         self.instruments_master = InstrumentMaster()
         self.api.set_instrument_master(self.instruments_master)
 
-        # --- Models ---
+        # Models & Analytics
         self.sabr    = EnhancedSABRModel()
         self.pricing = HybridPricingEngine(self.sabr)
         self.pricing.set_api(self.api)
-        # CRITICAL FIX: Link Master to Pricing Engine
         self.pricing.instrument_master = self.instruments_master
-
-        # --- Analytics ---
+        
         self.data_fetcher = DashboardDataFetcher(self.api)
         self.vol_analytics = HybridVolatilityAnalytics(self.data_fetcher)
         self.vrp_zscore = VRPZScoreAnalyzer(self.data_fetcher)
 
-        # --- Data Feed ---
+        # Feed & Risk
         self.data_feed = LiveDataFeed(self.rt_quotes, self._greeks_cache, self.sabr)
-
-        # --- Risk & Capital ---
-        self.capital_allocator = SmartCapitalAllocator(
-            settings.ACCOUNT_SIZE, settings.CAPITAL_ALLOCATION, self.db
-        )
+        self.capital_allocator = SmartCapitalAllocator(settings.ACCOUNT_SIZE, settings.CAPITAL_ALLOCATION, self.db)
         self.risk_mgr = AdvancedRiskManager(self.db, None)
 
-        # --- Execution Stack ---
+        # Execution Stack
         self.om = EnhancedOrderManager(self.api, self.db)
         self.executor = LiveOrderExecutor(self.api, self.om)
-        self.trade_mgr = EnhancedTradeManager(
-            self.api, self.db, self.om, self.pricing,
-            self.risk_mgr, None, self.capital_allocator,
-        )
+        self.trade_mgr = EnhancedTradeManager(self.api, self.db, self.om, self.pricing, self.risk_mgr, None, self.capital_allocator)
         self.trade_mgr.feed = self.data_feed
         self.lifecycle_mgr = PositionLifecycleManager(self.trade_mgr)
 
-        # --- Safety & Strategy ---
+        # Safety & Strategy
         self.greek_validator = GreekValidator(self._greeks_cache, self.sabr, settings.GREEK_REFRESH_SEC)
         self.greek_validator.set_instrument_master(self.instruments_master)
         self.strategy_engine = IntelligentStrategyEngine(self.vol_analytics, None, self.capital_allocator, self.pricing)
         self.strategy_engine.set_instruments_master(self.instruments_master)
         
-        self.safety_layer = MasterSafetyLayer(
-            self.risk_mgr,
-            getattr(self.trade_mgr, "margin_guard", None),
-            self.lifecycle_mgr,
-            self.vrp_zscore,
-        )
+        self.safety_layer = MasterSafetyLayer(self.risk_mgr, getattr(self.trade_mgr, "margin_guard", None), self.lifecycle_mgr, self.vrp_zscore)
 
-        # --- Runtime State ---
+        # Runtime State
         self.running = False
         self.trades: List[MultiLegTrade] = []
         self.error_count = 0
@@ -132,6 +115,7 @@ class VolGuard20Engine:
         self.last_safety_check = 0.0
         self.last_reconcile = 0.0
         self.last_sabr_calib = 0.0
+        self.last_data_refresh = 0.0  # Added for Auto-Healing
         self.last_known_spot = 0.0
         self.last_metrics: Optional[AdvancedMetrics] = None
         self.ai_verdict = "SAFE"
@@ -150,27 +134,23 @@ class VolGuard20Engine:
         try:
             await self.setup_async_components()
             
-            # --- Write PID for Sheriff Control ---
-            try:
-                pid_file = Path("data/engine.pid")
-                pid_file.parent.mkdir(parents=True, exist_ok=True)
-                pid_file.write_text(str(os.getpid()))
-                logger.info(f"📝 Engine PID Registered: {os.getpid()}")
-            except Exception as e:
-                logger.error(f"Failed to write PID file: {e}")
+            # Write PID
+            pid_file = Path("data/engine.pid")
+            pid_file.parent.mkdir(parents=True, exist_ok=True)
+            pid_file.write_text(str(os.getpid()))
 
-            # --- Setup Token Manager ---
+            # Auth & Tokens
             await self.db.init_db()
             self.token_manager = await setup_token_manager(self.db, self.api)
             asyncio.create_task(self.token_manager.start_refresh_loop())
-            logger.info("🔐 Token Manager Active")
 
+            # Data Loading
             await self.instruments_master.download_and_load()
             await self.data_fetcher.load_all_data()
+            self.last_data_refresh = time.time()  # Track initial load
+            
             await self.om.start()
             await self._restore_from_snapshot()
-            
-            # Startup Cleanup: Check for open positions and sync immediately
             await self._reconcile_broker_positions()
             
             self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
@@ -195,10 +175,18 @@ class VolGuard20Engine:
                 now  = datetime.now(IST)
                 tick = time.time()
                 
+                # Reset counters at Market Open
                 if now.time() >= settings.MARKET_OPEN_TIME and now.date() != last_reset_date:
                     self.safety_layer.reset_daily_counters()
                     last_reset_date = now.date()
                 
+                # --- AUTO-HEALING: Refresh History every 30 mins ---
+                if tick - self.last_data_refresh > DATA_REFRESH_INT:
+                    logger.info("♻️  Auto-Healing: Triggering background history refresh...")
+                    asyncio.create_task(self.data_fetcher.load_all_data())
+                    self.last_data_refresh = tick
+
+                # Safety Check
                 if tick - self.last_safety_check > SAFETY_CHECK_INT:
                     is_safe = await self._check_safety_heartbeat()
                     if not is_safe:
@@ -209,13 +197,14 @@ class VolGuard20Engine:
                     await self._sync_market_context()
                     self.last_safety_check = tick
                 
+                # Position Reconcile
                 if tick - self.last_reconcile > RECONCILE_INT:
                     await self._reconcile_broker_positions()
                     self.last_reconcile = tick
                 
+                # Pricing & Analytics
                 live_spot = self.rt_quotes.get(settings.MARKET_KEY_INDEX, 0.0)
-                if live_spot > 0:
-                    self.last_known_spot = live_spot
+                if live_spot > 0: self.last_known_spot = live_spot
                 
                 spot = self.last_known_spot
                 if spot > 0:
@@ -223,50 +212,41 @@ class VolGuard20Engine:
                     await self.lifecycle_mgr.monitor_lifecycle(self.trades)
                     await self._calculate_metrics(spot)
                 
+                # Trading Logic
                 market_open = settings.MARKET_OPEN_TIME <= now.time() <= settings.MARKET_CLOSE_TIME
                 if market_open and live_spot > 0:
                     if tick - self.last_sabr_calib > 900:
                         asyncio.create_task(self._sabr_calibrate())
                     
                     if self.ai_verdict == "DANGER" and self.ai_is_fresh:
-                        if int(tick) % 60 == 0: 
-                            logger.warning("⚠️ Trading Paused: AI Sensing Danger.")
+                        if int(tick) % 60 == 0: logger.warning("⚠️ Trading Paused: AI Sensing Danger.")
                     else:
                         await self._trading_logic(live_spot)
                 
                 await self.trade_mgr.monitor_active_trades(self.trades)
                 
-                if tick - self.last_error_time > 60:
-                    self.error_count = 0
-                
+                if tick - self.last_error_time > 60: self.error_count = 0
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
+
             except TokenExpiredError:
-                logger.error("🔑 Token Expired – Triggering Manager Refresh")
-                if self.token_manager:
-                    await self.token_manager.get_current_token()
+                if self.token_manager: await self.token_manager.get_current_token()
                 await asyncio.sleep(5)
             except EngineCircuitBreaker:
-                logger.critical("❌ Circuit Breaker Open – Shutting Down")
                 await self.shutdown()
                 break
             except Exception as exc:
                 self.error_count += 1
                 self.last_error_time = time.time()
                 logger.exception("Cycle Error")
-                if self.error_count > settings.MAX_ERROR_COUNT:
-                    raise EngineCircuitBreaker from exc
+                if self.error_count > settings.MAX_ERROR_COUNT: raise EngineCircuitBreaker from exc
                 await asyncio.sleep(1)
 
     async def shutdown(self) -> None:
         logger.info("🛑  Shutdown Started")
         self.running = False
-        if self.token_manager:
-            await self.token_manager.stop()
-        
-        try:
-            Path("data/engine.pid").unlink(missing_ok=True)
+        if self.token_manager: await self.token_manager.stop()
+        try: Path("data/engine.pid").unlink(missing_ok=True)
         except Exception: pass
-        
         await self._emergency_flatten()
         await self._save_snapshot()
         await self.api.close()
@@ -300,16 +280,12 @@ class VolGuard20Engine:
             self.risk_mgr.update_portfolio_state(self.trades, total_pnl)
 
     async def _calculate_metrics(self, spot: float) -> None:
-        """
-        Calculates Quant Metrics (VRP, Skew, etc.) and writes them to DB for the Dashboard.
-        """
         try:
             live_vix = self.rt_quotes.get(settings.MARKET_KEY_VIX, 0.0)
             vix = max(live_vix, 10.0)
             rv7, rv28, garch, egarch, ivp, iv_rank = self.vol_analytics.get_volatility_metrics(vix)
             struct = await self.pricing.get_market_structure(spot)
             
-            # 1. Update Internal State
             self.last_metrics = AdvancedMetrics(
                 timestamp=datetime.now(IST), spot_price=spot, vix=vix, ivp=ivp, iv_rank=iv_rank,
                 realized_vol_7d=rv7, realized_vol_28d=rv28, garch_vol_7d=garch, egarch_vol_1d=egarch,
@@ -318,7 +294,7 @@ class VolGuard20Engine:
                 vrp_zscore=self.vrp_zscore.calculate_vrp_zscore(struct.get("atm_iv", 0.0), vix)[0],
                 term_structure_spread=struct.get("term_structure_spread", 0.0),
                 straddle_price=struct.get("straddle_price", 0.0),
-                straddle_price_monthly=struct.get("straddle_price_monthly", 0.0), # Ensure model supports this
+                straddle_price_monthly=struct.get("straddle_price_monthly", 0.0),
                 volatility_skew=struct.get("skew_index", 0.0),
                 regime=self.vol_analytics.calculate_volatility_regime(vix, iv_rank),
                 trend_status=self.vol_analytics.get_trend_status(spot),
@@ -328,47 +304,24 @@ class VolGuard20Engine:
                 efficiency_table=struct.get("efficiency_table", [])
             )
 
-            # 2. Write to DB for "Data Beast" Dashboard (Tab 1)
-            # Only write if we have meaningful data
             if self.last_metrics.atm_iv > 0:
                 async with self.db.get_session() as session:
                     snapshot = DbMarketSnapshot(
-                        timestamp=datetime.utcnow(),
-                        spot_price=spot,
-                        vix=vix,
-                        
-                        # Term Structure
-                        atm_iv_weekly=self.last_metrics.atm_iv,
-                        atm_iv_monthly=self.last_metrics.monthly_iv,
+                        timestamp=datetime.utcnow(), spot_price=spot, vix=vix,
+                        atm_iv_weekly=self.last_metrics.atm_iv, atm_iv_monthly=self.last_metrics.monthly_iv,
                         iv_spread=self.last_metrics.term_structure_spread,
                         term_structure_tag="Backwardation" if self.last_metrics.term_structure_spread > 0 else "Contango",
-                        
-                        # Quant Models
-                        rv_7d=self.last_metrics.realized_vol_7d,
-                        garch_vol_7d=self.last_metrics.garch_vol_7d,
-                        egarch_vol_1d=self.last_metrics.egarch_vol_1d,
-                        iv_percentile=self.last_metrics.ivp,
-                        
-                        # VRP Signals
-                        # spread_rv is IV - RV
-                        vrp_spread=self.last_metrics.atm_iv - self.last_metrics.realized_vol_7d, 
-                        vrp_zscore=self.last_metrics.vrp_zscore,
-                        vrp_verdict=self.last_metrics.regime, # Using regime as proxy for verdict for now
-                        
-                        # Execution Levels
-                        straddle_cost_weekly=self.last_metrics.straddle_price,
-                        straddle_cost_monthly=self.last_metrics.straddle_price_monthly,
-                        breakeven_lower=spot - self.last_metrics.straddle_price,
-                        breakeven_upper=spot + self.last_metrics.straddle_price,
-                        
-                        # The Full Option Chain Data
+                        rv_7d=self.last_metrics.realized_vol_7d, garch_vol_7d=self.last_metrics.garch_vol_7d,
+                        egarch_vol_1d=self.last_metrics.egarch_vol_1d, iv_percentile=self.last_metrics.ivp,
+                        vrp_spread=self.last_metrics.atm_iv - self.last_metrics.realized_vol_7d,
+                        vrp_zscore=self.last_metrics.vrp_zscore, vrp_verdict=self.last_metrics.regime,
+                        straddle_cost_weekly=self.last_metrics.straddle_price, straddle_cost_monthly=self.last_metrics.straddle_price_monthly,
+                        breakeven_lower=spot - self.last_metrics.straddle_price, breakeven_upper=spot + self.last_metrics.straddle_price,
                         chain_json=self.last_metrics.efficiency_table
                     )
                     session.add(snapshot)
                     await self.db.safe_commit(session)
-
-        except Exception as e: 
-            logger.error(f"Metric Calculation Failed: {e}")
+        except Exception as e: logger.error(f"Metric Calculation Failed: {e}")
 
     async def _sabr_calibrate(self) -> None:
         if self._calibration_semaphore.locked(): return
@@ -383,9 +336,7 @@ class VolGuard20Engine:
     async def _trading_logic(self, spot: float) -> None:
         if not self.last_metrics: return
         ai_ctx = {"verdict": self.ai_verdict, "is_fresh": self.ai_is_fresh}
-        strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(
-            self.last_metrics, spot, await self.capital_allocator.get_status(), ai_ctx
-        )
+        strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(self.last_metrics, spot, await self.capital_allocator.get_status(), ai_ctx)
         if strat == "WAIT": return
         
         trade_id = f"T-{int(time.time() * 1_000)}"
@@ -397,8 +348,7 @@ class VolGuard20Engine:
             real_legs.append(Position(
                 symbol=settings.UNDERLYING_SYMBOL, instrument_key=token, strike=leg["strike"], option_type=leg["type"],
                 quantity=settings.LOT_SIZE * (1 if leg["side"] == "BUY" else -1), entry_price=0.0, entry_time=datetime.now(IST),
-                current_price=0.0, current_greeks=GreeksSnapshot(timestamp=datetime.now(IST)),
-                expiry_type=etype, capital_bucket=bucket,
+                current_price=0.0, current_greeks=GreeksSnapshot(timestamp=datetime.now(IST)), expiry_type=etype, capital_bucket=bucket,
             ))
         
         trade = MultiLegTrade(legs=real_legs, strategy_type=StrategyType(strat), entry_time=datetime.now(IST),
@@ -447,44 +397,24 @@ class VolGuard20Engine:
         except Exception: logger.exception("Restore Failed")
 
     async def _reconcile_broker_positions(self) -> None:
-        """
-        HARDENED: Race-condition proof reconciliation.
-        """
         try:
-            # FIX: Lock BEFORE fetching broker positions
-            # This prevents us from adopting a position that belongs to a pending trade
             async with self._trade_lock:
                 broker_positions = await self.api.get_short_term_positions()
                 if not broker_positions: return
-                
-                broker_map = {}
-                for p in broker_positions:
-                    qty = int(p.get("quantity", 0))
-                    if qty != 0:
-                        broker_map[p["instrument_token"]] = qty
-                
+                broker_map = {p["instrument_token"]: int(p.get("quantity", 0)) for p in broker_positions if int(p.get("quantity", 0)) != 0}
                 internal_map = {}
                 for trade in self.trades:
                     if trade.status in (TradeStatus.OPEN, TradeStatus.PENDING):
                         for leg in trade.legs:
                             internal_map[leg.instrument_key] = internal_map.get(leg.instrument_key, 0) + leg.quantity
                 
-                # Check for zombies
                 for token, b_qty in broker_map.items():
-                    internal_qty = internal_map.get(token, 0)
-                    if b_qty != internal_qty:
-                        # Only adopt if we have ZERO record of it
-                        if internal_qty == 0:
-                            logger.critical(f"🧟 ZOMBIE FOUND: {token} (Qty: {b_qty}) - Adopting...")
-                            await self._adopt_zombie(token, b_qty)
-                        else:
-                            logger.error(f"⚠️ Quantity Mismatch for {token}: Broker {b_qty} vs Internal {internal_qty}")
-
+                    if b_qty != internal_map.get(token, 0) and internal_map.get(token, 0) == 0:
+                        logger.critical(f"🧟 ZOMBIE FOUND: {token} (Qty: {b_qty}) - Adopting...")
+                        await self._adopt_zombie(token, b_qty)
         except Exception: logger.exception("Reconciliation Failed")
 
     async def _adopt_zombie(self, token: str, qty: int) -> None:
-        # Note: _trade_lock is already held by the caller (_reconcile_broker_positions)
-        # So we don't need to lock again here.
         price = self.rt_quotes.get(token, 1.0)
         dummy = Position(symbol=settings.UNDERLYING_SYMBOL, instrument_key=token, strike=0.0, option_type="CE",
                         quantity=qty, entry_price=price, entry_time=datetime.now(IST), current_price=price,
