@@ -6,7 +6,6 @@ EnhancedUpstoxAPI 20.1 – Production Hardened (Fortress Edition)
 - set_instrument_master restored
 - close() method present
 - dates always YYYY-MM-DD strings
-- FIXED: Added get_quotes method for connectivity check
 ----------------------------------------------------------
 NEW: 00:00-06:00 IST night-mode stub for funds/margin calls
      so you can test without Upstox blocking you.
@@ -60,7 +59,7 @@ def _dummy_funds_margin() -> Dict[str, Any]:
     }
 
 # ------------------------------------------------------------------
-#  Rate Limiting Logic
+#  Existing code untouched below this line
 # ------------------------------------------------------------------
 class TokenExpiredError(RuntimeError): pass
 class MarginInsaneError(RuntimeError): pass
@@ -85,9 +84,6 @@ class RateLimiter:
             else:
                 self._tokens -= 1
 
-# ------------------------------------------------------------------
-#  Main API Client
-# ------------------------------------------------------------------
 class EnhancedUpstoxAPI:
     def __init__(self, token: str) -> None:
         self._token = token
@@ -238,14 +234,6 @@ class EnhancedUpstoxAPI:
     # -------------------------------------------------------------------------
     # High-level wrappers – V2 OFFICIAL ENDPOINTS
     # -------------------------------------------------------------------------
-    async def get_quotes(self, instrument_keys: List[str]) -> Dict[str, Any]:
-        """Fetches full market quotes (LTP, OHLC, etc) for given keys."""
-        return await self._request(
-            "GET", 
-            "market_quote", 
-            params={"instrument_key": ",".join(instrument_keys)}
-        )
-
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
             return True, f"SIM-{int(time.time() * 1_000)}"
