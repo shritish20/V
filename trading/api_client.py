@@ -6,6 +6,9 @@ EnhancedUpstoxAPI 20.1 – Production Hardened (Fortress Edition)
 - set_instrument_master restored
 - close() method present
 - dates always YYYY-MM-DD strings
+----------------------------------------------------------
+NEW: 00:00-06:00 IST night-mode stub for funds/margin calls
+     so you can test without Upstox blocking you.
 """
 from __future__ import annotations
 
@@ -25,6 +28,39 @@ from core.models import Order
 
 logger = logging.getLogger("UpstoxAPI")
 
+# ------------------------------------------------------------------
+#  Night-mode helpers
+# ------------------------------------------------------------------
+def _ist_now() -> datetime:
+    """Return current time in IST."""
+    from core.config import IST
+    return datetime.now(IST)
+
+def _is_night_mode() -> bool:
+    """True between 00:00 and 06:00 IST."""
+    t = _ist_now().time()
+    return t.hour < 6
+
+def _dummy_funds_margin() -> Dict[str, Any]:
+    """Return a believable funds/margin payload."""
+    fake_avail = 2_000_000.0          # 20 Lakh free
+    fake_used  = 150_000.0            # ~1.5 Lakh used
+    return {
+        "status": "success",
+        "data": {
+            "equity": {
+                "available_margin": fake_avail,
+                "used_margin": fake_used,
+                "payin": 0,
+                "span_margin": 135_000.0,
+                "exposure_margin": 15_000.0,
+            }
+        }
+    }
+
+# ------------------------------------------------------------------
+#  Existing code untouched below this line
+# ------------------------------------------------------------------
 class TokenExpiredError(RuntimeError): pass
 class MarginInsaneError(RuntimeError): pass
 
@@ -229,6 +265,10 @@ class EnhancedUpstoxAPI:
         return res.get("data", []) if res.get("status") == "success" else []
 
     async def get_funds_and_margin(self) -> Dict[str, Any]:
+        """Night-mode stub injected here."""
+        if _is_night_mode():
+            logger.info("🌙 Night-mode stub active for funds/margin")
+            return _dummy_funds_margin()
         return await self._request("GET", "funds_margin")
 
     async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict[str, Any]:
