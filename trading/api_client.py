@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-EnhancedUpstoxAPI 20.0 – Production Hardened (Fortress Edition)
-- SMART RETRY: Retries on 401 only if token was just updated.
-- NO RECURSION: Validity checks are isolated from main request logic.
-- Hard 5-second timeout per call.
-- Margin sanity check.
-- V3 FIX: Chronological date ordering for historical candles.
+EnhancedUpstoxAPI 20.1 – Production Hardened (Fortress Edition)
+- V2 ENDPOINTS only (no 404)
+- UDAPI100072 trap
+- set_instrument_master restored
+- close() method present
+- dates always YYYY-MM-DD strings
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ import time
 import random
 import json
 import re
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from urllib.parse import quote
 
@@ -24,18 +25,9 @@ from core.models import Order
 
 logger = logging.getLogger("UpstoxAPI")
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-class TokenExpiredError(RuntimeError):
-    """Raised when bearer token is rejected."""
+class TokenExpiredError(RuntimeError): pass
+class MarginInsaneError(RuntimeError): pass
 
-class MarginInsaneError(RuntimeError):
-    """Raised when available margin is <= 0."""
-
-# ---------------------------------------------------------------------------
-# Rate limiter – token bucket
-# ---------------------------------------------------------------------------
 class RateLimiter:
     def __init__(self, rate_per_sec: int = 9) -> None:
         self._rate = rate_per_sec
@@ -56,9 +48,6 @@ class RateLimiter:
             else:
                 self._tokens -= 1
 
-# ---------------------------------------------------------------------------
-# API client
-# ---------------------------------------------------------------------------
 class EnhancedUpstoxAPI:
     def __init__(self, token: str) -> None:
         self._token = token
@@ -74,12 +63,7 @@ class EnhancedUpstoxAPI:
         self._limiter = RateLimiter()
         self.instrument_master = None
 
-    def set_instrument_master(self, master: Any) -> None:
-        """Link to Instrument Master for symbol lookups."""
-        self.instrument_master = master
-
     async def update_token(self, new_token: str) -> None:
-        """Called by TokenManager when a fresh token is available."""
         async with self._session_lock:
             self._token = new_token
             self._token_last_updated = time.time()
@@ -90,7 +74,6 @@ class EnhancedUpstoxAPI:
         logger.info("🔄 API Client Token Rotated Successfully")
 
     async def check_token_validity(self) -> bool:
-        """ISOLATED PROBE: Checks if token is valid."""
         url = settings.API_BASE_URL + "/v2/user/profile"
         try:
             async with aiohttp.ClientSession(headers=self._headers) as temp_session:
@@ -104,10 +87,23 @@ class EnhancedUpstoxAPI:
             logger.warning(f"Token probe network error: {e}")
             return True
 
+    def set_instrument_master(self, master) -> None:
+        """Engine needs this – do not delete."""
+        self.instrument_master = master
+
     async def close(self) -> None:
+        """Closes aiohttp session; Engine calls this on shutdown."""
         async with self._session_lock:
             if self._session and not self._session.closed:
                 await self._session.close()
+                self._session = None
+                logger.info("📡 API Session Closed Gracefully")
+
+    async def _get_session(self) -> aiohttp.ClientSession:
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(headers=self._headers)
+            return self._session
 
     async def _request(
         self,
@@ -119,14 +115,12 @@ class EnhancedUpstoxAPI:
         json_data: Optional[Dict] = None,
         retry: int = 3,
     ) -> Dict[str, Any]:
-        """Unified request with Smart 401 handling."""
         if dynamic_url:
             url = dynamic_url
         else:
             url = settings.API_BASE_URL + UPSTOX_API_ENDPOINTS.get(endpoint_key, "")
 
         request_start_time = time.time()
-
         for attempt in range(1, retry + 1):
             await self._limiter.acquire()
             try:
@@ -145,18 +139,16 @@ class EnhancedUpstoxAPI:
                         try:
                             data = json.loads(body)
                         except json.JSONDecodeError:
-                             logger.error(f"❌ JSON Decode Error: {safe_body}")
-                             return {"status": "error", "message": "Invalid JSON"}
-
+                            logger.error(f"❌ JSON Decode Error: {safe_body}")
+                            return {"status": "error", "message": "Invalid JSON"}
                         if endpoint_key == "funds_margin":
                             self._sanity_check_margin(data)
                         return data
 
                     if resp.status == 401:
                         if self._token_last_updated > request_start_time:
-                            logger.info("⚠️ 401 received, but token was just updated. Retrying...")
+                            logger.info("⚠️ 401 but token was just updated – retrying")
                             continue
-                        logger.error("❌ Token Expired (401). Raising signal for Engine.")
                         raise TokenExpiredError("Access Token Invalid")
 
                     if resp.status in (429, 503):
@@ -172,7 +164,7 @@ class EnhancedUpstoxAPI:
                     return {"status": "error", "message": safe_body, "code": resp.status}
 
             except TokenExpiredError:
-                raise 
+                raise
             except asyncio.TimeoutError:
                 logger.error(f"⏰ Request Timeout (5s): {url}")
                 return {"status": "error", "message": "timeout"}
@@ -184,12 +176,6 @@ class EnhancedUpstoxAPI:
 
         return {"status": "error", "message": "Max retries"}
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        async with self._session_lock:
-            if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession(headers=self._headers)
-            return self._session
-
     @staticmethod
     def _sanity_check_margin(data: Dict[str, Any]) -> None:
         try:
@@ -200,21 +186,17 @@ class EnhancedUpstoxAPI:
                 if avail <= 0:
                     raise MarginInsaneError(f"Available margin {avail} – HALT TRADING")
         except (KeyError, ValueError):
-            pass 
+            pass
 
     @staticmethod
     def _redact(text: str) -> str:
-        patterns = [
-            (r"Bearer\s+[a-zA-Z0-9\-._]+", "Bearer [REDACTED]"),
-            (r'"access_token"\s*:\s*"[^"]+"', '"access_token":"[REDACTED]"'),
-            (r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', "[JWT_REDACTED]"),
-        ]
-        for pat, repl in patterns:
-            text = re.sub(pat, repl, text, flags=re.IGNORECASE)
+        text = re.sub(r"Bearer\s+[a-zA-Z0-9\-._]+", "Bearer [REDACTED]", text, flags=re.I)
+        text = re.sub(r'"access_token"\s*:\s*"[^"]+"', '"access_token":"[REDACTED]"', text, flags=re.I)
+        text = re.sub(r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', "[JWT_REDACTED]", text, flags=re.I)
         return text
 
     # -------------------------------------------------------------------------
-    # High-level Helpers
+    # High-level wrappers – V2 OFFICIAL ENDPOINTS
     # -------------------------------------------------------------------------
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
@@ -239,6 +221,7 @@ class EnhancedUpstoxAPI:
         return False, None
 
     async def get_option_chain(self, instrument_key: str, expiry_date: str) -> Dict[str, Any]:
+        """Official v2 option-chain endpoint."""
         return await self._request("GET", "option_chain", params={"instrument_key": instrument_key, "expiry_date": expiry_date})
 
     async def get_short_term_positions(self) -> List[Dict[str, Any]]:
@@ -250,16 +233,28 @@ class EnhancedUpstoxAPI:
 
     async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict[str, Any]:
         """
-        FIXED: Chronological order (from_date, then to_date) for Upstox V3.
+        V2 historical candles + UDAPI100072 trap + empty guard
+        ALWAYS expects YYYY-MM-DD strings
         """
         encoded = quote(instrument_key)
-        # Chronological order is mandatory for V3: /from_date/to_date
-        url = f"{settings.API_BASE_URL}/v3/historical-candle/{encoded}/{interval}/{from_date}/{to_date}"
-        return await self._request("GET", dynamic_url=url)
+        url = f"{settings.API_BASE_URL}/v2/historical-candle/{encoded}/{interval}/{to_date}/{from_date}"
+        res = await self._request("GET", dynamic_url=url)
+
+        # ---- Trap expired instrument ----
+        if res.get("code") == "UDAPI100072":
+            logger.info("Instrument %s expired – returning empty candles", instrument_key)
+            return {"status": "success", "data": {"candles": []}}
+
+        # ---- Guard empty payload ----
+        if res.get("status") == "success" and not res.get("data", {}).get("candles"):
+            logger.warning("No candles for %s – empty frame", instrument_key)
+            return {"status": "success", "data": {"candles": []}}
+
+        return res
 
     async def get_intraday_candles(self, instrument_key: str, interval: str) -> Dict[str, Any]:
         encoded = quote(instrument_key)
-        url = f"{settings.API_BASE_URL}/v3/historical-candle/intraday/{encoded}/{interval}"
+        url = f"{settings.API_BASE_URL}/v2/historical-candle/intraday/{encoded}/{interval}"
         return await self._request("GET", dynamic_url=url)
 
     async def get_market_quote_ohlc(self, instrument_key: str, interval: str) -> Dict[str, Any]:
