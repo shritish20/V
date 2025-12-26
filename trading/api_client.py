@@ -5,6 +5,7 @@ EnhancedUpstoxAPI 20.0 – Production Hardened (Fortress Edition)
 - NO RECURSION: Validity checks are isolated from main request logic.
 - Hard 5-second timeout per call.
 - Margin sanity check.
+- V3 FIX: Chronological date ordering for historical candles.
 """
 from __future__ import annotations
 
@@ -61,7 +62,6 @@ class RateLimiter:
 class EnhancedUpstoxAPI:
     def __init__(self, token: str) -> None:
         self._token = token
-        # Timestamp of last token update (used to prevent stale retries)
         self._token_last_updated = time.time()
         self._headers = {
             "Authorization": f"Bearer {token}",
@@ -84,19 +84,15 @@ class EnhancedUpstoxAPI:
             self._token = new_token
             self._token_last_updated = time.time()
             self._headers["Authorization"] = f"Bearer {new_token}"
-            # Force close session to flush old headers
             if self._session and not self._session.closed:
                 await self._session.close()
                 self._session = None
         logger.info("🔄 API Client Token Rotated Successfully")
 
     async def check_token_validity(self) -> bool:
-        """
-        ISOLATED PROBE: Checks if token is valid without triggering main retry loops.
-        """
+        """ISOLATED PROBE: Checks if token is valid."""
         url = settings.API_BASE_URL + "/v2/user/profile"
         try:
-            # We create a throwaway session for the probe to ensure isolation
             async with aiohttp.ClientSession(headers=self._headers) as temp_session:
                 async with temp_session.get(url, timeout=5) as resp:
                     if resp.status == 401:
@@ -105,7 +101,6 @@ class EnhancedUpstoxAPI:
         except TokenExpiredError:
             raise
         except Exception as e:
-            # Network glitches shouldn't kill the bot, just warn
             logger.warning(f"Token probe network error: {e}")
             return True
 
@@ -114,9 +109,6 @@ class EnhancedUpstoxAPI:
             if self._session and not self._session.closed:
                 await self._session.close()
 
-    # ---------------------------------------------------------------------
-    # Low-Level Request (Hardened)
-    # ---------------------------------------------------------------------
     async def _request(
         self,
         method: str,
@@ -127,15 +119,12 @@ class EnhancedUpstoxAPI:
         json_data: Optional[Dict] = None,
         retry: int = 3,
     ) -> Dict[str, Any]:
-        """
-        Unified request with Smart 401 handling.
-        """
+        """Unified request with Smart 401 handling."""
         if dynamic_url:
             url = dynamic_url
         else:
             url = settings.API_BASE_URL + UPSTOX_API_ENDPOINTS.get(endpoint_key, "")
 
-        # Snapshot start time to detect if token changed during request
         request_start_time = time.time()
 
         for attempt in range(1, retry + 1):
@@ -147,7 +136,7 @@ class EnhancedUpstoxAPI:
                     url,
                     params=params,
                     json=json_data,
-                    timeout=aiohttp.ClientTimeout(total=5), # Hard 5s Limit
+                    timeout=aiohttp.ClientTimeout(total=5),
                 ) as resp:
                     body = await resp.text()
                     safe_body = self._redact(body)
@@ -163,43 +152,32 @@ class EnhancedUpstoxAPI:
                             self._sanity_check_margin(data)
                         return data
 
-                    # --- SMART 401 HANDLING ---
                     if resp.status == 401:
-                        # Case A: Token was updated by TokenManager while we were waiting
                         if self._token_last_updated > request_start_time:
                             logger.info("⚠️ 401 received, but token was just updated. Retrying...")
-                            continue # Retry loop will pick up new token/session
-                        
-                        # Case B: Genuine Expiry
+                            continue
                         logger.error("❌ Token Expired (401). Raising signal for Engine.")
                         raise TokenExpiredError("Access Token Invalid")
 
                     if resp.status in (429, 503):
                         sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning(
-                            "⚠️ Rate/Gateway limit – Backing off",
-                            extra={"status": resp.status, "sleep": round(sleep_time, 2)},
-                        )
+                        logger.warning(f"⚠️ Rate/Gateway limit – Backing off {round(sleep_time, 2)}s")
                         await asyncio.sleep(sleep_time)
                         continue
 
-                    # Maintenance Mode Handling
                     if resp.status == 423:
                         return {"status": "error", "message": "Upstox Maintenance", "code": 423}
 
-                    logger.error(
-                        "❌ API error",
-                        extra={"status": resp.status, "url": url, "body": safe_body[:200]},
-                    )
+                    logger.error(f"❌ API error: {resp.status} - {url}")
                     return {"status": "error", "message": safe_body, "code": resp.status}
 
             except TokenExpiredError:
-                raise # Pass up to Engine
+                raise 
             except asyncio.TimeoutError:
-                logger.error("⏰ Request Timeout (5s)", extra={"url": url})
+                logger.error(f"⏰ Request Timeout (5s): {url}")
                 return {"status": "error", "message": "timeout"}
             except Exception as exc:
-                logger.exception("🔥 Request failed", extra={"url": url})
+                logger.exception(f"🔥 Request failed: {url}")
                 if attempt == retry:
                     return {"status": "error", "message": str(exc)}
                 await asyncio.sleep(1)
@@ -214,24 +192,18 @@ class EnhancedUpstoxAPI:
 
     @staticmethod
     def _sanity_check_margin(data: Dict[str, Any]) -> None:
-        """Raise if available_margin <= 0."""
         try:
             if data.get("status") == "success":
                 fund_data = data.get("data", {})
-                # Handle nested SEC/COM structure
-                if isinstance(fund_data, dict):
-                    segment = fund_data.get("SEC", fund_data)
-                    avail = float(segment.get("available_margin", 0.0))
-                    if avail <= 0:
-                        raise MarginInsaneError(f"Available margin {avail} – HALT TRADING")
-        except (KeyError, ValueError) as exc:
-            pass # Don't crash on bad data structure, just log
-        except MarginInsaneError:
-            raise
+                segment = fund_data.get("SEC", fund_data)
+                avail = float(segment.get("available_margin", 0.0))
+                if avail <= 0:
+                    raise MarginInsaneError(f"Available margin {avail} – HALT TRADING")
+        except (KeyError, ValueError):
+            pass 
 
     @staticmethod
     def _redact(text: str) -> str:
-        """Remove tokens / jwt from logged text."""
         patterns = [
             (r"Bearer\s+[a-zA-Z0-9\-._]+", "Bearer [REDACTED]"),
             (r'"access_token"\s*:\s*"[^"]+"', '"access_token":"[REDACTED]"'),
@@ -266,14 +238,6 @@ class EnhancedUpstoxAPI:
             return True, res["data"]["order_id"]
         return False, None
 
-    async def place_multi_order(self, orders_payload: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if settings.SAFETY_MODE != "live":
-            return {
-                "status": "success",
-                "data": [{"order_id": f"SIM-BATCH-{i}"} for i in range(len(orders_payload))],
-            }
-        return await self._request("POST", "place_multi_order", json_data=orders_payload)
-
     async def get_option_chain(self, instrument_key: str, expiry_date: str) -> Dict[str, Any]:
         return await self._request("GET", "option_chain", params={"instrument_key": instrument_key, "expiry_date": expiry_date})
 
@@ -282,15 +246,15 @@ class EnhancedUpstoxAPI:
         return res.get("data", []) if res.get("status") == "success" else []
 
     async def get_funds_and_margin(self) -> Dict[str, Any]:
-        """Public wrapper – engine uses this for real margin."""
         return await self._request("GET", "funds_margin")
 
-    async def get_holidays(self) -> Dict[str, Any]:
-        return await self._request("GET", "holidays")
-
     async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict[str, Any]:
+        """
+        FIXED: Chronological order (from_date, then to_date) for Upstox V3.
+        """
         encoded = quote(instrument_key)
-        url = f"{settings.API_BASE_URL}/v3/historical-candle/{encoded}/{interval}/{to_date}/{from_date}"
+        # Chronological order is mandatory for V3: /from_date/to_date
+        url = f"{settings.API_BASE_URL}/v3/historical-candle/{encoded}/{interval}/{from_date}/{to_date}"
         return await self._request("GET", dynamic_url=url)
 
     async def get_intraday_candles(self, instrument_key: str, interval: str) -> Dict[str, Any]:
