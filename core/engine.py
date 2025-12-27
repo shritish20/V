@@ -41,15 +41,13 @@ from core.safety_layer import MasterSafetyLayer
 from trading.live_order_executor import LiveOrderExecutor, RollbackFailure
 from trading.position_lifecycle import PositionLifecycleManager
 from analytics.vrp_zscore import VRPZScoreAnalyzer
-from prometheus_client import Counter
+from core.metrics import get_metrics     # NEW
 
 logger = setup_logger("Engine")
 
-STALE_DATA_THRESHOLD = 5.0          # Seconds
-SAFETY_CHECK_INT     = 5
-RECONCILE_INT        = 60
-
-stale_data_counter = Counter('volguard_stale_data_total', 'Times stale data detected', ['instrument'])
+STALE_DATA_THRESHOLD = 5.0
+SAFETY_CHECK_INT = 5
+RECONCILE_INT = 60
 
 class StaleDataError(RuntimeError): pass
 class EngineCircuitBreaker(Exception): pass
@@ -60,7 +58,7 @@ class VolGuard20Engine:
         self.rt_quotes: Dict[str, Dict] = {}
         self._greeks_cache: Dict[str, GreeksSnapshot] = {}
         self._cache_lock: asyncio.Lock = None
-        self._trade_lock: asyncio.Lock   = None
+        self._trade_lock: asyncio.Lock = None
         self._calibration_semaphore: asyncio.Lock = None
         self.db = HybridDatabaseManager()
         self.api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
@@ -104,15 +102,16 @@ class VolGuard20Engine:
         self.last_reconcile = 0.0
         self.last_sabr_calib = 0.0
         self.last_metrics: Optional[AdvancedMetrics] = None
+        self.metrics = get_metrics()          # NEW
 
-    # ---------------  CRITICAL FIX #1: Stale Data Guard  ---------------
+    # --------------- CRITICAL FIX #1: Stale Data Guard --------------
     def _get_safe_price(self, token: str) -> float:
         data = self.rt_quotes.get(token)
         if not data:
             raise StaleDataError(f"No market data available for {token}")
         lag = time.time() - data.get('last_updated', 0)
         if lag > STALE_DATA_THRESHOLD:
-            stale_data_counter.labels(token).inc()
+            self.metrics.log_stale_data(token)            # NEW
             if int(time.time()) % 10 == 0:
                 logger.warning(f"⚠️ STALE DATA for {token}: {lag:.1f}s lag")
             raise StaleDataError(f"Data for {token} is {lag:.1f}s old (threshold: {STALE_DATA_THRESHOLD}s)")
@@ -157,8 +156,8 @@ class VolGuard20Engine:
                 tick = time.time()
                 if now.time() >= settings.MARKET_OPEN_TIME and now.date() != last_reset_date:
                     self.safety_layer.reset_daily_counters()
+                    self.metrics.reset_daily_counters()       # NEW
                     last_reset_date = now.date()
-                    consecutive_stale_errors = 0
                 if tick - self.last_safety_check > SAFETY_CHECK_INT:
                     if not await self._check_safety_heartbeat():
                         logger.critical("🛑 SAFETY KILL SWITCH ACTIVE. HALTING.")
@@ -177,7 +176,7 @@ class VolGuard20Engine:
                         logger.critical("🚨 PERSISTENT STALE DATA – reconnecting feed")
                         if self.data_feed:
                             self.data_feed.disconnect()
-                            consecutive_stale_errors = 0
+                        consecutive_stale_errors = 0
                     await asyncio.sleep(1)
                     continue
                 await self._update_greeks_and_risk(spot)
@@ -195,7 +194,7 @@ class VolGuard20Engine:
                     except StaleDataError as e:
                         logger.warning(f"⚠️ Skipping trade cycle: {e}")
                         continue
-                    await self.trade_mgr.monitor_active_trades(self.trades)
+                await self.trade_mgr.monitor_active_trades(self.trades)
                 if tick - self.last_error_time > 60:
                     self.error_count = 0
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
@@ -253,8 +252,8 @@ class VolGuard20Engine:
             tasks = [self.trade_mgr.update_trade_prices(t, spot, flat_quotes) for t in self.trades if t.status == TradeStatus.OPEN]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-        total_pnl = sum(t.total_unrealized_pnl() for t in self.trades if t.status == TradeStatus.OPEN)
-        self.risk_mgr.update_portfolio_state(self.trades, total_pnl)
+            total_pnl = sum(t.total_unrealized_pnl() for t in self.trades if t.status == TradeStatus.OPEN)
+            self.risk_mgr.update_portfolio_state(self.trades, total_pnl)
 
     async def _calculate_metrics(self, spot: float, vix: float) -> None:
         try:
@@ -330,9 +329,7 @@ class VolGuard20Engine:
         real_legs = []
         for leg in legs:
             expiry_dt = datetime.strptime(leg["expiry"], "%Y-%m-%d").date()
-            token = self.instruments_master.get_option_token(
-                settings.UNDERLYING_SYMBOL, leg["strike"], leg["type"], expiry_dt
-            )
+            token = self.instruments_master.get_option_token(settings.UNDERLYING_SYMBOL, leg["strike"], leg["type"], expiry_dt)
             if not token:
                 return
             real_legs.append(Position(
@@ -347,8 +344,8 @@ class VolGuard20Engine:
         trade = MultiLegTrade(
             legs=real_legs, strategy_type=StrategyType(strat),
             entry_time=datetime.now(IST), expiry_date=legs[0]["expiry"],
-            expiry_type=etype, capital_bucket=bucket, status=TradeStatus.PENDING,
-            id=trade_id
+            expiry_type=etype, capital_bucket=bucket,
+            status=TradeStatus.PENDING, id=trade_id
         )
         approved, reason = await self.safety_layer.pre_trade_gate(
             trade, {"greeks_cache": self._greeks_cache}
@@ -363,8 +360,10 @@ class VolGuard20Engine:
                 async with self._trade_lock:
                     trade.status = TradeStatus.OPEN
                     self.trades.append(trade)
+                    self.metrics.log_trade(success=True, trade_id=trade.id, strategy=strat)   # NEW
                 logger.info(f"✅ Trade {trade.id} opened successfully")
             else:
+                self.metrics.log_trade(success=False, trade_id=trade.id, strategy=strat, reason=msg)  # NEW
                 logger.warning(f"⚠️ Trade {trade.id} execution failed: {msg}")
         except RollbackFailure as e:
             logger.critical("🚨🚨🚨 ROLLBACK FAILURE DETECTED 🚨🚨🚨")
@@ -388,8 +387,8 @@ class VolGuard20Engine:
                 for trade in self.trades:
                     if trade.status in (TradeStatus.OPEN, TradeStatus.EXTERNAL):
                         db_obj = DbStrategy(
-                            id=trade.id, type=trade.strategy_type.value,
-                            status=trade.status.value, entry_time=trade.entry_time,
+                            id=trade.id, type=trade.strategy_type.value, status=trade.status.value,
+                            entry_time=trade.entry_time,
                             capital_bucket=trade.capital_bucket.value,
                             pnl=trade.total_unrealized_pnl(),
                             expiry_date=datetime.strptime(trade.expiry_date, "%Y-%m-%d").date(),
@@ -461,12 +460,13 @@ class VolGuard20Engine:
         try:
             price = self._get_safe_price(token)
         except StaleDataError:
-            logger.warning(f"⚠ Zombie {token} has stale price - using fallback")
-            price = 1.0
+            price = max(strike * 0.95, 50.0)          # NEW sane fallback
+            logger.warning(f"⚠ Zombie {token} fallback price ₹{price:.2f}")
         dummy = Position(
             symbol=symbol, instrument_key=token, strike=strike, option_type=option_type,
             quantity=qty, entry_price=price, entry_time=datetime.now(IST),
-            current_price=price, current_greeks=GreeksSnapshot(timestamp=datetime.now(IST)),
+            current_price=price,
+            current_greeks=GreeksSnapshot(timestamp=datetime.now(IST)),
             expiry_type=ExpiryType.INTRADAY, capital_bucket=CapitalBucket.INTRADAY
         )
         trade = MultiLegTrade(
@@ -484,7 +484,6 @@ class VolGuard20Engine:
             tasks = [self.trade_mgr.close_trade(t, ExitReason.CIRCUIT_BREAKER) for t in self.trades if t.status == TradeStatus.OPEN]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-
 
 if __name__ == "__main__":
     engine = VolGuard20Engine()
