@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from core.engine import VolGuard20Engine, TradeStatus
-from datetime import datetime
+from datetime import datetime, timedelta
 
 @pytest.mark.asyncio
 async def test_engine_heartbeat_check_failure(mock_db, mock_upstox):
@@ -14,7 +14,7 @@ async def test_engine_heartbeat_check_failure(mock_db, mock_upstox):
     engine.data_fetcher.load_all_data = AsyncMock()
     engine.om.start = AsyncMock()
     # Setup DB to return an OLD heartbeat (Dead Sheriff)
-    old_time = datetime.utcnow() - 60
+    old_time = datetime.utcnow() - timedelta(seconds=60)
     mock_row = MagicMock()
     mock_row.sheriff_heartbeat = old_time
     mock_row.kill_switch_active = False
