@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   # ---------------------------------------------------------
-  # DATABASE (Local Fallback - Use RDS for Production!)
+  # DATABASE (Local Container)
+  # For AWS RDS: Set POSTGRES_SERVER in .env to your RDS Endpoint
+  # and you can optionally comment this service out.
   # ---------------------------------------------------------
   db:
     image: postgres:15-alpine
@@ -16,7 +18,6 @@ services:
       - postgres_data:/var/lib/postgresql/data
     networks:
       - vg_net
-    # DB Healthcheck ensures app doesn't start until DB is ready
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U volguard_user -d volguard_db"]
       interval: 5s
@@ -25,7 +26,8 @@ services:
 
   # ---------------------------------------------------------
   # VOLGUARD FORTRESS (Monolithic Container)
-  # Runs: Engine + API + Sheriff + Sentinel + Analyst
+  # Runs: Engine + API + Sheriff + Sentinel
+  # (AI Analyst Removed)
   # ---------------------------------------------------------
   app:
     build: .
@@ -42,27 +44,27 @@ services:
       - POSTGRES_SERVER=db
       - PYTHONPATH=/app
       
-      # 🚨 PRODUCTION SAFETY OVERRIDES 🚨
-      # CHANGED TO 'paper' FOR SAFETY - CHANGE TO 'live' WHEN READY
-      - SAFETY_MODE=paper  
+      # 🚨 PRODUCTION SAFETY CONTROLS 🚨
+      # Mode: 'paper' (Simulation) or 'live' (Real Money)
+      - SAFETY_MODE=${SAFETY_MODE:-paper}
       - ENV=production
       
-      # TELEGRAM ALERTS (Fill these in .env)
+      # TELEGRAM ALERTS (Required)
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     ports:
       - "8000:8000"
     volumes:
-      # Map logs out so you can read them on EC2
+      # Map logs for CloudWatch/Monitoring
       - ./logs:/app/logs
-      # Map data for persistence (Engine PID, etc)
+      # Map data for persistence (PIDs, State)
       - ./data:/app/data
       - ./dashboard_data:/app/dashboard_data
     networks:
       - vg_net
-    # AWS Health Check: Ensures API is responsive
+    # Health Check: Ensures API is responsive
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/market/live"]
       interval: 30s
       timeout: 10s
       retries: 3
