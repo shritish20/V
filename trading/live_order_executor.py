@@ -14,10 +14,12 @@ import hashlib
 from typing import List, Tuple, Dict, Optional, Any
 from core.models import MultiLegTrade, Position
 from core.config import settings
+from core.metrics import get_metrics            # NEW
+
 logger = logging.getLogger("LiveExecutor")
 
-MAX_SLIPPAGE_PCT = float(getattr(settings, "MAX_SLIPPAGE_PCT", 0.05))
-SMART_BUFFER_PCT = float(getattr(settings, "SMART_BUFFER_PCT", 0.03))
+MAX_SLIPPAGE_PCT   = float(getattr(settings, "MAX_SLIPPAGE_PCT", 0.05))
+SMART_BUFFER_PCT   = float(getattr(settings, "SMART_BUFFER_PCT", 0.03))
 DEFAULT_FREEZE_QTY = 1800
 
 class RollbackFailure(RuntimeError):
@@ -27,6 +29,7 @@ class LiveOrderExecutor:
     def __init__(self, api_client, order_manager) -> None:
         self.api = api_client
         self.om = order_manager
+        self.metrics = get_metrics()            # NEW
 
     async def execute_with_hedge_priority(
         self, trade: MultiLegTrade
@@ -40,19 +43,23 @@ class LiveOrderExecutor:
         """
         logger.info("🛡️ Execution started", extra={"trade_id": trade.id})
         hedge_legs = [l for l in trade.legs if l.quantity > 0]
-        risk_legs = [l for l in trade.legs if l.quantity < 0]
+        risk_legs  = [l for l in trade.legs if l.quantity < 0]
+
         if hedge_legs:
             ok, msg = await self._execute_batch(hedge_legs, trade.id, "HEDGE")
             if not ok:
                 return False, f"Hedge failed: {msg}"
+
         if hedge_legs and risk_legs:
             await asyncio.sleep(0.5)
+
         if risk_legs:
             ok, msg = await self._execute_batch(risk_legs, trade.id, "RISK")
             if not ok:
                 logger.error("❌ Risk failed – rolling back hedge", extra={"trade_id": trade.id})
                 await self._rollback(hedge_legs)
                 return False, f"Risk failed (hedge rolled back): {msg}"
+
         logger.info("✅ Execution complete", extra={"trade_id": trade.id})
         return True, "All legs executed"
 
@@ -62,7 +69,7 @@ class LiveOrderExecutor:
         quotes = await self._fetch_quotes([l.instrument_key for l in legs])
         if not quotes:
             logger.warning("⚠️ No quotes – falling back to Market Orders", extra={"trade_id": trade_id})
-            quotes = {}
+
         payload: List[Dict[str, Any]] = []
         for idx, leg in enumerate(legs):
             slices = self._slice_quantity(abs(leg.quantity))
@@ -84,8 +91,10 @@ class LiveOrderExecutor:
                     "tag": f"{trade_id}-{side}-{idx}",
                     "correlation_id": cid,
                 })
+
         if not payload:
             return True, "Nothing to send"
+
         try:
             logger.info(f"📤 Sending batch of {len(payload)} orders", extra={"trade_id": trade_id})
             res = await self.api.place_multi_order(payload)
@@ -120,11 +129,10 @@ class LiveOrderExecutor:
 
     def _slice_quantity(self, qty: int) -> List[int]:
         freeze_limit = getattr(settings, "NIFTY_FREEZE_QTY", DEFAULT_FREEZE_QTY)
-        slices: List[int] = []
         if qty <= freeze_limit:
             return [qty]
         full_slices, remainder = divmod(qty, freeze_limit)
-        slices.extend([freeze_limit] * full_slices)
+        slices = [freeze_limit] * full_slices
         if remainder > 0:
             slices.append(remainder)
         return slices
@@ -173,7 +181,8 @@ class LiveOrderExecutor:
                 "tag": f"ROLLBACK-{idx}",
                 "correlation_id": f"RB-{int(time.time() * 1000)}-{idx}",
             })
-            logger.info(f"  🔄 Reversing: {leg.instrument_key} | {payload[-1]['transaction_type']} {payload[-1]['quantity']}")
+            logger.info(f" 🔄 Reversing: {leg.instrument_key} | {payload[-1]['transaction_type']} {payload[-1]['quantity']}")
+
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             try:
@@ -183,7 +192,8 @@ class LiveOrderExecutor:
                     logger.info("✅ Rollback orders placed successfully")
                     orders = res.get("data", [])
                     for order in orders:
-                        logger.info(f"  ✅ Rollback order: {order.get('order_id')}")
+                        logger.info(f" ✅ Rollback order: {order.get('order_id')}")
+                    self.metrics.log_rollback(trade_id="UNKNOWN", legs_count=len(legs), success=True)   # NEW
                     return
                 else:
                     error_msg = res.get("message", "Unknown broker error")
@@ -201,7 +211,8 @@ class LiveOrderExecutor:
                 else:
                     logger.critical("🔥 ROLLBACK COMPLETELY FAILED – NAKED POSITION RISK")
                     for leg in legs:
-                        logger.critical(f"   - {leg.instrument_key}: {leg.quantity} qty")
+                        logger.critical(f" - {leg.instrument_key}: {leg.quantity} qty")
+                    self.metrics.log_rollback(trade_id="UNKNOWN", legs_count=len(legs), success=False)   # NEW
                     raise RollbackFailure(
                         f"Unable to rollback {len(legs)} positions after {max_attempts} attempts. MANUAL INTERVENTION REQUIRED"
                     ) from exc
