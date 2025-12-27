@@ -25,6 +25,7 @@ from database.models import (
     DbMarketSnapshot, DbCapitalUsage, DbTradeJournal
 )
 from core.config import settings
+from core.metrics import get_metrics   # NEW
 
 logger = logging.getLogger("API_Routes")
 router = APIRouter(prefix="/api", tags=["VolGuard Dashboard"])
@@ -38,13 +39,13 @@ async def get_db_session() -> AsyncSession:
     async with db.get_session() as session:
         yield session
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # TAB 1: LIVE FEED (The "Matrix")
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 @router.get("/market/live")
 async def get_live_quant_feed(session: AsyncSession = Depends(get_db_session)):
     try:
-        res = await session.execute(select(DbMarketSnapshot).order_by(DbMarketSnapshot.timestamp.desc()).limit(1))
+        res = await session.execute(select(DbMarketSnapshot).order_by(DbMarketSnapshot.timestamp.desc()))
         data = res.scalars().first()
         if not data:
             return {"status": "waiting_for_engine"}
@@ -80,9 +81,9 @@ async def get_live_quant_feed(session: AsyncSession = Depends(get_db_session)):
         logger.error(f"Live Feed Error: {e}")
         return {}
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # TAB 2: STRATEGIES (Execution)
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 @router.get("/strategies/active")
 async def get_active_strategies(session: AsyncSession = Depends(get_db_session)):
     try:
@@ -105,9 +106,9 @@ async def get_active_strategies(session: AsyncSession = Depends(get_db_session))
         logger.error(f"Strategy Fetch Error: {e}")
         return []
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # TAB 3: RISK DESK (Sheriff)
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 @router.get("/risk/detailed")
 async def get_risk_desk(session: AsyncSession = Depends(get_db_session)):
     try:
@@ -137,9 +138,9 @@ async def get_risk_desk(session: AsyncSession = Depends(get_db_session)):
         logger.error(f"Risk Desk Error: {e}")
         return {}
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # TAB 4: SYSTEM (Logs)
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 @router.get("/system/logs")
 async def get_system_logs(lines: int = 100):
     possible_paths = [
@@ -158,13 +159,13 @@ async def get_system_logs(lines: int = 100):
     except Exception as e:
         return {"logs": [f"[ERROR] Could not read logs: {str(e)}"]}
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # TAB 5: JOURNAL
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 @router.get("/journal/entries")
 async def get_journal_entries(session: AsyncSession = Depends(get_db_session)):
     try:
-        res = await session.execute(select(DbTradeJournal).order_by(desc(DbTradeJournal.date)).limit(50))
+        res = await session.execute(select(DbTradeJournal).order_by(desc(DbTradeJournal.date)).limit(100))
         return res.scalars().all()
     except Exception as e:
         logger.error(f"Journal Error: {e}")
@@ -189,9 +190,9 @@ async def update_journal_note(
         logger.error(f"Journal Update Failed: {e}")
         raise HTTPException(status_code=500, detail="Update failed")
 
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 # CONTROL: PANIC BUTTON
-# -------------------------------------------------------------------------
+# ------------------------------------------------------------------------
 @router.post("/emergency/flatten")
 async def trigger_emergency_flatten(session: AsyncSession = Depends(get_db_session)):
     logger.critical("🚨 API RECEIVED EMERGENCY FLATTEN COMMAND 🚨")
@@ -240,34 +241,79 @@ async def reset_kill_switch(session: AsyncSession = Depends(get_db_session)):
         await session.rollback()
         raise HTTPException(status_code=500, detail="Failed to Reset")
 
-# -------------------------------------------------------------------------
-# NEW: DEEP HEALTH PROBE
-# -------------------------------------------------------------------------
-@router.get("/health/deep")
-async def deep_health(session: AsyncSession = Depends(get_db_session)):
+# ------------------------------------------------------------------------
+# NEW: LIVE METRICS ENDPOINT (replaces Prometheus)
+# ------------------------------------------------------------------------
+@router.get("/metrics/live")
+async def get_live_metrics():
+    """
+    Real-time metrics for React dashboard
+    Replaces Prometheus - serves JSON instead of scrape format
+    """
+    metrics = get_metrics()
+    return {
+        "status": "success",
+        "data": metrics.to_dict()
+    }
+
+# ------------------------------------------------------------------------
+# NEW: ENHANCED HEALTH WITH METRICS
+# ------------------------------------------------------------------------
+@router.get("/health/detailed")
+async def detailed_health(session: AsyncSession = Depends(get_db_session)):
     """
     Returns 503 if any critical fix is broken.
     """
+    metrics = get_metrics()
+    
     # 1. Engine running
     engine_pid_file = Path("data/engine.pid")
     if not engine_pid_file.exists():
         raise HTTPException(status_code=503, detail="engine_not_running")
-
+    
     # 2. Negative capital usage (corruption check)
-    row = await session.execute(text(
-        "SELECT COUNT(*) FROM capital_usage WHERE used_amount < 0"
-    ))
+    row = await session.execute(text("SELECT COUNT(*) FROM capital_usage WHERE used_amount < 0"))
     if row.scalar() > 0:
         raise HTTPException(status_code=503, detail="negative_capital_usage")
-
+    
     # 3. Duplicate capital ledger rows (idempotency breach)
     row = await session.execute(text("""
         SELECT COUNT(*) FROM (
-            SELECT trade_id, bucket FROM capital_ledger 
+            SELECT trade_id, bucket FROM capital_ledger
             GROUP BY trade_id, bucket HAVING COUNT(*) > 1
         ) t
     """))
     if row.scalar() > 0:
         raise HTTPException(status_code=503, detail="duplicate_allocations")
-
-    return {"status": "pass", "timestamp": datetime.utcnow()}
+    
+    # 4. Build alerts from metrics
+    alerts = []
+    if metrics.rollback_attempts > 0:
+        alerts.append({
+            "severity": "CRITICAL",
+            "message": f"{metrics.rollback_attempts} rollback attempts today"
+        })
+    
+    if metrics.last_stale_data:
+        minutes_since = (datetime.utcnow() - metrics.last_stale_data).total_seconds() / 60
+        if minutes_since < 5:
+            alerts.append({
+                "severity": "WARNING", 
+                "message": f"Stale data detected {minutes_since:.1f}m ago"
+            })
+    
+    total_allocs = metrics.capital_allocation_success + metrics.capital_allocation_failed
+    if total_allocs > 0:
+        alloc_rate = metrics.capital_allocation_success / total_allocs
+        if alloc_rate < 0.8:
+            alerts.append({
+                "severity": "WARNING",
+                "message": f"Low allocation success rate: {alloc_rate*100:.1f}%"
+            })
+    
+    return {
+        "status": "healthy" if not alerts else "degraded",
+        "alerts": alerts,
+        "metrics": metrics.to_dict(),
+        "timestamp": datetime.utcnow().isoformat()
+    }
