@@ -115,6 +115,10 @@ class MarginGuard:
         HARDENED: Uses NSE margin table + VIX multiplier + DB Sanity Check
         CRITICAL FIX: Added validation for empty trades and zero quantities
         """
+        # ===== GUARD: Invalid LOT_SIZE =====
+        if settings.LOT_SIZE <= 0:
+            raise ValueError(f"Invalid LOT_SIZE in settings: {settings.LOT_SIZE}")
+
         try:
             if not trade.legs or len(trade.legs) == 0:
                 logger.error("❌ Cannot calculate margin for trade with no legs")
