@@ -79,7 +79,7 @@ class SmartCapitalAllocator:
 
                 ledger_check = text("""SELECT id FROM capital_ledger WHERE trade_id = :trade_id AND bucket = :bucket LIMIT 1""")
                 check_result = await session.execute(ledger_check, {"trade_id": trade_id, "bucket": bucket})
-                if check_result.scalar():
+                if await check_result.scalar():
                     logger.info(f"✓ Allocation already exists: {trade_id} {bucket}")
                     self.metrics.log_allocation(True, bucket, amount, trade_id)    # NEW
                     return True
