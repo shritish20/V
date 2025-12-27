@@ -9,34 +9,27 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+import os
 from typing import Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy import select, text
 from core.config import settings
 from database.models import DbCapitalUsage
-
 logger = logging.getLogger("CapitalAllocator")
 
-# Config
-MARGIN_REFRESH_SEC = 30  # Broker margin cache TTL
+MARGIN_REFRESH_SEC = 30
 
 class SmartCapitalAllocator:
     def __init__(self, fallback_account_size: float, allocation_config: Dict[str, float], db) -> None:
         self._fallback_size = fallback_account_size
         self._bucket_pct = allocation_config
         self._db = db
-        
-        # We don't need asyncio.Lock because we use strictly stronger DB row locks
         self._last_margin_fetch = 0.0
         self._cached_available_margin = fallback_account_size
 
-    # --- PUBLIC INTERFACE ---
-
     async def get_status(self) -> Dict[str, Any]:
-        """Return current capital status (includes real margin)."""
         margin = await self._get_real_margin()
         used = await self._get_used_breakdown()
-        
         buckets = {}
         for bucket, pct in self._bucket_pct.items():
             limit = margin * pct
@@ -46,7 +39,6 @@ class SmartCapitalAllocator:
                 "used": used_amt,
                 "avail": max(0.0, limit - used_amt),
             }
-            
         return {
             "total": margin,
             "cached_margin": margin,
@@ -63,161 +55,77 @@ class SmartCapitalAllocator:
         3. Inserts ledger entry (Idempotent).
         4. Updates usage.
         """
-        # 1. Global Safety Check (Read-only first)
         margin = await self._get_real_margin()
         draw_down = await self._current_draw_down_pct(margin)
-        
         if draw_down > settings.DAILY_LOSS_LIMIT_PCT:
             logger.critical(f"🛑 DRAW-DOWN BRAKE HIT ({draw_down*100:.2f}%) Allocation Denied")
             return False
-
         try:
             limit = margin * self._bucket_pct.get(bucket, 0.0)
-            
             async with self._db.get_session() as session:
-                # START ATOMIC TRANSACTION
-                
-                # Step A: Lock the usage row for update
-                # This ensures no other trade can read/write this bucket until we finish
-                # If row doesn't exist, we handle creation in Step D, but locking ensures serialization
-                stmt = text("""
-                    SELECT used_amount 
-                    FROM capital_usage 
-                    WHERE bucket = :bucket 
-                    FOR UPDATE
-                """)
-                result = await session.execute(stmt, {"bucket": bucket})
+                lock_stmt = text("""SELECT used_amount FROM capital_usage WHERE bucket = :bucket FOR UPDATE""")
+                result = await session.execute(lock_stmt, {"bucket": bucket})
                 row = result.fetchone()
-                
                 current_used = row[0] if row else 0.0
+                logger.debug(f"🔒 Lock acquired for bucket '{bucket}' | PID {os.getpid()} | Current: ₹{current_used:,.0f}")
                 new_used = current_used + amount
-                
-                # Step B: Check limit WHILE LOCKED
                 if new_used > limit:
-                    logger.warning(
-                        f"🚫 Allocation Denied: {bucket} | "
-                        f"Used: {current_used:,.0f} + {amount:,.0f} = {new_used:,.0f} "
-                        f"> Limit: {limit:,.0f}"
-                    )
-                    return False # Transaction ends (Lock released)
-
-                # Step C: Insert ledger entry (Idempotent via Unique Constraint)
-                # If trade_id+bucket exists, this returns nothing (DO NOTHING)
-                ledger_stmt = text("""
-                    INSERT INTO capital_ledger (trade_id, bucket, amount, date, timestamp)
-                    VALUES (:trade_id, :bucket, :amount, CURRENT_DATE, NOW())
-                    ON CONFLICT (trade_id, bucket) DO NOTHING
-                    RETURNING id
-                """)
-                ledger_result = await session.execute(ledger_stmt, {
-                    "trade_id": trade_id,
-                    "bucket": bucket,
-                    "amount": amount
-                })
-                
-                inserted_id = ledger_result.scalar()
-                
-                if not inserted_id:
-                    # Row exists, we already allocated. Return True (Idempotent Success).
-                    # We do NOT update usage again.
+                    logger.warning(f"🚫 Allocation Denied: {bucket} | Used: {current_used:,.0f} + {amount:,.0f} = {new_used:,.0f} > Limit: {limit:,.0f}")
+                    return False
+                ledger_check = text("""SELECT id FROM capital_ledger WHERE trade_id = :trade_id AND bucket = :bucket LIMIT 1""")
+                check_result = await session.execute(ledger_check, {"trade_id": trade_id, "bucket": bucket})
+                if check_result.scalar():
                     logger.info(f"✓ Allocation already exists: {trade_id} {bucket}")
                     return True
-
-                # Step D: Update usage summary
-                # Upsert logic handles first-time creation
-                update_stmt = text("""
-                    INSERT INTO capital_usage (bucket, used_amount, last_updated)
-                    VALUES (:bucket, :amount, NOW())
-                    ON CONFLICT (bucket) DO UPDATE 
-                    SET used_amount = capital_usage.used_amount + :amount,
-                        last_updated = NOW()
-                """)
+                ledger_stmt = text("""INSERT INTO capital_ledger (trade_id, bucket, amount, date, timestamp) VALUES (:trade_id, :bucket, :amount, CURRENT_DATE, NOW()) RETURNING id""")
+                ledger_result = await session.execute(ledger_stmt, {"trade_id": trade_id, "bucket": bucket, "amount": amount})
+                if not ledger_result.scalar():
+                    logger.error(f"❌ Ledger insert failed for {trade_id}")
+                    return False
+                update_stmt = text("""INSERT INTO capital_usage (bucket, used_amount, last_updated) VALUES (:bucket, :amount, NOW()) ON CONFLICT (bucket) DO UPDATE SET used_amount = capital_usage.used_amount + :amount, last_updated = NOW()""")
                 await session.execute(update_stmt, {"bucket": bucket, "amount": amount})
-                
-                # COMMIT TRANSACTION
                 await self._db.safe_commit(session)
-                
-                logger.info(
-                    f"💰 Capital Allocated: {bucket} | "
-                    f"Trade: {trade_id} | Amount: {amount:,.0f} | New Usage: {new_used:,.0f}"
-                )
+                logger.info(f"💰 Capital Allocated: {bucket} | Trade: {trade_id} | Amount: {amount:,.0f} | New Usage: {new_used:,.0f}")
                 return True
-
         except Exception as e:
             logger.error(f"🔥 Allocation System Error: {e}", exc_info=True)
             return False
 
     async def release_capital(self, bucket: str, amount: float, trade_id: str) -> None:
-        """ATOMIC RELEASE: Mirrors allocation logic with locking."""
         try:
             async with self._db.get_session() as session:
-                # Step A: Delete ledger entry
-                delete_stmt = text("""
-                    DELETE FROM capital_ledger 
-                    WHERE trade_id = :trade_id AND bucket = :bucket
-                    RETURNING amount
-                """)
-                result = await session.execute(delete_stmt, {
-                    "trade_id": trade_id,
-                    "bucket": bucket
-                })
-                
+                delete_stmt = text("""DELETE FROM capital_ledger WHERE trade_id = :trade_id AND bucket = :bucket RETURNING amount""")
+                result = await session.execute(delete_stmt, {"trade_id": trade_id, "bucket": bucket})
                 deleted_row = result.fetchone()
                 if not deleted_row:
-                    return # Nothing to release (Idempotent)
-
-                # Use the ACTUAL amount that was locked
+                    return
                 released_amount = deleted_row[0]
-
-                # Step B: Update usage summary (Atomic decrement)
-                update_stmt = text("""
-                    UPDATE capital_usage 
-                    SET used_amount = GREATEST(0, used_amount - :amount),
-                        last_updated = NOW()
-                    WHERE bucket = :bucket
-                """)
-                await session.execute(update_stmt, {
-                    "bucket": bucket, 
-                    "amount": released_amount
-                })
-                
+                update_stmt = text("""UPDATE capital_usage SET used_amount = GREATEST(0, used_amount - :amount), last_updated = NOW() WHERE bucket = :bucket""")
+                await session.execute(update_stmt, {"bucket": bucket, "amount": released_amount})
                 await self._db.safe_commit(session)
                 logger.info(f"💸 Capital Released: {bucket} | Trade: {trade_id} | Amount: {released_amount:,.0f}")
-
         except Exception as e:
             logger.error(f"Release Error: {e}", exc_info=True)
 
-    # --- INTERNAL HELPERS ---
-
     async def _get_real_margin(self) -> float:
-        """Return available margin from broker (cached)."""
         now = time.time()
         if now - self._last_margin_fetch < MARGIN_REFRESH_SEC:
             return self._cached_available_margin
-
-        # Avoid circular import
-        from trading.api_client import EnhancedUpstoxAPI
-
         if settings.SAFETY_MODE == "paper" and "TEST" in settings.UPSTOX_ACCESS_TOKEN:
             return self._fallback_size
-
         try:
-            # We create a temporary client just for this check
-            # In a highly optimized engine, we might pass the existing API client
+            from trading.api_client import EnhancedUpstoxAPI
             api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
             raw = await api.get_funds_and_margin()
             await api.close()
-            
             eq = raw.get("data", {}).get("equity", {})
             avail = float(eq.get("available_margin", 0.0))
-            
             if avail > 0:
                 self._cached_available_margin = avail
         except Exception:
-            pass # Keep using cache on failure
+            pass
         finally:
             self._last_margin_fetch = now
-            
         return self._cached_available_margin
 
     async def _get_used_breakdown(self) -> Dict[str, float]:
@@ -230,19 +138,14 @@ class SmartCapitalAllocator:
             return {}
 
     async def _current_draw_down_pct(self, current_margin: float) -> float:
-        """Calculate drawdown based on Start-of-Day Equity snapshot in DB."""
         from database.models import DbRiskState
         from sqlalchemy import desc
-        
         try:
             async with self._db.get_session() as session:
                 stmt = select(DbRiskState).order_by(desc(DbRiskState.timestamp)).limit(1)
                 result = await session.execute(stmt)
                 state = result.scalars().first()
-                
                 if state and state.sod_equity > 0:
-                    # Drawdown = (Current - SOD) / SOD
-                    # If positive (profit), DD is 0
                     dd = (state.current_equity - state.sod_equity) / state.sod_equity
                     return abs(dd) if dd < 0 else 0.0
                 return 0.0
