@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – The Sheriff v2.0 (Fortress Edition)
-- Independent Process (Process 3)
-- Monitors Realized + Unrealized PnL via Broker API
-- AUTO-KILL: Sends SIGTERM to Engine if limits breached.
-- Token-Aware: Fetches latest token from DB to avoid expiry.
+VolGuard 20.0 – The Sheriff (Risk Watchdog)
+- INDEPENDENT PROCESS: Monitors PnL & Equity.
+- SINGLETON DB: Uses shared pool.
+- V3 EXECUTION: Uses updated Order model for flattening.
+- ENGINE KILLER: Sends SIGTERM if Drawdown > Limit.
 """
 import asyncio
 import logging
@@ -18,15 +18,14 @@ from datetime import datetime, time
 sys.path.append(os.getcwd())
 
 from core.config import settings
+from core.models import Order  # <--- CRITICAL: Required for V3 API calls
 from trading.api_client import EnhancedUpstoxAPI
 from database.manager import HybridDatabaseManager
 from database.models import DbRiskState, DbTokenState
 from sqlalchemy import select
 
-# --- FIX: Create logs directory before configuring logger ---
+# --- SETUP LOGGING ---
 os.makedirs("logs", exist_ok=True)
-
-# Structured Logging
 logging.basicConfig(
     level=logging.INFO, 
     format="%(asctime)s | 🤠 SHERIFF | %(levelname)s | %(message)s",
@@ -39,7 +38,7 @@ logger = logging.getLogger("Sheriff")
 
 # CONFIGURATION
 MAX_DRAWDOWN_PCT = getattr(settings, 'DAILY_LOSS_LIMIT_PCT', 0.03) 
-MARKET_OPEN_TIME = time(9, 15)
+MARKET_OPEN_TIME = settings.MARKET_OPEN_TIME
 HEARTBEAT_INTERVAL = 2
 ENGINE_PID_FILE = Path("data/engine.pid")
 
@@ -51,6 +50,7 @@ async def get_valid_token(db: HybridDatabaseManager) -> str:
                 select(DbTokenState).order_by(DbTokenState.last_refreshed.desc()).limit(1)
             )
             state = result.scalars().first()
+            # Add 60s buffer to expiry check
             if state and datetime.utcnow() < state.expires_at:
                 return state.access_token
     except Exception:
@@ -59,62 +59,55 @@ async def get_valid_token(db: HybridDatabaseManager) -> str:
 
 async def _shutdown_engine():
     """
-    NEW: Send SIGTERM to Engine process for graceful shutdown.
-    Prevents the engine from opening new trades while we are flattening.
+    Sends SIGTERM to Engine process.
     """
     try:
         if not ENGINE_PID_FILE.exists():
-            logger.warning("⚠️ Engine PID file not found - cannot send shutdown signal")
             return
         
         pid_str = ENGINE_PID_FILE.read_text().strip()
         if not pid_str.isdigit():
-            logger.error(f"❌ Invalid PID in file: {pid_str}")
             return
         
         engine_pid = int(pid_str)
-        logger.critical(f"🛑 Sending SIGTERM to Engine (PID: {engine_pid})")
+        logger.critical(f"🛑 SHERIFF STOPPING ENGINE (PID: {engine_pid})")
         
         try:
-            # Send graceful shutdown signal
             os.kill(engine_pid, signal.SIGTERM)
         except ProcessLookupError:
-            logger.info("✅ Engine process already gone.")
             ENGINE_PID_FILE.unlink(missing_ok=True)
             return
 
-        # Wait for process to die (max 5 seconds)
+        # Wait for death
         for i in range(5):
             await asyncio.sleep(1)
             try:
-                os.kill(engine_pid, 0)  # Signal 0 = check existence
+                os.kill(engine_pid, 0)
             except ProcessLookupError:
-                logger.info(f"✅ Engine shutdown confirmed after {i+1}s")
+                logger.info("✅ Engine stopped.")
                 ENGINE_PID_FILE.unlink(missing_ok=True)
                 return
         
-        # Force kill if still alive
-        logger.critical("⚠️ Engine did not respond to SIGTERM - sending SIGKILL")
+        # Force Kill
         try:
             os.kill(engine_pid, signal.SIGKILL)
-        except OSError:
-            pass
+        except OSError: pass
         ENGINE_PID_FILE.unlink(missing_ok=True)
         
     except Exception as e:
-        logger.error(f"Failed to shutdown engine: {e}")
+        logger.error(f"Engine Shutdown Failed: {e}")
 
 async def run_watchdog():
+    # SINGLETON DB
     db = HybridDatabaseManager()
     await db.init_db()
     
-    # Initial Token Fetch
+    # Initial Token
     token = await get_valid_token(db)
     api = EnhancedUpstoxAPI(token)
     
-    logger.info(f"🤠 Sheriff Online. Max Drawdown Limit: {MAX_DRAWDOWN_PCT*100}%")
+    logger.info(f"🤠 Sheriff Online. Kill Limit: {MAX_DRAWDOWN_PCT*100}%")
     
-    # State Variables
     sod_equity = 0.0
     kill_switch_triggered = False
     last_flatten_time = datetime.min
@@ -122,18 +115,16 @@ async def run_watchdog():
 
     while True:
         try:
-            # --- 0. REFRESH TOKEN IF NEEDED ---
-            # Every 100 loops (~3 mins), check if DB has a newer token
+            # 0. Token Refresh (Every ~3 mins)
             if int(datetime.utcnow().timestamp()) % 200 == 0:
                 new_token = await get_valid_token(db)
-                if new_token != api.access_token:
-                    api = EnhancedUpstoxAPI(new_token)
-                    logger.info("🔄 Sheriff picked up new token from DB")
+                if new_token != api._token: # Access token safely
+                     await api.update_token(new_token)
+                     logger.info("🔄 Sheriff synced token")
 
-            # --- 1. BROKER DATA (SOURCE OF TRUTH) ---
+            # 1. Broker Data (Source of Truth)
             funds_resp = await api.get_funds_and_margin()
             if funds_resp.get("status") != "success":
-                logger.warning("Broker API glitch. Retrying...")
                 await asyncio.sleep(1)
                 continue
                 
@@ -142,22 +133,23 @@ async def run_watchdog():
             avail_margin = float(data.get("available_margin", 0.0))
             current_equity = avail_margin + used_margin
             
-            now = datetime.now().time()
+            now = datetime.now(settings.IST).time()
 
-            # --- 2. SOD RE-LOCK LOGIC (9:15 AM Reset) ---
+            # 2. SOD Lock Logic
+            # Reset SOD if we are in pre-open or just started
             if sod_equity == 0.0 or (now >= MARKET_OPEN_TIME and now < time(9, 16) and not sod_locked_today):
                 sod_equity = current_equity
                 sod_locked_today = True
-                logger.info(f"🌅 SOD Equity Locked: ₹{sod_equity:,.2f}")
+                logger.info(f"🌅 SOD Equity Locked: {sod_equity:,.2f}")
             
             if now > time(23, 0): sod_locked_today = False
 
-            # --- 3. CALCULATE DRAWDOWN ---
+            # 3. Drawdown Calc
             drawdown_pct = 0.0
             if sod_equity > 0:
                 drawdown_pct = (current_equity - sod_equity) / sod_equity
             
-            # --- 4. CHECK DB FOR MANUAL KILL SWITCH ---
+            # 4. DB Kill Switch Check
             manual_kill = False
             async with db.get_session() as session:
                 res = await session.execute(
@@ -167,7 +159,7 @@ async def run_watchdog():
                 if latest_state and latest_state.kill_switch_active:
                     manual_kill = True
 
-            # --- 5. DECISION LOGIC ---
+            # 5. Decision Logic
             should_flatten = False
             
             if drawdown_pct < -MAX_DRAWDOWN_PCT:
@@ -176,16 +168,17 @@ async def run_watchdog():
                 kill_switch_triggered = True
             
             if manual_kill:
-                logger.critical("🚨 MANUAL KILL SWITCH DETECTED FROM DB")
+                logger.critical("🚨 MANUAL KILL SWITCH ACTIVE")
                 should_flatten = True
                 kill_switch_triggered = True
 
+            # Reset if recovered and NOT manual kill
             if kill_switch_triggered and not manual_kill and drawdown_pct > -0.01:
-                logger.info(f"✅ Equity Recovered ({drawdown_pct*100:.2f}%). Resetting Kill Switch.")
+                logger.info(f"✅ Recovery Detected ({drawdown_pct*100:.2f}%). Disarming.")
                 kill_switch_triggered = False
                 should_flatten = False
 
-            # --- 6. WRITE HEARTBEAT ---
+            # 6. Heartbeat Write
             state = DbRiskState(
                 sheriff_heartbeat=datetime.utcnow(),
                 sod_equity=sod_equity,
@@ -195,7 +188,8 @@ async def run_watchdog():
                 is_flattening=should_flatten
             )
             
-            for attempt in range(3):
+            # Retry loop for heartbeat to avoid crashing watchdog on DB blip
+            for _ in range(3):
                 try:
                     async with db.get_session() as session:
                         session.add(state)
@@ -204,12 +198,12 @@ async def run_watchdog():
                 except Exception:
                     await asyncio.sleep(0.5)
 
-            # --- 7. EXECUTE FLATTENING & KILL ENGINE ---
+            # 7. Execution
             if should_flatten:
-                # FIRST: Kill the Engine so it stops fighting us
+                # A. Kill Engine First
                 await _shutdown_engine()
                 
-                # THEN: Flatten positions
+                # B. Flatten Positions
                 if (datetime.utcnow() - last_flatten_time).total_seconds() > 5:
                     positions = await api.get_short_term_positions()
                     open_positions = [p for p in positions if int(p['quantity']) != 0]
@@ -217,15 +211,20 @@ async def run_watchdog():
                     if open_positions:
                         logger.warning(f"📉 FLATTENING {len(open_positions)} POSITIONS...")
                         for pos in open_positions:
-                            await api.place_order({
-                                "instrument_token": pos['instrument_token'],
-                                "quantity": abs(int(pos['quantity'])),
-                                "transaction_type": "SELL" if int(pos['quantity']) > 0 else "BUY",
-                                "order_type": "MARKET",
-                                "product": "I",
-                                "validity": "DAY",
-                                "tag": "SHERIFF_KILL"
-                            })
+                            qty = int(pos['quantity'])
+                            # Construct Proper Order Object for V3 API
+                            order = Order(
+                                quantity=abs(qty),
+                                product="I", # Intraday for safety
+                                validity="DAY",
+                                price=0.0, # Market
+                                trigger_price=0.0,
+                                instrument_key=pos['instrument_token'],
+                                order_type="MARKET",
+                                transaction_type="SELL" if qty > 0 else "BUY",
+                                tag="SHERIFF_KILL"
+                            )
+                            await api.place_order(order)
                         last_flatten_time = datetime.utcnow()
                     else:
                         logger.info("✅ All Positions Closed.")
