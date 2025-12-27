@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 Fortress Engine (V3 Hybrid)
-- DATA SAFETY: Enforces 5-second freshness check on all ticks.
-- SINGLETON DB: Prevents AWS Pool Exhaustion.
+VolGuard 20.0 Fortress Engine (V3 Hybrid) – 24×7 Market-Aware Edition
+- DATA SAFETY: 5-second freshness check on every tick.
+- SINGLETON DB: Prevents AWS pool exhaustion.
 - STRATEGY: Pure Quant (No AI).
 - HYBRID: V3 Execution / V2 Option Chain
+- MARKET-AWARE: WebSocket only when NSE is open; historical fetch only after 7 PM.
 """
 from __future__ import annotations
 import asyncio
@@ -41,7 +42,8 @@ from core.safety_layer import MasterSafetyLayer
 from trading.live_order_executor import LiveOrderExecutor, RollbackFailure
 from trading.position_lifecycle import PositionLifecycleManager
 from analytics.vrp_zscore import VRPZScoreAnalyzer
-from core.metrics import get_metrics     # NEW
+from core.metrics import get_metrics
+from core.market_session import MarketSessionManager      # ← NEW
 
 logger = setup_logger("Engine")
 
@@ -49,17 +51,19 @@ STALE_DATA_THRESHOLD = 5.0
 SAFETY_CHECK_INT = 5
 RECONCILE_INT = 60
 
+
 class StaleDataError(RuntimeError): pass
 class EngineCircuitBreaker(Exception): pass
 
+
 class VolGuard20Engine:
     def __init__(self) -> None:
-        logger.info("🛡️ VolGuard-20 FORTRESS ENGINE Initialising (V3 Hybrid)")
+        logger.info("🛡️ VolGuard-20 FORTRESS ENGINE Initialising (V3 Hybrid – 24×7)")
         self.rt_quotes: Dict[str, Dict] = {}
         self._greeks_cache: Dict[str, GreeksSnapshot] = {}
-        self._cache_lock: asyncio.Lock = None
-        self._trade_lock: asyncio.Lock = None
-        self._calibration_semaphore: asyncio.Lock = None
+        self._cache_lock: asyncio.Lock | None = None
+        self._trade_lock: asyncio.Lock | None = None
+        self._calibration_semaphore: asyncio.Lock | None = None
         self.db = HybridDatabaseManager()
         self.api = EnhancedUpstoxAPI(settings.UPSTOX_ACCESS_TOKEN)
         self.token_manager = None
@@ -102,16 +106,17 @@ class VolGuard20Engine:
         self.last_reconcile = 0.0
         self.last_sabr_calib = 0.0
         self.last_metrics: Optional[AdvancedMetrics] = None
-        self.metrics = get_metrics()          # NEW
+        self.metrics = get_metrics()
+        self.market_session = MarketSessionManager(self.api)   # ← NEW
 
-    # --------------- CRITICAL FIX #1: Stale Data Guard --------------
+    # --------------- CRITICAL FIX #1: Stale Data Guard -------------
     def _get_safe_price(self, token: str) -> float:
         data = self.rt_quotes.get(token)
         if not data:
             raise StaleDataError(f"No market data available for {token}")
         lag = time.time() - data.get('last_updated', 0)
         if lag > STALE_DATA_THRESHOLD:
-            self.metrics.log_stale_data(token)            # NEW
+            self.metrics.log_stale_data(token)
             if int(time.time()) % 10 == 0:
                 logger.warning(f"⚠️ STALE DATA for {token}: {lag:.1f}s lag")
             raise StaleDataError(f"Data for {token} is {lag:.1f}s old (threshold: {STALE_DATA_THRESHOLD}s)")
@@ -133,13 +138,28 @@ class VolGuard20Engine:
         self.token_manager = await setup_token_manager(self.db, self.api)
         asyncio.create_task(self.token_manager.start_refresh_loop())
         await self.instruments_master.download_and_load()
-        await self.data_fetcher.load_all_data()
+        # -------- market-aware historical fetch --------
+        today = datetime.now(IST).date()
+        from_dt = today.replace(year=today.year - 1)
+        await self.market_session.refresh()
+        if self.market_session.can_fetch_historical(from_dt, today):
+            logger.info("📚 EOD data available — fetching historical")
+            await self.data_fetcher.load_all_data()
+        else:
+            logger.info("📚 Skipping historical fetch (EOD not ready)")
+        # ------------------------------------------------
         await self.om.start()
         await self._restore_from_snapshot()
         await self._reconcile_broker_positions()
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_INDEX)
         self.data_feed.subscribe_instrument(settings.MARKET_KEY_VIX)
-        asyncio.create_task(self.data_feed.start())
+        # -------- market-aware websocket start --------
+        if self.market_session.can_use_websocket():
+            logger.info("📡 Market open — starting WebSocket")
+            asyncio.create_task(self.data_feed.start())
+        else:
+            logger.info("🌙 Market closed — WebSocket disabled")
+        # ------------------------------------------------
         if settings.GREEK_VALIDATION:
             asyncio.create_task(self.greek_validator.start())
         logger.info("✅ Engine Fully Initialised")
@@ -147,17 +167,21 @@ class VolGuard20Engine:
     async def run(self) -> None:
         await self.initialize()
         self.running = True
-        logger.info("🟢 Engine Loop Started (Quant Mode)")
+        logger.info("🟢 Engine Loop Started (Quant Mode – 24×7)")
         last_reset_date: Optional[datetime] = None
         consecutive_stale_errors = 0
         while self.running:
             try:
                 now = datetime.now(IST)
                 tick = time.time()
+
+                # ---------- daily reset ----------
                 if now.time() >= settings.MARKET_OPEN_TIME and now.date() != last_reset_date:
                     self.safety_layer.reset_daily_counters()
-                    self.metrics.reset_daily_counters()       # NEW
+                    self.metrics.reset_daily_counters()
                     last_reset_date = now.date()
+
+                # ---------- safety heartbeat ----------
                 if tick - self.last_safety_check > SAFETY_CHECK_INT:
                     if not await self._check_safety_heartbeat():
                         logger.critical("🛑 SAFETY KILL SWITCH ACTIVE. HALTING.")
@@ -165,9 +189,19 @@ class VolGuard20Engine:
                         await self.shutdown()
                         break
                     self.last_safety_check = tick
+
+                # ---------- market session controller ----------
+                await self.market_session.refresh()
+                mode = self.market_session.current_mode()
+                if mode != "LIVE_MARKET":
+                    await asyncio.sleep(5)
+                    continue
+                # ----------------------------------------------
+
+                # ---------- safe price ----------
                 try:
                     spot = self._get_safe_price(settings.MARKET_KEY_INDEX)
-                    vix = self._get_safe_price(settings.MARKET_KEY_VIX)
+                    vix  = self._get_safe_price(settings.MARKET_KEY_VIX)
                     consecutive_stale_errors = 0
                 except StaleDataError as e:
                     consecutive_stale_errors += 1
@@ -179,12 +213,16 @@ class VolGuard20Engine:
                         consecutive_stale_errors = 0
                     await asyncio.sleep(1)
                     continue
+
                 await self._update_greeks_and_risk(spot)
                 await self.lifecycle_mgr.monitor_lifecycle(self.trades)
+
                 if tick - self.last_reconcile > RECONCILE_INT:
                     await self._reconcile_broker_positions()
                     self.last_reconcile = tick
+
                 await self._calculate_metrics(spot, vix)
+
                 market_open = settings.MARKET_OPEN_TIME <= now.time() <= settings.MARKET_CLOSE_TIME
                 if market_open:
                     if tick - self.last_sabr_calib > 900:
@@ -194,10 +232,14 @@ class VolGuard20Engine:
                     except StaleDataError as e:
                         logger.warning(f"⚠️ Skipping trade cycle: {e}")
                         continue
+
                 await self.trade_mgr.monitor_active_trades(self.trades)
+
                 if tick - self.last_error_time > 60:
                     self.error_count = 0
+
                 await asyncio.sleep(settings.TRADING_LOOP_INTERVAL)
+
             except TokenExpiredError:
                 if self.token_manager:
                     await self.token_manager.get_current_token()
@@ -230,6 +272,7 @@ class VolGuard20Engine:
         await self.api.close()
         logger.info("✅ Shutdown Complete")
 
+    # ---------- remainder of engine helpers (unchanged) ----------
     async def _check_safety_heartbeat(self) -> bool:
         try:
             async with self.db.get_session() as session:
@@ -315,9 +358,11 @@ class VolGuard20Engine:
                     await self.pricing.calibrate_sabr(spot)
                     self.last_sabr_calib = time.time()
             except Exception:
-                self.sabr.reset()
+                self.sabr.use_cached_params()
 
     async def _trading_logic(self, spot: float) -> None:
+        if not self.market_session.can_trade():          # ← NEW
+            return
         if not self.last_metrics:
             return
         strat, legs, etype, bucket = self.strategy_engine.select_strategy_with_capital(
@@ -329,7 +374,8 @@ class VolGuard20Engine:
         real_legs = []
         for leg in legs:
             expiry_dt = datetime.strptime(leg["expiry"], "%Y-%m-%d").date()
-            token = self.instruments_master.get_option_token(settings.UNDERLYING_SYMBOL, leg["strike"], leg["type"], expiry_dt)
+            token = self.instruments_master.get_option_token(settings.UNDERLYING_SYMBOL,
+                                                             leg["strike"], leg["type"], expiry_dt)
             if not token:
                 return
             real_legs.append(Position(
@@ -347,9 +393,7 @@ class VolGuard20Engine:
             expiry_type=etype, capital_bucket=bucket,
             status=TradeStatus.PENDING, id=trade_id
         )
-        approved, reason = await self.safety_layer.pre_trade_gate(
-            trade, {"greeks_cache": self._greeks_cache}
-        )
+        approved, reason = await self.safety_layer.pre_trade_gate(trade, {"greeks_cache": self._greeks_cache})
         if not approved:
             return
         try:
@@ -360,10 +404,10 @@ class VolGuard20Engine:
                 async with self._trade_lock:
                     trade.status = TradeStatus.OPEN
                     self.trades.append(trade)
-                    self.metrics.log_trade(success=True, trade_id=trade.id, strategy=strat)   # NEW
-                logger.info(f"✅ Trade {trade.id} opened successfully")
+                    self.metrics.log_trade(success=True, trade_id=trade.id, strategy=strat)
+                    logger.info(f"✅ Trade {trade.id} opened successfully")
             else:
-                self.metrics.log_trade(success=False, trade_id=trade.id, strategy=strat, reason=msg)  # NEW
+                self.metrics.log_trade(success=False, trade_id=trade.id, strategy=strat, reason=msg)
                 logger.warning(f"⚠️ Trade {trade.id} execution failed: {msg}")
         except RollbackFailure as e:
             logger.critical("🚨🚨🚨 ROLLBACK FAILURE DETECTED 🚨🚨🚨")
@@ -381,6 +425,7 @@ class VolGuard20Engine:
                 pass
             raise EngineCircuitBreaker(f"Rollback failure - manual intervention required") from e
 
+    # ---------- rest of helpers (unchanged) ----------
     async def _save_snapshot(self) -> None:
         try:
             async with self.db.get_session() as session:
@@ -460,7 +505,7 @@ class VolGuard20Engine:
         try:
             price = self._get_safe_price(token)
         except StaleDataError:
-            price = max(strike * 0.95, 50.0)          # NEW sane fallback
+            price = max(strike * 0.95, 50.0)
             logger.warning(f"⚠ Zombie {token} fallback price ₹{price:.2f}")
         dummy = Position(
             symbol=symbol, instrument_key=token, strike=strike, option_type=option_type,
@@ -484,6 +529,7 @@ class VolGuard20Engine:
             tasks = [self.trade_mgr.close_trade(t, ExitReason.CIRCUIT_BREAKER) for t in self.trades if t.status == TradeStatus.OPEN]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+
 
 if __name__ == "__main__":
     engine = VolGuard20Engine()
