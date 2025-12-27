@@ -1,15 +1,5 @@
 #!/usr/bin/env python3
-"""
-EnhancedUpstoxAPI 20.1 – Production Hardened (Fortress Edition)
-- V2 ENDPOINTS only (no 404)
-- UDAPI100072 trap
-- set_instrument_master restored
-- close() method present
-- dates always YYYY-MM-DD strings
-----------------------------------------------------------
-NEW: 00:00-06:00 IST night-mode stub for funds/margin calls
-     so you can test without Upstox blocking you.
-"""
+
 from __future__ import annotations
 
 import asyncio
@@ -28,29 +18,24 @@ from core.models import Order
 
 logger = logging.getLogger("UpstoxAPI")
 
-# ------------------------------------------------------------------
-#  Night-mode helpers
-# ------------------------------------------------------------------
+# ------------------------------------------------------
+# Night-mode helpers
+# ------------------------------------------------------
 def _ist_now() -> datetime:
-    """Return current time in IST."""
     from core.config import IST
     return datetime.now(IST)
 
 def _is_night_mode() -> bool:
-    """True between 00:00 and 06:00 IST."""
     t = _ist_now().time()
     return t.hour < 6
 
 def _dummy_funds_margin() -> Dict[str, Any]:
-    """Return a believable funds/margin payload."""
-    fake_avail = 2_000_000.0          # 20 Lakh free
-    fake_used  = 150_000.0            # ~1.5 Lakh used
     return {
         "status": "success",
         "data": {
             "equity": {
-                "available_margin": fake_avail,
-                "used_margin": fake_used,
+                "available_margin": 2_000_000.0,
+                "used_margin": 150_000.0,
                 "payin": 0,
                 "span_margin": 135_000.0,
                 "exposure_margin": 15_000.0,
@@ -58,12 +43,18 @@ def _dummy_funds_margin() -> Dict[str, Any]:
         }
     }
 
-# ------------------------------------------------------------------
-#  Existing code untouched below this line
-# ------------------------------------------------------------------
-class TokenExpiredError(RuntimeError): pass
-class MarginInsaneError(RuntimeError): pass
+# ------------------------------------------------------
+# Exceptions
+# ------------------------------------------------------
+class TokenExpiredError(RuntimeError):
+    pass
 
+class MarginInsaneError(RuntimeError):
+    pass
+
+# ------------------------------------------------------
+# Rate limiter
+# ------------------------------------------------------
 class RateLimiter:
     def __init__(self, rate_per_sec: int = 9) -> None:
         self._rate = rate_per_sec
@@ -84,6 +75,9 @@ class RateLimiter:
             else:
                 self._tokens -= 1
 
+# ------------------------------------------------------
+# API Client
+# ------------------------------------------------------
 class EnhancedUpstoxAPI:
     def __init__(self, token: str) -> None:
         self._token = token
@@ -99,6 +93,9 @@ class EnhancedUpstoxAPI:
         self._limiter = RateLimiter()
         self.instrument_master = None
 
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
     async def update_token(self, new_token: str) -> None:
         async with self._session_lock:
             self._token = new_token
@@ -123,18 +120,19 @@ class EnhancedUpstoxAPI:
             logger.warning(f"Token probe network error: {e}")
             return True
 
-    def set_instrument_master(self, master) -> None:
-        """Engine needs this – do not delete."""
+    def set_instrument_master(self, master: Any) -> None:
         self.instrument_master = master
 
     async def close(self) -> None:
-        """Closes aiohttp session; Engine calls this on shutdown."""
         async with self._session_lock:
             if self._session and not self._session.closed:
                 await self._session.close()
                 self._session = None
                 logger.info("📡 API Session Closed Gracefully")
 
+    # ------------------------------------------------------------------
+    # Internal request wrapper
+    # ------------------------------------------------------------------
     async def _get_session(self) -> aiohttp.ClientSession:
         async with self._session_lock:
             if self._session is None or self._session.closed:
@@ -231,9 +229,9 @@ class EnhancedUpstoxAPI:
         text = re.sub(r'eyJ[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+\.[a-zA-Z0-9\-_]+', "[JWT_REDACTED]", text, flags=re.I)
         return text
 
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # High-level wrappers – V2 OFFICIAL ENDPOINTS
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def place_order(self, order: Order) -> Tuple[bool, Optional[str]]:
         if settings.SAFETY_MODE != "live":
             return True, f"SIM-{int(time.time() * 1_000)}"
@@ -257,7 +255,6 @@ class EnhancedUpstoxAPI:
         return False, None
 
     async def get_option_chain(self, instrument_key: str, expiry_date: str) -> Dict[str, Any]:
-        """Official v2 option-chain endpoint."""
         return await self._request("GET", "option_chain", params={"instrument_key": instrument_key, "expiry_date": expiry_date})
 
     async def get_short_term_positions(self) -> List[Dict[str, Any]]:
@@ -265,31 +262,24 @@ class EnhancedUpstoxAPI:
         return res.get("data", []) if res.get("status") == "success" else []
 
     async def get_funds_and_margin(self) -> Dict[str, Any]:
-        """Night-mode stub injected here."""
         if _is_night_mode():
             logger.info("🌙 Night-mode stub active for funds/margin")
             return _dummy_funds_margin()
         return await self._request("GET", "funds_margin")
 
-    async def get_historical_candles(self, instrument_key: str, interval: str, to_date: str, from_date: str) -> Dict[str, Any]:
-        """
-        V2 historical candles + UDAPI100072 trap + empty guard
-        ALWAYS expects YYYY-MM-DD strings
-        """
+    async def get_historical_candles(
+        self, instrument_key: str, interval: str, to_date: str, from_date: str
+    ) -> Dict[str, Any]:
         encoded = quote(instrument_key)
         url = f"{settings.API_BASE_URL}/v2/historical-candle/{encoded}/{interval}/{to_date}/{from_date}"
         res = await self._request("GET", dynamic_url=url)
 
-        # ---- Trap expired instrument ----
         if res.get("code") == "UDAPI100072":
             logger.info("Instrument %s expired – returning empty candles", instrument_key)
             return {"status": "success", "data": {"candles": []}}
-
-        # ---- Guard empty payload ----
         if res.get("status") == "success" and not res.get("data", {}).get("candles"):
             logger.warning("No candles for %s – empty frame", instrument_key)
             return {"status": "success", "data": {"candles": []}}
-
         return res
 
     async def get_intraday_candles(self, instrument_key: str, interval: str) -> Dict[str, Any]:
