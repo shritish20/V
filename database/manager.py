@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Database Manager (Fortress Edition)
-- INCREASED: Pool Size (10 Base + 20 Overflow) to support 4 processes.
-- ADDED: Pool Pre-Ping to auto-heal dropped connections.
-- ADDED: Slow Query Monitoring.
+VolGuard 20.0 - Database Manager (Singleton Edition)
+- SINGLETON IMPLEMENTED: Solves AWS RDS pool exhaustion.
+- INCREASED CAPACITY: Configured for production loads.
 """
-import time
 import asyncio
-import traceback
 from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.exc import TimeoutError as SA_TimeoutError
@@ -18,69 +15,70 @@ from utils.logger import setup_logger
 logger = setup_logger("DBManager")
 
 class HybridDatabaseManager:
-    """
-    Manages the Async Database connection pool.
-    Optimized for multiple concurrent processes (Engine, Sheriff, API, Analyst).
-    """
-    def __init__(self):
-        self.engine = None
-        self.async_session = None
-        self._active_sessions = {}
-        self._session_counter = 0
-        self._last_pool_warning = 0
+    _instance = None  # The Singleton Instance
+
+    def __new__(cls):
+        """
+        Singleton Pattern: Ensures only ONE instance exists per process.
+        This is critical to prevent creating a new DB Pool for every API request.
+        """
+        if cls._instance is None:
+            cls._instance = super(HybridDatabaseManager, cls).__new__(cls)
+            cls._instance.engine = None
+            cls._instance.async_session = None
+            cls._instance._initialized = False
+        return cls._instance
 
     async def init_db(self):
-        """Initializes the connection pool and creates tables if missing."""
-        if self.engine is None:
+        """Initializes the connection pool if not already active."""
+        # If already initialized, do nothing.
+        if self._initialized and self.engine is not None:
+            return
+
+        logger.info(f"🔌 Connecting to Database: {settings.POSTGRES_SERVER}")
+        
+        try:
             self.engine = create_async_engine(
                 settings.DATABASE_URL,
                 echo=False,
-                pool_pre_ping=True,  # Critical: Checks connection health before use
-                # HARDENING FIX: Increased capacity for multi-process architecture
-                pool_size=10,         
-                max_overflow=20,     
-                pool_recycle=3600,
+                pool_pre_ping=True,  # Critical for AWS RDS timeouts
+                pool_size=20,        # Base connections (Increased)
+                max_overflow=40,     # Burst capacity
+                pool_recycle=1800,   # Recycle connections every 30 mins
                 pool_timeout=30,
-                pool_reset_on_return='rollback',
             )
+            
             self.async_session = async_sessionmaker(
                 bind=self.engine,
                 expire_on_commit=False,
                 class_=AsyncSession
             )
             
-            try:
-                # Import Base here to ensure we pick up the models defined in database/models.py
-                from database.models import Base
-                async with self.engine.begin() as conn:
-                    await conn.run_sync(Base.metadata.create_all)
-                logger.info("✅ Database initialized (Pool: 10 base + 20 overflow)")
-            except Exception as e:
-                logger.critical(f"🔥 Failed to initialize database: {e}")
-                raise
+            # Import models here to ensure they are registered with Base metadata
+            from database.models import Base
+            async with self.engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            
+            self._initialized = True
+            logger.info("✅ Database initialized (Singleton Mode)")
+            
+        except Exception as e:
+            logger.critical(f"🔥 Database Init Failed: {e}")
+            raise
 
     @asynccontextmanager
     async def get_session(self):
         """
-        Yields a DB session with performance tracking and error handling.
+        Yields a session from the shared singleton pool.
         """
-        if self.async_session is None:
+        if not self._initialized or self.async_session is None:
             await self.init_db()
-        
-        session_id = self._session_counter
-        self._session_counter += 1
-        start_time = time.time()
-        
+            
         session: AsyncSession = self.async_session()
-        # Track session origin for debugging leaks
-        # caller_stack = ''.join(traceback.format_stack()[-4:-1]) 
-        # self._active_sessions[session_id] = {'start': start_time}
-
         try:
-            self._check_pool_health()
             yield session
         except SA_TimeoutError:
-            logger.critical("❌ DATABASE POOL EXHAUSTED! Increase pool_size or check for stuck sessions.")
+            logger.critical("❌ DB POOL EXHAUSTED! Check AWS RDS max_connections.")
             raise
         except Exception as e:
             await session.rollback()
@@ -88,29 +86,6 @@ class HybridDatabaseManager:
             raise
         finally:
             await session.close()
-            # self._active_sessions.pop(session_id, None)
-            
-            # Warn if a query held the DB for too long (>5s)
-            duration = time.time() - start_time
-            if duration > 5.0:
-                logger.error(f"⚠️ SLOW SESSION: Session {session_id} held for {duration:.1f}s")
-
-    def _check_pool_health(self):
-        """Monitors pool utilization and logs warnings if high."""
-        if not hasattr(self.engine.pool, 'checkedout'): return
-        try:
-            in_use = self.engine.pool.checkedout()
-            pool_size = self.engine.pool.size()
-            overflow = self.engine.pool.overflow()
-            max_capacity = pool_size + overflow
-            utilization = in_use / max_capacity if max_capacity > 0 else 0
-            
-            now = time.time()
-            # Warn if > 80% of connections are in use, but limit log spam (once per 60s)
-            if utilization > 0.80 and (now - self._last_pool_warning) > 60:
-                logger.warning(f"⚠️ HIGH DB LOAD: {in_use}/{max_capacity} connections ({utilization*100:.0f}%)")
-                self._last_pool_warning = now
-        except Exception: pass
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
     async def safe_commit(self, session: AsyncSession):
@@ -123,6 +98,9 @@ class HybridDatabaseManager:
             raise
 
     async def close(self):
-        """Closes the connection pool."""
+        """Closes the shared connection pool."""
         if self.engine:
             await self.engine.dispose()
+            self.engine = None
+            self._initialized = False
+            logger.info("🛑 Database pool closed.")
