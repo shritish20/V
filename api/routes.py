@@ -38,11 +38,11 @@ class JournalNoteUpdate(BaseModel):
     tags: Optional[str] = "Neutral"
 
 # ---------------------------------------------------------------------------
-# Dependency Injection
+# Dependency Injection (SINGLETON FIX)
 # ---------------------------------------------------------------------------
 async def get_db_session() -> AsyncSession:
-    """Provides a transactional scope for API requests."""
-    db = HybridDatabaseManager()
+    """Provides a transactional scope for API requests using the Singleton Pool."""
+    db = HybridDatabaseManager() # Uses the singleton instance
     async with db.get_session() as session:
         yield session
 
@@ -177,7 +177,8 @@ async def get_system_logs(lines: int = 100):
     possible_paths = [
         Path("logs/volguard_engine.log"), 
         Path("logs/volguard.log"),
-        Path("/var/log/volguard.log")
+        Path("/var/log/volguard.log"),
+        Path("logs/engine.out.log") # Supervisord standard path
     ]
     
     log_file = next((p for p in possible_paths if p.exists()), None)
@@ -199,10 +200,14 @@ async def get_system_logs(lines: int = 100):
 @router.get("/journal/entries")
 async def get_journal_entries(session: AsyncSession = Depends(get_db_session)):
     """Fetch all trading journal entries."""
-    res = await session.execute(
-        select(DbTradeJournal).order_by(desc(DbTradeJournal.date)).limit(50)
-    )
-    return res.scalars().all()
+    try:
+        res = await session.execute(
+            select(DbTradeJournal).order_by(desc(DbTradeJournal.date)).limit(50)
+        )
+        return res.scalars().all()
+    except Exception as e:
+        logger.error(f"Journal Error: {e}")
+        return []
 
 @router.patch("/journal/{trade_id}/note")
 async def update_journal_note(
@@ -211,20 +216,22 @@ async def update_journal_note(
     session: AsyncSession = Depends(get_db_session)
 ):
     """Save manual psychology notes."""
-    res = await session.execute(
-        select(DbTradeJournal).where(DbTradeJournal.id == trade_id)
-    )
-    entry = res.scalars().first()
-    
-    if not entry:
-        raise HTTPException(status_code=404, detail="Trade entry not found")
-    
-    entry.entry_rationale = note.rationale
-    # If you add a 'tags' column to DbTradeJournal later, update it here too
-    # entry.tags = note.tags 
-    
-    await session.commit()
-    return {"status": "success", "message": "Journal updated"}
+    try:
+        res = await session.execute(
+            select(DbTradeJournal).where(DbTradeJournal.id == trade_id)
+        )
+        entry = res.scalars().first()
+        
+        if not entry:
+            raise HTTPException(status_code=404, detail="Trade entry not found")
+        
+        entry.entry_rationale = note.rationale
+        await session.commit()
+        return {"status": "success", "message": "Journal updated"}
+    except Exception as e:
+        await session.rollback()
+        logger.error(f"Journal Update Failed: {e}")
+        raise HTTPException(status_code=500, detail="Update failed")
 
 # ===========================================================================
 # CONTROL: PANIC BUTTON
@@ -257,6 +264,7 @@ async def trigger_emergency_flatten(session: AsyncSession = Depends(get_db_sessi
         return {"status": "success", "message": "KILL SWITCH ACTIVATED"}
     except Exception as e:
         logger.error(f"Panic Failed: {e}")
+        await session.rollback()
         raise HTTPException(status_code=500, detail="Failed to write Panic Command")
 
 @router.post("/emergency/reset")
@@ -285,4 +293,5 @@ async def reset_kill_switch(session: AsyncSession = Depends(get_db_session)):
         await session.commit()
         return {"status": "success", "message": "System Disarmed."}
     except Exception as e:
+        await session.rollback()
         raise HTTPException(status_code=500, detail="Failed to Reset")
