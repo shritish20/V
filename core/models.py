@@ -44,10 +44,12 @@ class MultiLegTrade(BaseModel):
     def total_unrealized_pnl(self) -> float:
         return sum((l.current_price - l.entry_price) * l.quantity for l in self.legs)
 
-# --- METRICS (THE CRASH FIX) ---
+# --- METRICS (PURE QUANT) ---
 class AdvancedMetrics(BaseModel):
     """
-    Dashboard Metrics with Default Values to prevent startup crashes.
+    Market Data Snapshot.
+    Note: 'event_risk_score' and 'top_event' are retained as placeholders
+    to ensure compatibility with StrategyEngine checks, defaulting to safe values.
     """
     timestamp: datetime = Field(default_factory=datetime.now)
     spot_price: float = 0.0
@@ -79,11 +81,11 @@ class AdvancedMetrics(BaseModel):
     atm_gamma: float = 0.0
     atm_pop: float = 0.0
     
-    # Regime (Strings need defaults too!)
+    # Regime
     structure_confidence: float = 0.0
     regime: str = "Neutral"
-    event_risk_score: float = 0.0
-    top_event: str = "None"
+    event_risk_score: float = 0.0 # Placeholder (AI Removed)
+    top_event: str = "None"       # Placeholder (AI Removed)
     trend_status: str = "Flat"
     
     # Expiry Data
@@ -111,6 +113,7 @@ class Order(BaseModel):
     trigger_price: float
     validity: str
     is_amo: bool = False
+    tag: Optional[str] = None # Added for Sheriff compatibility
 
 # --- Manual Trade Models ---
 class ManualLegRequest(BaseModel):
