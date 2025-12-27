@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Pricing Engine (Hardened)
-- Calculates Skew, Term Structure, and VRP
-- Safe SABR Calibration (45s Timeout for High Vol)
-- Robust Error Handling
+VolGuard 20.0 – Pricing Engine (Non-Blocking)
+Uses ProcessPoolExecutor to bypass GIL during SABR calibration.
 """
 import asyncio
 import logging
+from concurrent.futures import ProcessPoolExecutor
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime, date, time as dtime
 
 from core.config import settings, IST
-from analytics.sabr_model import EnhancedSABRModel
+from analytics.sabr_model import EnhancedSABRModel, _worker_calibrate_sabr
 
 logger = logging.getLogger("PricingEngine")
 
-# ---------------------------------------------------------------------------
 # Config
-# ---------------------------------------------------------------------------
-MAX_IV_PCT        = 5.0          
-CALIB_TIMEOUT_SEC = 45           # PATCH: Increased to 45s for stability
-MIN_POINTS        = 5            
+MAX_IV_PCT = 5.0
+CALIB_TIMEOUT_SEC = 20  # Reduced - ProcessPool is much faster than threads for math
+MIN_POINTS = 5
 
 class DataIntegrityError(RuntimeError): pass
 class CalibrationError(RuntimeError): pass
@@ -36,9 +33,24 @@ class HybridPricingEngine:
         self.sabr = sabr_model
         self.api: Any = None
         self.instrument_master: Any = None
+        
+        # CRITICAL: Single-worker process pool
+        # Why 1 worker? SABR calibration is CPU-intensive serial work.
+        # Multiple workers would compete for CPU and slow everything down.
+        # We process in a separate core to avoid blocking the main Event Loop.
+        self.process_pool = ProcessPoolExecutor(max_workers=1)
+        
+        # Track calibration state to prevent overlap/spam
+        self._calibration_in_progress = False
+        self._last_calibration_time = 0.0
 
     def set_api(self, api: Any) -> None:
         self.api = api
+
+    async def shutdown(self):
+        """Cleanup on engine shutdown"""
+        self.process_pool.shutdown(wait=False)
+        logger.info("🛑 ProcessPool shutdown")
 
     async def get_market_structure(self, spot: float) -> Dict[str, Any]:
         """Calculates Skew, Term Structure, and Efficiency for Strategy Engine."""
@@ -55,7 +67,7 @@ class HybridPricingEngine:
             near_exp, far_exp = self._select_expiries(expiries, now)
             dte = max(0.001, self._calculate_dte(near_exp, now))
 
-            # Fetch both chains
+            # Fetch both chains in parallel
             chain_near, chain_far = await asyncio.gather(
                 self.api.get_option_chain(settings.MARKET_KEY_INDEX, near_exp.isoformat()),
                 self.api.get_option_chain(settings.MARKET_KEY_INDEX, far_exp.isoformat()),
@@ -80,8 +92,11 @@ class HybridPricingEngine:
             if far_metrics["iv"] > 0:
                 slope = (near_metrics["iv"] - far_metrics["iv"]) / far_metrics["iv"]
 
-            # Calibration
-            await self._calibrate_if_needed(chain_near["data"], atm_strike, spot, dte)
+            # NON-BLOCKING CALIBRATION
+            # Fire-and-forget: we launch the task but don't wait for it
+            asyncio.create_task(
+                self._calibrate_if_needed(chain_near["data"], atm_strike, spot, dte)
+            )
             
             eff_table = self._build_efficiency_table(chain_near["data"], spot)
 
@@ -128,8 +143,79 @@ class HybridPricingEngine:
         except Exception:
             pass
 
+    async def _calibrate_if_needed(self, chain: List[Dict[str, Any]], atm_strike: float, spot: float, dte: float) -> None:
+        """Runs calibration in process pool - NEVER blocks main thread."""
+        
+        # 1. Rate Limiting (Don't run more than once per 5 mins)
+        import time
+        now = time.time()
+        if now - self._last_calibration_time < 300:
+            return
+            
+        # 2. Concurrency Check
+        if self._calibration_in_progress:
+            return
+
+        try:
+            self._calibration_in_progress = True
+            
+            strikes, ivs = [], []
+            for item in chain:
+                strike = float(item.get("strike_price", 0))
+                # Filter points too far away (noise)
+                if abs(strike - atm_strike) > 500: continue
+                
+                iv = self._find_iv_at_strike(chain, strike, "CE")
+                if iv > 0.01:
+                    strikes.append(strike)
+                    ivs.append(iv)
+            
+            if len(strikes) < MIN_POINTS: return
+            
+            # Prepare inputs for the worker process
+            current_params = self.sabr.get_current_params()
+            bounds = [
+                settings.SABR_BOUNDS['alpha'],
+                settings.SABR_BOUNDS['beta'],
+                settings.SABR_BOUNDS['rho'],
+                settings.SABR_BOUNDS['nu']
+            ]
+            
+            # 3. Offload to Process Pool
+            loop = asyncio.get_running_loop()
+            result = await asyncio.wait_for(
+                loop.run_in_executor(
+                    self.process_pool,
+                    _worker_calibrate_sabr,  # The standalone function
+                    current_params,
+                    bounds,
+                    strikes,
+                    ivs,
+                    spot,
+                    dte / 365.25
+                ),
+                timeout=CALIB_TIMEOUT_SEC,
+            )
+            
+            # 4. Update Model if successful
+            if result:
+                params, error = result
+                self.sabr.update_params(params, error)
+                self._last_calibration_time = now
+            else:
+                self.sabr.use_cached_params()
+
+        except asyncio.TimeoutError:
+            logger.warning(f"SABR Calibration Timed Out ({CALIB_TIMEOUT_SEC}s) - using cache")
+            self.sabr.use_cached_params()
+        except Exception as e: 
+            logger.error(f"SABR Worker Error: {e}")
+            self.sabr.use_cached_params()
+        finally:
+            self._calibration_in_progress = False
+
     # -------------------------------------------------------------------------
-    # Internal Helpers
+    # Internal Helpers (Unchanged Logic)
     # -------------------------------------------------------------------------
 
     def _calculate_skew(self, chain: List[Dict], spot: float) -> float:
@@ -208,26 +294,3 @@ class HybridPricingEngine:
                     "efficiency": round(abs(theta) / vega, 4)
                 })
         return sorted(table, key=lambda x: x["efficiency"], reverse=True)[:10]
-
-    async def _calibrate_if_needed(self, chain: List[Dict[str, Any]], atm_strike: float, spot: float, dte: float) -> None:
-        strikes, ivs = [], []
-        for item in chain:
-            strike = float(item.get("strike_price", 0))
-            if abs(strike - atm_strike) > 500: continue
-            iv = self._find_iv_at_strike(chain, strike, "CE")
-            if iv > 0.01:
-                strikes.append(strike)
-                ivs.append(iv)
-        if len(strikes) < MIN_POINTS: return
-        
-        loop = asyncio.get_running_loop()
-        try:
-            # PATCH: Increased timeout to 45s
-            await asyncio.wait_for(
-                loop.run_in_executor(None, self.sabr.calibrate_to_chain, strikes, ivs, spot, dte/365.25),
-                timeout=CALIB_TIMEOUT_SEC,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"SABR Calibration Timed Out ({CALIB_TIMEOUT_SEC}s)")
-        except Exception: 
-            pass
