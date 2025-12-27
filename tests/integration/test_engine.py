@@ -46,6 +46,8 @@ async def test_continuous_reconciliation(mock_db, mock_upstox):
     }.get(k)
     engine.instruments_master.df.__getitem__.return_value = fake_row
     engine.instruments_master.df.empty = False
+    # Mock _get_safe_price so it does NOT raise StaleDataError
+    engine._get_safe_price = MagicMock(return_value=100.0)
     # Mock Broker returning 1 position
     mock_upstox.get_short_term_positions.return_value = [
         {"instrument_token": "123", "quantity": 50, "pnl": 0}
