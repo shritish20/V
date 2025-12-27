@@ -248,25 +248,26 @@ async def deep_health(session: AsyncSession = Depends(get_db_session)):
     """
     Returns 503 if any critical fix is broken.
     """
-    # 1. Stale-data path
-    from core.engine import STALE_DATA_THRESHOLD
-    from core.config import settings
-    from datetime import datetime
-
+    # 1. Engine running
     engine_pid_file = Path("data/engine.pid")
     if not engine_pid_file.exists():
         raise HTTPException(status_code=503, detail="engine_not_running")
 
-    # 2. Check for negative capital usage
-    row = await session.execute(text("SELECT COUNT(*) FROM capital_usage WHERE used_amount < 0"))
+    # 2. Negative capital usage (corruption check)
+    row = await session.execute(text(
+        "SELECT COUNT(*) FROM capital_usage WHERE used_amount < 0"
+    ))
     if row.scalar() > 0:
         raise HTTPException(status_code=503, detail="negative_capital_usage")
 
-    # 3. Ensure no duplicate capital ledger rows
-    row = await session.execute(text(
-        "SELECT COUNT(*) FROM (SELECT trade_id, bucket FROM capital_ledger GROUP BY trade_id, bucket HAVING COUNT(*) > 1) t"
-    ))
+    # 3. Duplicate capital ledger rows (idempotency breach)
+    row = await session.execute(text("""
+        SELECT COUNT(*) FROM (
+            SELECT trade_id, bucket FROM capital_ledger 
+            GROUP BY trade_id, bucket HAVING COUNT(*) > 1
+        ) t
+    """))
     if row.scalar() > 0:
-        raise HTTPException(status_code=503, detail="duplicate_ledger_rows")
+        raise HTTPException(status_code=503, detail="duplicate_allocations")
 
     return {"status": "pass", "timestamp": datetime.utcnow()}
