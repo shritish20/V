@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-VolGuard 20.0 – Web API Server (Microservice)
-- Roles: Serves Frontend API, Serves Static React Files
-- DOES NOT run the Trading Engine (Run core/engine.py for that)
-- Hardened: Auto-creates directories, Graceful DB shutdown
+VolGuard 20.0 – Web API Gateway (Pure Quant Edition)
+- SERVES: REST API + Static Dashboard
+- SINGLETON DB: Connects via shared pool.
+- NO AI: Purely serves market data and control endpoints.
 """
 import uvicorn
 import os
@@ -16,82 +16,71 @@ from pathlib import Path
 # Core Imports
 from core.config import settings
 from utils.logger import setup_logger
-# We will fix api/routes.py next, but main.py needs it to start
 from api.routes import router as api_router
 from database.manager import HybridDatabaseManager
 
-# --- FIX: Create essential directories before Logger/App start ---
+# Setup directories
 os.makedirs("logs", exist_ok=True)
 os.makedirs("static_dashboard", exist_ok=True)
 
-# Setup Logging
-logger = setup_logger("API_Server")
+logger = setup_logger("API_Gateway")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Lifecycle Manager for the Web Server.
-    Initializes DB Connection Pool for the API.
+    Lifecycle: Initializes the Singleton DB connection for the API.
     """
-    logger.info("🚀 VolGuard Web API Initializing...")
+    logger.info("🚀 VolGuard API Gateway Initializing...")
     
-    # 1. Initialize Database Manager (Shared Pool)
-    # This ensures the API can talk to the tables created by the Engine/Sheriff
+    # Initialize Singleton Database
     db = HybridDatabaseManager()
     await db.init_db() 
     
-    logger.info("✅ Database Connected")
+    logger.info("✅ Database Pool Ready (Singleton)")
     
     yield
     
     # Cleanup
-    await db.close()
     logger.info("🛑 Web API Shutdown...")
 
-# ==========================================
-# FASTAPI APP DEFINITION
-# ==========================================
 app = FastAPI(
-    title="VolGuard 20.0 (Command Center)",
-    description="API Layer for VolGuard Fortress Architecture",
+    title="VolGuard 20.0 (Pure Quant)",
+    description="API Layer for VolGuard Fortress (No AI)",
     version="20.0.1",
     lifespan=lifespan
 )
 
-# CORS (Allow Frontend to talk to Backend)
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, restrict this to your frontend URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Static Files (The React Frontend)
-# This serves the files from the 'static_dashboard' folder
+# Static Dashboard (Optional: requires React build in /static_dashboard)
 static_path = Path("./static_dashboard")
-app.mount("/dashboard", StaticFiles(directory=static_path, html=True), name="dashboard")
+if static_path.exists():
+    app.mount("/dashboard", StaticFiles(directory=static_path, html=True), name="dashboard")
 
-# Include the Unified Router (The Logic)
+# Routes
 app.include_router(api_router)
 
-# Root Redirect / Health Check
 @app.get("/")
 async def root():
     return {
-        "system": "VolGuard 20.0 Fortress",
-        "role": "API Gateway",
+        "system": "VolGuard 20.0",
+        "mode": "Pure Quant (Hardened)",
         "status": "Online",
-        "dashboard_url": f"http://localhost:{settings.PORT}/dashboard"
+        "docs": "/docs"
     }
 
 if __name__ == "__main__":
-    logger.info(f"🔥 Starting API Server on Port {settings.PORT}")
-    # reload=True is enabled for easier debugging during setup
     uvicorn.run(
         "main:app", 
         host="0.0.0.0", 
         port=settings.PORT, 
         log_level="info",
-        reload=True 
+        reload=False # False for production stability
     )
