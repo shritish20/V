@@ -14,9 +14,10 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 from sqlalchemy import select, text
 from core.config import settings
-from database.models import DbCapitalUsage
-logger = logging.getLogger("CapitalAllocator")
+from database.models import DbCapitalUsage, DbCapitalLedger
+from core.metrics import get_metrics            # NEW
 
+logger = logging.getLogger("CapitalAllocator")
 MARGIN_REFRESH_SEC = 30
 
 class SmartCapitalAllocator:
@@ -26,6 +27,7 @@ class SmartCapitalAllocator:
         self._db = db
         self._last_margin_fetch = 0.0
         self._cached_available_margin = fallback_account_size
+        self.metrics = get_metrics()             # NEW
 
     async def get_status(self) -> Dict[str, Any]:
         margin = await self._get_real_margin()
@@ -68,27 +70,36 @@ class SmartCapitalAllocator:
                 row = result.fetchone()
                 current_used = row[0] if row else 0.0
                 logger.debug(f"🔒 Lock acquired for bucket '{bucket}' | PID {os.getpid()} | Current: ₹{current_used:,.0f}")
+
                 new_used = current_used + amount
                 if new_used > limit:
                     logger.warning(f"🚫 Allocation Denied: {bucket} | Used: {current_used:,.0f} + {amount:,.0f} = {new_used:,.0f} > Limit: {limit:,.0f}")
+                    self.metrics.log_allocation(False, bucket, amount, trade_id)    # NEW
                     return False
+
                 ledger_check = text("""SELECT id FROM capital_ledger WHERE trade_id = :trade_id AND bucket = :bucket LIMIT 1""")
                 check_result = await session.execute(ledger_check, {"trade_id": trade_id, "bucket": bucket})
                 if check_result.scalar():
                     logger.info(f"✓ Allocation already exists: {trade_id} {bucket}")
+                    self.metrics.log_allocation(True, bucket, amount, trade_id)    # NEW
                     return True
+
                 ledger_stmt = text("""INSERT INTO capital_ledger (trade_id, bucket, amount, date, timestamp) VALUES (:trade_id, :bucket, :amount, CURRENT_DATE, NOW()) RETURNING id""")
                 ledger_result = await session.execute(ledger_stmt, {"trade_id": trade_id, "bucket": bucket, "amount": amount})
                 if not ledger_result.scalar():
                     logger.error(f"❌ Ledger insert failed for {trade_id}")
+                    self.metrics.log_allocation(False, bucket, amount, trade_id)   # NEW
                     return False
+
                 update_stmt = text("""INSERT INTO capital_usage (bucket, used_amount, last_updated) VALUES (:bucket, :amount, NOW()) ON CONFLICT (bucket) DO UPDATE SET used_amount = capital_usage.used_amount + :amount, last_updated = NOW()""")
                 await session.execute(update_stmt, {"bucket": bucket, "amount": amount})
                 await self._db.safe_commit(session)
                 logger.info(f"💰 Capital Allocated: {bucket} | Trade: {trade_id} | Amount: {amount:,.0f} | New Usage: {new_used:,.0f}")
+                self.metrics.log_allocation(True, bucket, amount, trade_id)        # NEW
                 return True
         except Exception as e:
             logger.error(f"🔥 Allocation System Error: {e}", exc_info=True)
+            self.metrics.log_allocation(False, bucket, amount, trade_id)           # NEW
             return False
 
     async def release_capital(self, bucket: str, amount: float, trade_id: str) -> None:
