@@ -1,4 +1,3 @@
-# utils/data_fetcher.py
 import pandas as pd
 import numpy as np
 import logging
@@ -58,8 +57,8 @@ class DashboardDataFetcher:
         This forces GARCH/IVP to calculate using Real-Time data WITHOUT 
         corrupting the database.
         """
-        # Ensure we work with Today's date normalized (00:00:00) to match history index
-        today = datetime.now(IST).normalize()
+        # FIX: Use .replace() instead of .normalize() for standard datetime objects
+        today = datetime.now(IST).replace(hour=0, minute=0, second=0, microsecond=0)
 
         # 1. Inject Spot (NIFTY) - In Memory Only
         if not self.nifty_data.empty:
