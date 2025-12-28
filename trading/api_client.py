@@ -89,7 +89,6 @@ class EnhancedUpstoxAPI:
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
             "Content-Type": "application/json",
-            # We allow endpoints to dictate version, but default to safe headers
         }
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
@@ -310,17 +309,34 @@ class EnhancedUpstoxAPI:
         return await self._request("GET", "funds_margin")
 
     # ------------------------------------------------------------------
-    # V3 HISTORY (Verified Fix)
+    # V3 HISTORY (FIXED: Supports /days/1/ structure)
     # ------------------------------------------------------------------
     async def get_historical_candles(
         self, instrument_key: str, interval: str, to_date: str, from_date: str
     ) -> Dict[str, Any]:
         """
-        Fetches history using V3 structure: /v3/historical-candle/{key}/{interval}/{to}/{from}
+        Fetches history using V3 structure.
+        Auto-splits 'day' -> 'days/1' to prevent API errors.
         """
         encoded = quote(instrument_key)
-        # Using explicit V3 URL construction
-        url = f"{settings.API_BASE_URL}/v3/historical-candle/{encoded}/{interval}/{to_date}/{from_date}"
+        
+        # --- V3 FIX: SPLIT INTERVAL INTO UNIT & VALUE ---
+        if interval == "day":
+            unit, value = "days", "1"
+        elif interval == "1minute":
+            unit, value = "minutes", "1"
+        elif interval == "30minute":
+            unit, value = "minutes", "30"
+        elif interval == "week":
+             unit, value = "weeks", "1"
+        elif interval == "month":
+             unit, value = "months", "1"
+        else:
+            # Fallback for manual inputs
+            unit, value = "days", "1"
+
+        # Construct V3 URL: /v3/historical-candle/{key}/{unit}/{value}/{to}/{from}
+        url = f"{settings.API_BASE_URL}/v3/historical-candle/{encoded}/{unit}/{value}/{to_date}/{from_date}"
         res = await self._request("GET", dynamic_url=url)
 
         # Handle expiration/empty data gracefully
