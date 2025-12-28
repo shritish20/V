@@ -1,3 +1,4 @@
+# utils/data_fetcher.py
 import pandas as pd
 import numpy as np
 import logging
@@ -35,15 +36,82 @@ class DashboardDataFetcher:
         """
         logger.info("🔄 Synchronising Persistent Volatility History...")
         self.nifty_data = await self._sync_instrument_history(settings.MARKET_KEY_INDEX)
+        
         # calc log-returns for GARCH/RV
         if not self.nifty_data.empty and 'close' in self.nifty_data.columns:
             self.nifty_data['Log_Returns'] = np.log(
                 self.nifty_data['close'] / self.nifty_data['close'].shift(1)
             ).fillna(0)
+            
         self.vix_data = await self._sync_instrument_history(settings.MARKET_KEY_VIX)
+        
         logger.info(
             f"✅ History Ready: NIFTY({len(self.nifty_data)} rows) | VIX({len(self.vix_data)} rows)"
         )
+
+    # --------------------------------------------------
+    # REAL-TIME INJECTION (The "Ghost Candle" Logic)
+    # --------------------------------------------------
+    def inject_live_candle(self, spot_ltp: float, vix_ltp: float):
+        """
+        Updates the DataFrame with the current LIVE price as a 'Ghost Candle'.
+        This forces GARCH/IVP to calculate using Real-Time data WITHOUT 
+        corrupting the database.
+        """
+        # Ensure we work with Today's date normalized (00:00:00) to match history index
+        today = datetime.now(IST).normalize()
+
+        # 1. Inject Spot (NIFTY) - In Memory Only
+        if not self.nifty_data.empty:
+            last_close = self.nifty_data.iloc[-1]['close']
+            
+            # If today already exists (updated previously in this loop), reuse its High/Low
+            if today in self.nifty_data.index:
+                curr_high = self.nifty_data.loc[today, 'high']
+                curr_low = self.nifty_data.loc[today, 'low']
+                new_high = max(curr_high, spot_ltp)
+                new_low = min(curr_low, spot_ltp)
+            else:
+                # First tick of the day
+                new_high = max(last_close, spot_ltp)
+                new_low = min(last_close, spot_ltp)
+
+            # Upsert 'Today' row
+            self.nifty_data.loc[today] = {
+                'open': last_close, 
+                'high': new_high,
+                'low': new_low,
+                'close': spot_ltp,
+                'volume': 0,
+                'oi': 0
+            }
+            
+            # Recalculate Returns immediately for GARCH
+            self.nifty_data['Log_Returns'] = np.log(
+                self.nifty_data['close'] / self.nifty_data['close'].shift(1)
+            ).fillna(0)
+
+        # 2. Inject VIX - In Memory Only
+        if not self.vix_data.empty:
+            last_vix = self.vix_data.iloc[-1]['close']
+            
+            if today in self.vix_data.index:
+                curr_high = self.vix_data.loc[today, 'high']
+                curr_low = self.vix_data.loc[today, 'low']
+                new_high = max(curr_high, vix_ltp)
+                new_low = min(curr_low, vix_ltp)
+            else:
+                new_high = max(last_vix, vix_ltp)
+                new_low = min(last_vix, vix_ltp)
+
+            self.vix_data.loc[today] = {
+                'open': last_vix,
+                'high': new_high,
+                'low': new_low,
+                'close': vix_ltp,
+                'volume': 0,
+                'oi': 0
+            }
 
     # --------------------------------------------------
     # per-instrument sync engine
@@ -140,6 +208,7 @@ class DashboardDataFetcher:
     # --------------------------------------------------
     async def _fetch_upstox_range(self, key: str, start: date_type, end: date_type) -> pd.DataFrame:
         try:
+            # V3 Fix: Using "day" here triggers the new 'days/1' logic in api_client
             res = await self.api.get_historical_candles(key, "day",
                                                         end.strftime("%Y-%m-%d"),
                                                         start.strftime("%Y-%m-%d"))
