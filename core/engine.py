@@ -43,7 +43,7 @@ from trading.live_order_executor import LiveOrderExecutor, RollbackFailure
 from trading.position_lifecycle import PositionLifecycleManager
 from analytics.vrp_zscore import VRPZScoreAnalyzer
 from core.metrics import get_metrics
-from core.market_session import MarketSessionManager      # ← NEW
+from core.market_session import MarketSessionManager
 
 logger = setup_logger("Engine")
 
@@ -107,7 +107,7 @@ class VolGuard20Engine:
         self.last_sabr_calib = 0.0
         self.last_metrics: Optional[AdvancedMetrics] = None
         self.metrics = get_metrics()
-        self.market_session = MarketSessionManager(self.api)   # ← NEW
+        self.market_session = MarketSessionManager(self.api)
 
     # --------------- CRITICAL FIX #1: Stale Data Guard -------------
     def _get_safe_price(self, token: str) -> float:
@@ -198,11 +198,15 @@ class VolGuard20Engine:
                     continue
                 # ----------------------------------------------
 
-                # ---------- safe price ----------
+                # ---------- safe price & LIVE INJECTION ----------
                 try:
                     spot = self._get_safe_price(settings.MARKET_KEY_INDEX)
                     vix  = self._get_safe_price(settings.MARKET_KEY_VIX)
                     consecutive_stale_errors = 0
+                    
+                    # 🔥 NEW: INJECT LIVE CANDLE FOR REAL-TIME GARCH/IVP
+                    self.data_fetcher.inject_live_candle(spot, vix)
+
                 except StaleDataError as e:
                     consecutive_stale_errors += 1
                     logger.warning(f"⚠️ Stale data ({consecutive_stale_errors}/10): {e}")
@@ -361,7 +365,7 @@ class VolGuard20Engine:
                 self.sabr.use_cached_params()
 
     async def _trading_logic(self, spot: float) -> None:
-        if not self.market_session.can_trade():          # ← NEW
+        if not self.market_session.can_trade():
             return
         if not self.last_metrics:
             return
