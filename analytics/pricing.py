@@ -145,34 +145,33 @@ class HybridPricingEngine:
 
     async def _calibrate_if_needed(self, chain: List[Dict[str, Any]], atm_strike: float, spot: float, dte: float) -> None:
         """Runs calibration in process pool - NEVER blocks main thread."""
-        
-        # 1. Rate Limiting (Don't run more than once per 5 mins)
         import time
         now = time.time()
         if now - self._last_calibration_time < 300:
             return
-            
-        # 2. Concurrency Check
         if self._calibration_in_progress:
+            logger.debug("SABR calibration already in progress, skipping")
             return
-
         try:
             self._calibration_in_progress = True
+            self._last_calibration_time = now
             
             strikes, ivs = [], []
             for item in chain:
                 strike = float(item.get("strike_price", 0))
-                # Filter points too far away (noise)
-                if abs(strike - atm_strike) > 500: continue
-                
+                if abs(strike - atm_strike) > 500: 
+                    continue
                 iv = self._find_iv_at_strike(chain, strike, "CE")
                 if iv > 0.01:
                     strikes.append(strike)
                     ivs.append(iv)
             
-            if len(strikes) < MIN_POINTS: return
-            
-            # Prepare inputs for the worker process
+            if len(strikes) < MIN_POINTS:
+                logger.warning(f"Insufficient data points for SABR calibration: {len(strikes)} < {MIN_POINTS}")
+                self.sabr.calibrated = False
+                self.sabr.use_cached_params()
+                return
+
             current_params = self.sabr.get_current_params()
             bounds = [
                 settings.SABR_BOUNDS['alpha'],
@@ -181,12 +180,11 @@ class HybridPricingEngine:
                 settings.SABR_BOUNDS['nu']
             ]
             
-            # 3. Offload to Process Pool
             loop = asyncio.get_running_loop()
             result = await asyncio.wait_for(
                 loop.run_in_executor(
                     self.process_pool,
-                    _worker_calibrate_sabr,  # The standalone function
+                    _worker_calibrate_sabr,
                     current_params,
                     bounds,
                     strikes,
@@ -197,26 +195,90 @@ class HybridPricingEngine:
                 timeout=CALIB_TIMEOUT_SEC,
             )
             
-            # 4. Update Model if successful
-            if result:
+            if result and isinstance(result, tuple) and len(result) == 2:
                 params, error = result
+                
+                # Validate calibration results
+                if not self._validate_calibration(params, error, strikes, ivs, spot):
+                    logger.warning("SABR calibration failed validation - using cache")
+                    self.sabr.calibrated = False
+                    self.sabr.use_cached_params()
+                    return
+                
+                # Update model with calibrated parameters
                 self.sabr.update_params(params, error)
                 self._last_calibration_time = now
+                
+                logger.info(f"SABR calibration successful: α={params[0]:.4f}, β={params[1]:.3f}, "
+                          f"ρ={params[2]:.3f}, ν={params[3]:.3f}, Error={error:.6f}")
+                
             else:
+                logger.error("Invalid calibration result format")
+                self.sabr.calibrated = False
                 self.sabr.use_cached_params()
 
         except asyncio.TimeoutError:
-            logger.warning(f"SABR Calibration Timed Out ({CALIB_TIMEOUT_SEC}s) - using cache")
+            logger.warning(f"SABR Calibration Timed Out ({CALIB_TIMEOUT_SEC}s) – using cache")
+            self.sabr.calibrated = False
             self.sabr.use_cached_params()
+            
+        except MemoryError:
+            logger.error("SABR calibration MemoryError - process pool may need restart")
+            self.sabr.calibrated = False
+            self.sabr.use_cached_params()
+            # Attempt to restart process pool
+            try:
+                self.process_pool.shutdown(wait=False)
+                self.process_pool = ProcessPoolExecutor(max_workers=1)
+                logger.info("ProcessPool restarted after MemoryError")
+            except Exception as e:
+                logger.error(f"Failed to restart process pool: {e}")
+                
         except Exception as e: 
             logger.error(f"SABR Worker Error: {e}")
+            # CRITICAL: mark surface invalid so SafetyLayer vetos new trades
+            self.sabr.calibrated = False
             self.sabr.use_cached_params()
+            
         finally:
             self._calibration_in_progress = False
-
-    # -------------------------------------------------------------------------
-    # Internal Helpers (Unchanged Logic)
-    # -------------------------------------------------------------------------
+    
+    def _validate_calibration(self, params: Tuple[float, float, float, float], 
+                            error: float, strikes: List[float], ivs: List[float],
+                            spot: float) -> bool:
+        """
+        Validate SABR calibration results to ensure they're physically plausible.
+        Returns True if calibration is valid, False otherwise.
+        """
+        if not params or len(params) != 4:
+            logger.warning(f"Invalid params length: {len(params) if params else 'None'}")
+            return False
+        
+        alpha, beta, rho, nu = params
+        
+        # Check parameter bounds (based on SABR model physics)
+        if not (0 < alpha < 5.0):
+            logger.warning(f"Alpha out of bounds: {alpha:.4f}")
+            return False
+        
+        if not (0.0 <= beta <= 1.0):
+            logger.warning(f"Beta out of bounds: {beta:.3f}")
+            return False
+        
+        if not (-1.0 <= rho <= 1.0):
+            logger.warning(f"Rho out of bounds: {rho:.3f}")
+            return False
+        
+        if not (0.0 <= nu < 5.0):
+            logger.warning(f"Nu out of bounds: {nu:.3f}")
+            return False
+        
+        # Check calibration error (should be reasonably small)
+        if error > 0.01:  # 1% average error threshold
+            logger.warning(f"Calibration error too high: {error:.6f}")
+            return False
+        
+        return True
 
     def _calculate_skew(self, chain: List[Dict], spot: float) -> float:
         try:
@@ -229,11 +291,13 @@ class HybridPricingEngine:
             if call_iv > 0.01:
                 return (put_iv / call_iv - 1.0) * 100
             return 0.0
-        except: return 0.0
+        except: 
+            return 0.0
 
     def _find_iv_at_strike(self, chain: List[Dict], strike: float, opt_type: str) -> float:
         row = next((c for c in chain if c.get("strike_price") == strike), None)
-        if not row: return 0.0
+        if not row: 
+            return 0.0
         greeks = row.get("call_options" if opt_type == "CE" else "put_options", {}).get("option_greeks", {})
         iv = float(greeks.get("iv", 0))
         return iv / 100 if iv > 5.0 else iv
@@ -249,7 +313,8 @@ class HybridPricingEngine:
 
     def _calculate_dte(self, expiry: date, now: datetime) -> float:
         today = now.date()
-        if expiry > today: return (expiry - today).days
+        if expiry > today: 
+            return (expiry - today).days
         return 0.001
 
     def _extract_atm_metrics(self, chain: List[Dict[str, Any]], atm_strike: float) -> Dict[str, float]:
@@ -263,7 +328,8 @@ class HybridPricingEngine:
         pe_g = pe.get("option_greeks", {})
 
         def iv_clamp(iv: float) -> float:
-            if iv > 5.0: iv /= 100.0
+            if iv > 5.0: 
+                iv /= 100.0
             return min(iv, MAX_IV_PCT)
 
         iv = iv_clamp((float(ce_g.get("iv", 0)) + float(pe_g.get("iv", 0))) / 2)
@@ -283,7 +349,8 @@ class HybridPricingEngine:
         table = []
         for item in chain:
             strike = float(item.get("strike_price", 0))
-            if abs(strike - spot) > 500: continue
+            if abs(strike - spot) > 500: 
+                continue
             ce_g = item.get("call_options", {}).get("option_greeks", {})
             pe_g = item.get("put_options", {}).get("option_greeks", {})
             vega = float(ce_g.get("vega", 0)) + float(pe_g.get("vega", 0))
