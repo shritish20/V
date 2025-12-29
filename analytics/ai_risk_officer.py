@@ -18,10 +18,8 @@ from groq import Groq
 from sqlalchemy import select
 from core.config import settings
 from database.manager import HybridDatabaseManager
-from database.models import (
-    DbTradeJournal, DbLearnedPattern, DbPatternWarning,
-    DbTradePostmortem, DbRiskBriefing, DbMarketSnapshot
-)
+from database.models import DbTradeJournal
+from database.models_risk import DbLearnedPattern, DbPatternWarning, DbRiskBriefing, DbTradePostmortem
 from core.models import MultiLegTrade
 
 logger = logging.getLogger("AIRiskOfficer")
@@ -31,7 +29,7 @@ class AIRiskOfficer:
     VolGuard Intelligence Core (v3.0 Final)
     The Central Nervous System that merges:
     1. Live Market Intelligence (FII, Macro, News, Events)
-    2. Historical Wisdom (Pattern Learning from past trades)
+    2. Historical Wisdom (Pattern Learning from DbTradeJournal)
     3. Pre-Trade Validation (Prevents repeating mistakes)
     4. Post-Trade Coaching (Grades every trade A-F)
     """
@@ -365,12 +363,12 @@ class AIRiskOfficer:
         logger.info("🔍 Analyzing trade history for patterns...")
         try:
             async with self.db.get_session() as session:
-                # Get all closed trades
+                # Get all closed trades (using correct DbTradeJournal fields)
                 stmt = select(DbTradeJournal).where(DbTradeJournal.net_pnl != 0).order_by(DbTradeJournal.date)
                 result = await session.execute(stmt)
                 trades = result.scalars().all()
                 
-                if len(trades) < 10: return
+                if len(trades) < 5: return
 
                 # Convert to dict format
                 trade_dicts = []
@@ -518,12 +516,16 @@ class AIRiskOfficer:
         """Generates an A-F grade for a closed trade"""
         logger.info(f"📊 Generatng Post-Mortem for Trade {trade.id}")
         
+        # Calculate duration
+        exit_time = trade.exit_time or datetime.utcnow()
+        duration_hrs = (exit_time - trade.entry_time).total_seconds() / 3600
+        
         prompt = f"""
         Grade this completed trade (A-F) based on execution quality.
         
         TRADE: {trade.strategy_type.value}
         PNL: {final_pnl}
-        DURATION: {(trade.exit_time - trade.entry_time).total_seconds()/3600:.1f} hours
+        DURATION: {duration_hrs:.1f} hours
         
         OUTPUT JSON:
         {{
