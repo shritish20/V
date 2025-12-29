@@ -1,11 +1,6 @@
 version: '3.8'
 
 services:
-  # ---------------------------------------------------------
-  # DATABASE (Local Container)
-  # For AWS RDS: Set POSTGRES_SERVER in .env to your RDS Endpoint
-  # and you can optionally comment this service out.
-  # ---------------------------------------------------------
   db:
     image: postgres:15-alpine
     container_name: vg_postgres
@@ -24,11 +19,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # ---------------------------------------------------------
-  # VOLGUARD FORTRESS (Monolithic Container)
-  # Runs: Engine + API + Sheriff + Sentinel
-  # (AI Analyst Removed)
-  # ---------------------------------------------------------
   app:
     build: .
     container_name: volguard_fortress
@@ -39,32 +29,25 @@ services:
     env_file:
       - .env
     environment:
-      # CRITICAL: Fix Timezone for NSE Market Hours
       - TZ=Asia/Kolkata
       - POSTGRES_SERVER=db
       - PYTHONPATH=/app
-      
-      # 🚨 PRODUCTION SAFETY CONTROLS 🚨
-      # Mode: 'paper' (Simulation) or 'live' (Real Money)
       - SAFETY_MODE=${SAFETY_MODE:-paper}
       - ENV=production
-      
-      # TELEGRAM ALERTS (Required)
+      # API KEYS
+      - GROQ_API_KEY=${GROQ_API_KEY}  # <--- NEW: AI Key
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
     ports:
       - "8000:8000"
     volumes:
-      # Map logs for CloudWatch/Monitoring
       - ./logs:/app/logs
-      # Map data for persistence (PIDs, State)
       - ./data:/app/data
       - ./dashboard_data:/app/dashboard_data
     networks:
       - vg_net
-    # Health Check: Ensures API is responsive
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/market/live"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/detailed"]
       interval: 30s
       timeout: 10s
       retries: 3
