@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
 
-# External Libraries (IO Bound)
+# External Libraries (IO Bound - Run in Threads)
 import yfinance as yf
 import nselib
 from nselib import derivatives
@@ -28,11 +28,12 @@ logger = logging.getLogger("AIRiskOfficer")
 
 class AIRiskOfficer:
     """
-    VolGuard Intelligence Core (v2.0 Production)
+    VolGuard Intelligence Core (v3.0 Final)
     The Central Nervous System that merges:
     1. Live Market Intelligence (FII, Macro, News, Events)
     2. Historical Wisdom (Pattern Learning from past trades)
-    3. Pre-Trade Validation ( preventing repetition of mistakes)
+    3. Pre-Trade Validation (Prevents repeating mistakes)
+    4. Post-Trade Coaching (Grades every trade A-F)
     """
     
     def __init__(self, groq_api_key: str, db_manager: HybridDatabaseManager):
@@ -90,6 +91,8 @@ class AIRiskOfficer:
             
             longs = c(fii['Future Index Long'])
             shorts = c(fii['Future Index Short'])
+            calls_l = c(fii['Option Index Call Long'])
+            puts_l = c(fii['Option Index Put Long'])
             
             net_fut = longs - shorts
             ls_ratio = longs / (longs + shorts) if (longs+shorts) > 0 else 0
@@ -109,6 +112,7 @@ class AIRiskOfficer:
                 "date": target_date.strftime("%d-%b"),
                 "ls_ratio": round(ls_ratio, 2),
                 "net_futures": net_fut,
+                "pcr_index": round(puts_l/calls_l, 2) if calls_l > 0 else 0,
                 "sentiment": sentiment,
                 "risk_impact": risk_impact
             }
@@ -152,6 +156,8 @@ class AIRiskOfficer:
                      risk_impact = 0.5; impact_msg = "Inflationary"
                 elif name == "US 10Y Yield" and price > 4.6:
                      risk_impact = 1; impact_msg = "Outflow Risk"
+                elif name == "Dollar Index" and price > 105:
+                     risk_impact = 0.5; impact_msg = "EM Pressure"
 
                 results.append({
                     "asset": name,
@@ -404,8 +410,9 @@ class AIRiskOfficer:
             if len(strat_trades) < 5: continue
             
             losses = [t for t in strat_trades if t["outcome"]["pnl"] < 0]
+            wins = [t for t in strat_trades if t["outcome"]["pnl"] > 0]
             
-            # Pattern: Low VIX Losses
+            # 1. FAILURE PATTERN: Low VIX Losses
             low_vix_losses = [t for t in losses if t["entry_conditions"]["vix"] < 13]
             if len(low_vix_losses) >= 3:
                 patterns.append({
@@ -416,9 +423,25 @@ class AIRiskOfficer:
                     "win_rate": 0.0,
                     "avg_pnl": sum(t["outcome"]["pnl"] for t in low_vix_losses) / len(low_vix_losses),
                     "severity": "HIGH",
-                    "lesson": f"Avoid {strategy} when VIX < 13.",
+                    "lesson": f"Avoid {strategy} when VIX < 13. Gamma risk is too high.",
                     "evidence": [t["id"] for t in low_vix_losses],
                 })
+                
+            # 2. SUCCESS PATTERN: High Win Rate Setup
+            if len(wins) >= 5:
+                win_rate = len(wins) / len(strat_trades)
+                if win_rate > 0.75:
+                    patterns.append({
+                        "type": "SUCCESS",
+                        "name": f"{strategy} Golden Setup",
+                        "conditions": {"strategy": strategy},
+                        "occurrences": len(wins),
+                        "win_rate": win_rate,
+                        "avg_pnl": sum(t["outcome"]["pnl"] for t in wins) / len(wins),
+                        "severity": "LOW",
+                        "lesson": f"You are very strong at {strategy}. Double down on this.",
+                        "evidence": [t["id"] for t in wins],
+                    })
         return patterns
 
     async def _store_pattern(self, session, pattern: Dict):
@@ -486,3 +509,53 @@ class AIRiskOfficer:
         # Generate Warning
         ai_warning = f"Wait! You historically lose money on {trade_features['strategy']} when VIX is low."
         return False, matches, ai_warning
+
+    # ================================================================
+    # PART D: POST-TRADE COACHING (The Review)
+    # ================================================================
+
+    async def generate_postmortem(self, trade: MultiLegTrade, final_pnl: float):
+        """Generates an A-F grade for a closed trade"""
+        logger.info(f"📊 Generatng Post-Mortem for Trade {trade.id}")
+        
+        prompt = f"""
+        Grade this completed trade (A-F) based on execution quality.
+        
+        TRADE: {trade.strategy_type.value}
+        PNL: {final_pnl}
+        DURATION: {(trade.exit_time - trade.entry_time).total_seconds()/3600:.1f} hours
+        
+        OUTPUT JSON:
+        {{
+            "grade": "A/B/C/D/F",
+            "mistakes": ["List of errors"],
+            "good_points": ["List of good execution"],
+            "lesson": "One sentence lesson"
+        }}
+        """
+        
+        try:
+            response = self.groq.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.3
+            )
+            analysis = json.loads(response.choices[0].message.content)
+            
+            # Save
+            async with self.db.get_session() as session:
+                pm = DbTradePostmortem(
+                    trade_id=trade.id,
+                    grade=analysis["grade"],
+                    what_went_right=analysis["good_points"],
+                    what_went_wrong=analysis["mistakes"],
+                    lessons_learned=analysis["lesson"],
+                    ai_analysis=json.dumps(analysis)
+                )
+                session.add(pm)
+                await self.db.safe_commit(session)
+                
+            return analysis
+        except Exception as e:
+            logger.error(f"Post-Mortem Error: {e}")
