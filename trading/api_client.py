@@ -1,4 +1,3 @@
-cat <<EOF > trading/api_client.py
 #!/usr/bin/env python3
 """
 EnhancedUpstoxAPI 20.3 (V3 POWERED) - FIXED RETURN TYPE
