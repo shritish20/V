@@ -25,7 +25,7 @@ async def main():
     
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
-        logger.critical("❌ GROQ_API_KEY missing. Intelligence Core disabled.")
+        logger.critical("❌ GROQ_API_KEY missing in .env! Intelligence Core disabled.")
         return
     
     db = HybridDatabaseManager()
@@ -34,7 +34,7 @@ async def main():
     officer = AIRiskOfficer(groq_key, db)
     logger.info("🚀 VolGuard Intelligence Core Started")
     
-    # Run once on startup
+    # Run once on startup to prime the cache
     logger.info("Initializing Intelligence...")
     await officer.learn_from_history(force_refresh=True)
     await officer.generate_comprehensive_briefing()
@@ -64,7 +64,7 @@ async def main():
                 logger.info("🎓 Running Weekly Pattern Analysis...")
                 await officer.learn_from_history(force_refresh=True)
 
-            # Sleep 1 minute
+            # Sleep 1 minute check
             await asyncio.sleep(60)
             
         except Exception as e:
