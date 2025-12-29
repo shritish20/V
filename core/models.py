@@ -41,6 +41,28 @@ class MultiLegTrade(BaseModel):
     basket_order_id: Optional[str] = None
     exit_reason: Optional[ExitReason] = None
 
+    # --- ADDED PROPERTIES TO FIX ATTRIBUTE ERROR ---
+    @property
+    def trade_vega(self) -> float:
+        """Calculates total Portfolio Vega for this trade (sum of leg vegas)"""
+        return sum(leg.current_greeks.vega * leg.quantity for leg in self.legs)
+
+    @property
+    def trade_delta(self) -> float:
+        """Calculates total Portfolio Delta for this trade"""
+        return sum(leg.current_greeks.delta * leg.quantity for leg in self.legs)
+
+    @property
+    def trade_gamma(self) -> float:
+        """Calculates total Portfolio Gamma for this trade"""
+        return sum(leg.current_greeks.gamma * leg.quantity for leg in self.legs)
+
+    @property
+    def trade_theta(self) -> float:
+        """Calculates total Portfolio Theta for this trade"""
+        return sum(leg.current_greeks.theta * leg.quantity for leg in self.legs)
+    # -----------------------------------------------
+
     def total_unrealized_pnl(self) -> float:
         return sum((l.current_price - l.entry_price) * l.quantity for l in self.legs)
 
