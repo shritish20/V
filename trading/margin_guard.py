@@ -35,25 +35,12 @@ class MarginGuard:
             "BEAR_CALL_SPREAD": 45000,
         }
 
-    async def is_margin_ok(
-        self, trade: MultiLegTrade, current_vix: Optional[float] = None
-    ) -> Tuple[bool, float]:
-        if settings.SAFETY_MODE != "live":
-            return await self._paper_mode_check(trade, current_vix)
+    async def is_margin_ok(self, trade: MultiLegTrade, current_vix: Optional[float] = None) -> Tuple[bool, float]:
+        # GUARD: zero legs or zero lot size
+        if not trade.legs or settings.LOT_SIZE <= 0:
+            logger.error("Margin check aborted: empty legs or LOT_SIZE=0")
+            return False, float('inf')
         return await self._live_mode_check(trade, current_vix)
-
-    async def _paper_mode_check(
-        self, trade: MultiLegTrade, current_vix: Optional[float]
-    ) -> Tuple[bool, float]:
-        _, req_margin = await self._enhanced_fallback_margin(trade, current_vix)
-        available = settings.ACCOUNT_SIZE
-        if available >= req_margin:
-            return True, req_margin
-        else:
-            logger.warning(
-                f"🚫 [PAPER] Margin Shortfall: Req=₹{req_margin:,.0f}, Virtual Avail=₹{available:,.0f}"
-            )
-            return False, req_margin
 
     async def _live_mode_check(
         self, trade: MultiLegTrade, current_vix: Optional[float]
