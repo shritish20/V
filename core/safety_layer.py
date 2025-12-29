@@ -69,29 +69,32 @@ class MasterSafetyLayer:
         if self.last_trade_time > 0 and time_since_last < self.min_time_between_trades:
             return False, f"Cooldown: {int(self.min_time_between_trades - time_since_last)}s remaining"
 
-        # === GATE 5: AI PATTERN RECOGNITION [NEW] ===
-        # Asks the AI if this trade matches a historical failure pattern
+        # === GATE 5: AI Pattern Recognition (BAYESIAN) ===
         if self.ai_officer:
             try:
-                # Construct simple context for AI
                 market_ctx = {
                     "vix": current_metrics.get("vix", 0),
                     "ivp": current_metrics.get("ivp", 0),
-                    "spot": current_metrics.get("spot_price", 0)
+                    "regime": current_metrics.get("regime", "NEUTRAL"),
+                    "atm_iv": current_metrics.get("atm_iv", 0.20),
+                    "realized_vol_7d": current_metrics.get("realized_vol_7d", 15),
+                    "term_structure_spread": current_metrics.get("term_structure_spread", 0),
+                    "volatility_skew": current_metrics.get("volatility_skew", 0),
+                    "atm_theta": current_metrics.get("atm_theta", 0),
+                    "atm_vega": current_metrics.get("atm_vega", 0),
                 }
-                
-                # Check for patterns
                 approved, matches, warning = await self.ai_officer.validate_trade(trade, market_ctx)
-                
                 if not approved:
-                    logger.warning(f"🤖 AI VETO: {warning}")
-                    # We treat High Severity patterns as HARD blocks, Low as warnings
-                    high_severity = any(m.get('severity') == 'HIGH' for m in matches)
-                    if high_severity:
+                    # Require ≥ 3 high-severity patterns AND ≥ 70% confidence before hard veto
+                    high_severity = [m for m in matches if m.get('win_rate', 1) < 0.35 and m.get('n_trades', 0) >= 15]
+                    if len(high_severity) >= 3:
+                        logger.warning(f"🤖 AI HARD VETO: {warning}")
                         return False, f"AI BLOCK: {warning}"
+                    else:
+                        logger.warning(f"🤖 AI SOFT WARNING: {warning}")  # log but allow
             except Exception as e:
                 logger.error(f"AI Check Failed: {e}")
-                # Don't block on AI failure, proceed to math checks
+                # Do not block on AI failure – proceed to math checks
 
         # === GATE 6: Lifecycle ===
         allowed, reason = self.lifecycle_mgr.can_enter_new_trade(trade.expiry_date, trade.expiry_type)
