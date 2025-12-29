@@ -7,8 +7,8 @@ services:
     restart: always
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-volguard_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
-      POSTGRES_DB: ${POSTGRES_DB:-volguard_db}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_pass}
+      POSTGRES_DB: volguard_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -26,31 +26,20 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    env_file:
-      - .env
+    # R2: Explicit environment mapping, do not bake .env file
     environment:
-      - TZ=Asia/Kolkata
-      - POSTGRES_SERVER=db
-      - PYTHONPATH=/app
-      - SAFETY_MODE=${SAFETY_MODE:-paper}
-      - ENV=production
-      # API KEYS
-      - GROQ_API_KEY=${GROQ_API_KEY}  # <--- NEW: AI Key
+      - GROQ_API_KEY=${GROQ_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - POSTGRES_SERVER=db
+      - ENV=production
     ports:
       - "8000:8000"
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
-      - ./dashboard_data:/app/dashboard_data
     networks:
       - vg_net
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/detailed"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
 
 networks:
   vg_net:
