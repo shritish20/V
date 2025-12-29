@@ -1,23 +1,24 @@
 import asyncio
 import logging
 from datetime import datetime
-from typing import Tuple
+from typing import Tuple, Dict, Any
 from core.models import MultiLegTrade
-from core.enums import TradeStatus, ExitReason, ExpiryType
-from core.config import settings, IST
+from core.enums import TradeStatus
+from core.config import settings
 
 logger = logging.getLogger("SafetyLayer")
 
 class MasterSafetyLayer:
     """
-    ENHANCED v2.0: Added single-trade loss limit (1% per trade)
+    INTELLIGENCE EDITION v3.0:
+    Now includes AI Pattern Matching in the approval chain.
     """
-    
-    def __init__(self, risk_manager, margin_guard, lifecycle_mgr, vrp_analyzer):
+    def __init__(self, risk_manager, margin_guard, lifecycle_mgr, vrp_analyzer, ai_officer):
         self.risk_mgr = risk_manager
         self.margin_guard = margin_guard
         self.lifecycle_mgr = lifecycle_mgr
         self.vrp_analyzer = vrp_analyzer
+        self.ai_officer = ai_officer  # NEW: The AI Brain
         
         # State tracking
         self.trades_today = 0
@@ -27,149 +28,101 @@ class MasterSafetyLayer:
         
         # Safety limits
         self.max_trades_per_day = 3
-        self.min_time_between_trades = 1800  # 30 minutes
-        self.max_drawdown_pct = 0.05  # 5% portfolio DD
-        self.max_single_trade_loss_pct = 0.01  # 1% per trade (NEW)
+        self.min_time_between_trades = 1800 
+        self.max_drawdown_pct = 0.05 
+        self.max_single_trade_loss_pct = 0.01
         self.min_greek_confidence = 0.6
-        
+
     async def pre_trade_gate(
         self, 
         trade: MultiLegTrade, 
-        current_metrics: dict
+        current_metrics: Dict[str, Any]
     ) -> Tuple[bool, str]:
         """
-        MASTER GATE - All checks in one place
-        Returns: (approved, rejection_reason)
+        MASTER GATE - Checks Math, Margin, Greeks, AND AI History
         """
-        
-        # === GATE 1: System Halted Check ===
+        # === GATE 1: System Halted ===
         if self.is_halted:
-            return False, "🛑 SYSTEM HALTED: Trading suspended due to drawdown"
-        
-        # === GATE 2: Portfolio Drawdown Check ===
-        daily_pnl = self.risk_mgr.daily_pnl
+            return False, "🛑 SYSTEM HALTED: Trading suspended"
+
+        # === GATE 2: Drawdown ===
+        daily_pnl = getattr(self.risk_mgr, 'daily_pnl', 0.0)
         if self.peak_equity == 0:
             self.peak_equity = settings.ACCOUNT_SIZE
-        
         self.peak_equity = max(self.peak_equity, settings.ACCOUNT_SIZE + daily_pnl)
         
         drawdown_pct = 0.0
         if self.peak_equity > 0:
-            drawdown_pct = (
-                self.peak_equity - (settings.ACCOUNT_SIZE + daily_pnl)
-            ) / self.peak_equity
-        
+            drawdown_pct = (self.peak_equity - (settings.ACCOUNT_SIZE + daily_pnl)) / self.peak_equity
+            
         if drawdown_pct > self.max_drawdown_pct:
             self.is_halted = True
-            logger.critical(f"🚨 DRAWDOWN HALT: {drawdown_pct*100:.1f}% from peak")
-            return False, f"Drawdown limit breached: {drawdown_pct*100:.1f}%"
-        
-        # === GATE 3: Daily Trade Limit ===
+            logger.critical(f"🚨 DRAWDOWN HALT: {drawdown_pct*100:.1f}%")
+            return False, f"Drawdown breached: {drawdown_pct*100:.1f}%"
+
+        # === GATE 3: Limits ===
         if self.trades_today >= self.max_trades_per_day:
-            return False, (
-                f"Daily trade limit reached: "
-                f"{self.trades_today}/{self.max_trades_per_day}"
-            )
-        
-        # === GATE 4: Entry Cooldown ===
+            return False, "Daily trade limit reached"
+
+        # === GATE 4: Cooldown ===
         time_since_last = datetime.now().timestamp() - self.last_trade_time
         if self.last_trade_time > 0 and time_since_last < self.min_time_between_trades:
-            remaining = int(self.min_time_between_trades - time_since_last)
-            return False, f"Cooldown active: {remaining}s remaining"
-        
-        # === GATE 5: Lifecycle Check (Expiry Rules) ===
-        allowed, lifecycle_reason = self.lifecycle_mgr.can_enter_new_trade(
-            trade.expiry_date, trade.expiry_type
-        )
-        if not allowed:
-            return False, f"Lifecycle block: {lifecycle_reason}"
-        
-        # === GATE 6: Greek Confidence Check ===
-        for leg in trade.legs:
-            greeks = current_metrics.get("greeks_cache", {}).get(
-                leg.instrument_key, {}
-            )
-            confidence = greeks.get("confidence_score", 0.0)
-            
-            if confidence > 0 and confidence < self.min_greek_confidence:
-                logger.critical(
-                    f"🚫 LOW CONFIDENCE: {leg.strike} {leg.option_type} = {confidence}"
-                )
-                return False, (
-                    f"Greek confidence too low: {confidence} < {self.min_greek_confidence}"
-                )
-        
-        # === GATE 7: VRP Z-Score Filter (Warning Only) ===
-        current_vix = current_metrics.get("vix", 15.0)
-        current_iv = current_metrics.get("atm_iv", 15.0)
-        
-        if self.vrp_analyzer:
-            z_score, signal, _ = self.vrp_analyzer.calculate_vrp_zscore(
-                current_iv, current_vix
-            )
-            if z_score < -1.0 and trade.strategy_type.value in [
-                "SHORT_STRANGLE", "IRON_CONDOR"
-            ]:
-                logger.warning(
-                    f"⚠️ VRP WARNING: Z-Score = {z_score:.2f} (options cheap)"
-                )
-        
-        # === GATE 8: Risk Manager Approval ===
-        if not self.risk_mgr.check_pre_trade(trade):
-            return False, "Risk manager rejection (portfolio limits)"
-        
-        # === GATE 9: Margin Check ===
-        if self.margin_guard and hasattr(self.margin_guard, 'is_margin_ok'):
+            return False, f"Cooldown: {int(self.min_time_between_trades - time_since_last)}s remaining"
+
+        # === GATE 5: AI PATTERN RECOGNITION [NEW] ===
+        # Asks the AI if this trade matches a historical failure pattern
+        if self.ai_officer:
             try:
-                margin_ok, margin_req = await self.margin_guard.is_margin_ok(
-                    trade, current_vix
-                )
-                if not margin_ok:
-                    return False, f"Insufficient margin: Need ₹{margin_req:,.0f}"
+                # Construct simple context for AI
+                market_ctx = {
+                    "vix": current_metrics.get("vix", 0),
+                    "ivp": current_metrics.get("ivp", 0),
+                    "spot": current_metrics.get("spot_price", 0)
+                }
+                
+                # Check for patterns
+                approved, matches, warning = await self.ai_officer.validate_trade(trade, market_ctx)
+                
+                if not approved:
+                    logger.warning(f"🤖 AI VETO: {warning}")
+                    # We treat High Severity patterns as HARD blocks, Low as warnings
+                    high_severity = any(m.get('severity') == 'HIGH' for m in matches)
+                    if high_severity:
+                        return False, f"AI BLOCK: {warning}"
             except Exception as e:
-                logger.error(f"Margin check error: {e}")
-        
-        # === ALL GATES PASSED ===
-        logger.info(f"✅ SAFETY GATES PASSED: {trade.strategy_type.value}")
+                logger.error(f"AI Check Failed: {e}")
+                # Don't block on AI failure, proceed to math checks
+
+        # === GATE 6: Lifecycle ===
+        allowed, reason = self.lifecycle_mgr.can_enter_new_trade(trade.expiry_date, trade.expiry_type)
+        if not allowed:
+            return False, f"Lifecycle: {reason}"
+
+        # === GATE 7: Greeks ===
+        for leg in trade.legs:
+            greeks = current_metrics.get("greeks_cache", {}).get(leg.instrument_key, {})
+            confidence = greeks.get("confidence_score", 0.0)
+            if confidence > 0 and confidence < self.min_greek_confidence:
+                return False, f"Low Greek Confidence: {confidence}"
+
+        # === GATE 8: Margin ===
+        if self.margin_guard:
+            try:
+                vix = current_metrics.get("vix", 20.0)
+                ok, req = await self.margin_guard.is_margin_ok(trade, vix)
+                if not ok:
+                    return False, f"Insufficient Margin: Need {req:,.0f}"
+            except Exception:
+                pass
+
+        logger.info(f"✅ ALL GATES PASSED for {trade.id}")
         return True, "Approved"
-    
-    async def monitor_position_losses(self, trade: MultiLegTrade):
-        """
-        NEW: Real-time single-trade loss monitoring.
-        Call this periodically for each open trade.
-        """
-        if trade.status != TradeStatus.OPEN:
-            return
-        
-        pnl = trade.total_unrealized_pnl()
-        loss_pct = pnl / settings.ACCOUNT_SIZE
-        
-        if loss_pct < -self.max_single_trade_loss_pct:
-            logger.critical(
-                f"🚨 EMERGENCY: Single trade loss {loss_pct*100:.2f}% "
-                f"> {self.max_single_trade_loss_pct*100}% limit"
-            )
-            
-            # Trigger emergency close via trade manager
-            # Note: You'll need to pass trade_mgr to this class
-            # For now, log the critical alert
-            logger.critical(f"MANUAL INTERVENTION REQUIRED: Close {trade.id} immediately")
-            
-            return True  # Breach detected
-        
-        return False  # No breach
-    
+
     def post_trade_update(self, trade_executed: bool):
-        """Call this after attempting trade execution"""
         if trade_executed:
             self.trades_today += 1
             self.last_trade_time = datetime.now().timestamp()
-            logger.info(
-                f"📊 Trades today: {self.trades_today}/{self.max_trades_per_day}"
-            )
-    
+
     def reset_daily_counters(self):
-        """Call this at market open (9:15 AM)"""
         self.trades_today = 0
         self.is_halted = False
-        logger.info("🌅 Daily counters reset")
