@@ -6,13 +6,28 @@ class WebSocketState:
         self._lock = Lock()
         self.market = {}
         self.positions = {}
-        self.last_tick = datetime.utcnow()
+        
+        # Health Timestamps
+        self.last_market_tick = datetime.min
+        self.last_portfolio_tick = datetime.min
 
     def update_market(self, data: dict):
         with self._lock:
             self.market.update(data)
-            self.last_tick = datetime.utcnow()
+            # Fix 5: Update timestamp for health check
+            self.last_market_tick = datetime.utcnow()
+
+    def update_positions(self, data: dict):
+        with self._lock:
+            # Assuming data is a dictionary of positions keyed by token
+            self.positions.update(data)
+            self.last_portfolio_tick = datetime.utcnow()
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {"market": dict(self.market), "last_tick": self.last_tick}
+            return {
+                "market": dict(self.market),
+                "positions": dict(self.positions),
+                "last_market_tick": self.last_market_tick,
+                "last_portfolio_tick": self.last_portfolio_tick
+            }
